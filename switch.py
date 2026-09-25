@@ -4001,23 +4001,75 @@ def _fail(message):
 
 DEFAULT_MAX_EVENTS = 100000
 DEFAULT_MAX_LOG_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_CONFIG_BYTES = 1024 * 1024
+DEFAULT_MAX_EVENTS_BYTES = 16 * 1024 * 1024
+_READ_CHUNK = 65536
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 
 
-def _parse_limits(tokens):
-    """解析可选的 MAX_EVENTS MAX_LOG_BYTES（须成对、[1-9][0-9]*）。
+def _limit_values(tokens):
+    """上限串须整体匹配 [1-9][0-9]*；按数学整数转换（Python 任意精度）。"""
+    if any(_LIMIT_RE.fullmatch(tok) is None for tok in tokens):
+        return None
+    return [int(tok) for tok in tokens]
 
-    空序列取默认值；个数不对或任一参数非法返回 None（调用方按 usage 处理）。
+
+def _parse_record_limits(tokens):
+    """record：上限只准 0、2、4 项
+    [MAX_EVENTS MAX_LOG_BYTES [MAX_CONFIG_BYTES MAX_EVENTS_BYTES]]。
+
+    缺省项取默认值；个数不对或任一参数非法返回 None（调用方按 usage）。
     """
-    if not tokens:
+    if len(tokens) not in (0, 2, 4):
+        return None
+    values = _limit_values(tokens)
+    if values is None:
+        return None
+    max_events = values[0] if len(values) >= 2 else DEFAULT_MAX_EVENTS
+    max_log_bytes = values[1] if len(values) >= 2 else DEFAULT_MAX_LOG_BYTES
+    max_config_bytes = (
+        values[2] if len(values) == 4 else DEFAULT_MAX_CONFIG_BYTES
+    )
+    max_events_bytes = (
+        values[3] if len(values) == 4 else DEFAULT_MAX_EVENTS_BYTES
+    )
+    return (
+        max_events,
+        max_log_bytes,
+        max_config_bytes,
+        max_events_bytes,
+    )
+
+
+def _parse_replay_limits(tokens):
+    """replay：上限只准 0、2 项 [MAX_EVENTS MAX_LOG_BYTES]。"""
+    if len(tokens) not in (0, 2):
+        return None
+    values = _limit_values(tokens)
+    if values is None:
+        return None
+    if not values:
         return DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_BYTES
-    if len(tokens) != 2:
-        return None
-    if _LIMIT_RE.fullmatch(tokens[0]) is None:
-        return None
-    if _LIMIT_RE.fullmatch(tokens[1]) is None:
-        return None
-    return int(tokens[0]), int(tokens[1])
+    return values[0], values[1]
+
+
+def _read_capped(handle, limit):
+    """按至多 65536 字节分块读取，累计字节一旦超过 limit 立即停止。
+
+    返回 (raw, overflowed)：未超限时 raw 为完整文件内容（等于上限合法）；
+    超限时 raw 为 None。读取尺寸只取 min(65536, limit+1-total)，不直接向
+    read 传入任意精度上界，杜绝尺寸溢出。
+    """
+    buf = bytearray()
+    total = 0
+    while total <= limit:
+        chunk = handle.read(min(_READ_CHUNK, limit + 1 - total))
+        if not chunk:
+            return bytes(buf), False
+        buf.extend(chunk)
+        total += len(chunk)
+        if total > limit:
+            return None, True
 
 
 RECORD_SCHEMA = 1
@@ -4248,17 +4300,47 @@ def _emit_result(result):
     sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
 
 
-def _cmd_record(config_path, events_path, log_path, max_events, max_log_bytes):
+def _cmd_record(
+    config_path,
+    events_path,
+    log_path,
+    max_events,
+    max_log_bytes,
+    max_config_bytes,
+    max_events_bytes,
+):
+    # 文件缺失/不可读优先于一切字节上界
     try:
-        with open(config_path, "rb") as handle:
-            config_raw = handle.read()
-        with open(events_path, "rb") as handle:
-            events_raw = handle.read()
+        config_handle = open(config_path, "rb")
     except OSError:
         _fail("file_not_found")
         return 3
     try:
-        # 事件上界先于解析与预演判定；超限时绝不触碰 LOG
+        events_handle = open(events_path, "rb")
+    except OSError:
+        config_handle.close()
+        _fail("file_not_found")
+        return 3
+    with config_handle, events_handle:
+        # 上界判定顺序：CONFIG 字节、EVENTS 字节、事件数、输入语义、LOG 字节
+        try:
+            config_raw, overflowed = _read_capped(
+                config_handle, max_config_bytes
+            )
+            if overflowed:
+                _fail("config_limit")
+                return 5
+            events_raw, overflowed = _read_capped(
+                events_handle, max_events_bytes
+            )
+            if overflowed:
+                _fail("events_limit")
+                return 5
+        except OSError:
+            _fail("file_not_found")
+            return 3
+    try:
+        # 事件数上界先于解析与预演判定；超限时绝不触碰 LOG
         events_preview = parse_json(events_raw)
         if isinstance(events_preview, list) and len(events_preview) > max_events:
             _fail("event_limit")
@@ -4287,12 +4369,12 @@ def _cmd_record(config_path, events_path, log_path, max_events, max_log_bytes):
 def _cmd_replay(log_path, max_events, max_log_bytes):
     try:
         with open(log_path, "rb") as handle:
-            log_raw = handle.read(max_log_bytes + 1)
+            log_raw, overflowed = _read_capped(handle, max_log_bytes)
     except OSError:
         _fail("file_not_found")
         return 3
-    # 字节上界先判定（至多读取 MAX_LOG_BYTES+1 字节，含末尾 LF）
-    if len(log_raw) > max_log_bytes:
+    # 字节上界先判定（分块读取，累计超过 MAX_LOG_BYTES 即止，含末尾 LF）
+    if overflowed:
         _fail("log_limit")
         return 5
     try:
@@ -4322,19 +4404,21 @@ def _cmd_replay(log_path, max_events, max_log_bytes):
 def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
-        if len(args) not in (4, 6):  # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES]
+        if len(args) not in (4, 6, 8):
+            # record CONFIG EVENTS LOG
+            #   [MAX_EVENTS MAX_LOG_BYTES [MAX_CONFIG_BYTES MAX_EVENTS_BYTES]]
             _fail("usage")
             return 2
-        limits = _parse_limits(args[4:])
+        limits = _parse_record_limits(args[4:])
         if limits is None:
             _fail("usage")
             return 2
-        return _cmd_record(args[1], args[2], args[3], limits[0], limits[1])
+        return _cmd_record(args[1], args[2], args[3], *limits)
     if args[:1] == ["replay"]:
         if len(args) not in (2, 4):  # replay LOG [MAX_EVENTS MAX_LOG_BYTES]
             _fail("usage")
             return 2
-        limits = _parse_limits(args[2:])
+        limits = _parse_replay_limits(args[2:])
         if limits is None:
             _fail("usage")
             return 2

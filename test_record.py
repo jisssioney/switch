@@ -751,6 +751,283 @@ class LogLimitTest(unittest.TestCase):
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
 
 
+class InputByteLimitTest(unittest.TestCase):
+    """MAX_CONFIG_BYTES / MAX_EVENTS_BYTES 原始字节上界（含空白）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.cfg = os.path.join(d, "config.json")
+        self.evt = os.path.join(d, "events.json")
+        self.log = os.path.join(d, "out.log")
+        self.config = base_config()
+        self.events = [
+            frame(i, "p1", "00:00:00:00:00:01") for i in range(5)
+        ]
+        self.cfg_raw = json.dumps(self.config).encode()
+        self.evt_raw = json.dumps(self.events).encode()
+        with open(self.cfg, "wb") as handle:
+            handle.write(self.cfg_raw)
+        with open(self.evt, "wb") as handle:
+            handle.write(self.evt_raw)
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.record_out = rec.stdout
+        with open(self.log, "rb") as handle:
+            self.log_bytes = handle.read()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args):
+        proc = subprocess.run(
+            [sys.executable, SWITCH, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _four(self, max_events, max_log, max_cfg, max_evt):
+        return self._run(
+            "record", self.cfg, self.evt, self.log,
+            str(max_events), str(max_log), str(max_cfg), str(max_evt),
+        )
+
+    def test_config_boundary_equal_legal(self):
+        code, out, err = self._four(
+            100000, 16777216, len(self.cfg_raw), 16777216
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_config_over_exact_contract_and_no_log(self):
+        os.unlink(self.log)
+        code, out, err = self._four(
+            100000, 16777216, len(self.cfg_raw) - 1, 16777216
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"config_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_events_boundary_equal_legal(self):
+        code, out, err = self._four(
+            100000, 16777216, 1048576, len(self.evt_raw)
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_events_over_exact_contract_and_no_log(self):
+        os.unlink(self.log)
+        code, out, err = self._four(
+            100000, 16777216, 1048576, len(self.evt_raw) - 1
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_whitespace_counts_toward_events_bytes(self):
+        with open(self.evt, "ab") as handle:
+            handle.write(b"   ")  # 原始字节含尾部空白
+        size = len(self.evt_raw) + 3
+        code, _, err = self._four(100000, 16777216, 1048576, size)
+        self.assertEqual(code, 0, err)
+        code, out, err = self._four(100000, 16777216, 1048576, size - 1)
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+        self.assertEqual(out, b"")
+
+    def test_existing_log_untouched_on_config_and_events_limit(self):
+        code, _, err = self._four(100000, 16777216, 1, 16777216)
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"config_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+        code, _, err = self._four(
+            100000, 16777216, len(self.cfg_raw), 1
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_priority_config_beats_events(self):
+        code, _, err = self._four(100000, 16777216, 1, 1)
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"config_limit"}\n')
+
+    def test_priority_events_bytes_beats_event_count(self):
+        code, _, err = self._four(
+            1, 16777216, len(self.cfg_raw), 1
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+
+    def test_priority_event_count_beats_semantics(self):
+        # 事件数先于语义判定：5 条合法帧，上限 4 -> event_limit
+        code, _, err = self._four(
+            4, 16777216, 1048576, 16777216
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"event_limit"}\n')
+
+    def test_priority_missing_file_beats_byte_limits(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        code, _, err = self._run(
+            "record", missing, self.evt, self.log,
+            "100000", "16777216", "1", "1",
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(err, b'{"error":"file_not_found"}\n')
+        code, _, err = self._run(
+            "record", self.cfg, missing, self.log,
+            "100000", "16777216", str(len(self.cfg_raw)), "1",
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(err, b'{"error":"file_not_found"}\n')
+
+    def test_usage_on_odd_limit_counts_and_bad_new_limits(self):
+        for extra in (
+            ("1",),
+            ("1", "2", "3"),
+            ("1", "2", "3", "4", "5"),
+        ):
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual(
+                (code, err), (2, b'{"error":"usage"}\n'), extra
+            )
+        for extra in (
+            ("100000", "16777216", "0", "16777216"),
+            ("100000", "16777216", "1048576", "0"),
+            ("100000", "16777216", "1", "01"),
+            ("100000", "16777216", "-1", "16777216"),
+            ("100000", "16777216", "1.0", "16777216"),
+        ):
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual(
+                (code, err), (2, b'{"error":"usage"}\n'), extra
+            )
+        # replay 不接受新增两项
+        code, _, err = self._run(
+            "replay", self.log, "100000", "16777216",
+            "1048576", "16777216",
+        )
+        self.assertEqual((code, err), (2, b'{"error":"usage"}\n'))
+
+    def test_explicit_four_limits_byte_identical_to_defaults(self):
+        code, out, err = self._four(
+            100000, 16777216, 1048576, 16777216
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_arbitrarily_long_limits_compared_as_integers(self):
+        big = "9" * 80
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            big, big, big, big,
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_chunked_config_over_64k_boundary(self):
+        bulky = copy.deepcopy(self.config)
+        bulky["acl"] = [
+            {
+                "src": None, "dst": None, "vlan": None, "ethertype": None,
+                "priority": None, "action": "allow", "to_vlan": None,
+            }
+            for _ in range(7000)
+        ]
+        raw = json.dumps(bulky).encode()
+        self.assertGreater(len(raw), 65536)
+        path = os.path.join(self.tmp.name, "big.json")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        code, _, err = self._run(
+            "record", path, self.evt, self.log,
+            "100000", "16777216", str(len(raw)), "16777216",
+        )
+        self.assertEqual(code, 0, err)
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", path, self.evt, self.log,
+            "100000", "16777216", str(len(raw) - 1), "16777216",
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"config_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_chunked_events_over_64k_boundary(self):
+        bulky = [frame(i, "p1", "00:00:00:00:00:01") for i in range(700)]
+        raw = json.dumps(bulky).encode()
+        self.assertGreater(len(raw), 65536)
+        path = os.path.join(self.tmp.name, "big_events.json")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        code, _, err = self._run(
+            "record", self.cfg, path, self.log,
+            "100000", "16777216", "1048576", str(len(raw)),
+        )
+        self.assertEqual(code, 0, err)
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, path, self.log,
+            "100000", "16777216", "1048576", str(len(raw) - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_default_config_limit_is_one_mib(self):
+        bulky = copy.deepcopy(self.config)
+        bulky["acl"] = [
+            {
+                "src": None, "dst": None, "vlan": None, "ethertype": None,
+                "priority": None, "action": "allow", "to_vlan": None,
+            }
+            for _ in range(12000)
+        ]
+        raw = json.dumps(bulky).encode()
+        self.assertGreater(len(raw), 1048576)
+        path = os.path.join(self.tmp.name, "huge_config.json")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", path, self.evt, self.log
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"config_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_default_events_limit_is_16_mib_sparse(self):
+        # 稀疏文件：超 16MiB 即按 events_limit 拒绝，先于解析，无需真实 JSON
+        path = os.path.join(self.tmp.name, "huge_events.json")
+        with open(path, "wb") as handle:
+            handle.truncate(17 * 1024 * 1024)
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, path, self.log
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"events_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+
 class CliErrorTest(unittest.TestCase):
     def test_record_usage(self):
         code, out, err, _ = run_cli(["record", "a", "b"])
