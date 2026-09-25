@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """二层以太网交换机仿真（仅标准库）。"""
 
+import heapq
 import json
 import re
 import sys
@@ -14,6 +15,9 @@ FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
 PORT_KEYS_V2 = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
 FRAME_KEYS_V2 = frozenset(("t", "port", "src", "dst", "vlan"))
 PORT_MODES = ("access", "trunk", "hybrid")
+STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
+STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
+STP_EVENT_KEYS = frozenset(("t", "id", "up"))
 
 
 class InvalidInput(Exception):
@@ -429,6 +433,260 @@ def forward_v2(frames, ports, age):
     }
 
 
+def validate_stp_config(config):
+    if not isinstance(config, dict) or frozenset(config) != STP_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges = config["bridges"]
+    links = config["links"]
+    delay = config["delay"]
+    if not isinstance(bridges, list) or not bridges:
+        raise InvalidInput("bridges must be a non-empty list")
+    if not all(isinstance(b, str) and b for b in bridges):
+        raise InvalidInput("bridges must be non-empty strings")
+    if len(set(bridges)) != len(bridges):
+        raise InvalidInput("bridges must be distinct")
+    bridge_set = set(bridges)
+    if not isinstance(links, list):
+        raise InvalidInput("links must be a list")
+    endpoints = set()
+    link_ids = set()
+    for link in links:
+        if not isinstance(link, dict) or frozenset(link) != STP_LINK_KEYS:
+            raise InvalidInput("bad link")
+        lid = link["id"]
+        x = link["x"]
+        y = link["y"]
+        cost = link["cost"]
+        up = link["up"]
+        if not isinstance(lid, str) or not lid:
+            raise InvalidInput("bad link id")
+        if lid in link_ids:
+            raise InvalidInput("link ids must be distinct")
+        link_ids.add(lid)
+        if not isinstance(x, list) or len(x) != 2:
+            raise InvalidInput("bad endpoint")
+        if not isinstance(y, list) or len(y) != 2:
+            raise InvalidInput("bad endpoint")
+        xb, xp = x
+        yb, yp = y
+        if not all(isinstance(v, str) and v for v in (xb, xp, yb, yp)):
+            raise InvalidInput("bad endpoint")
+        if xb not in bridge_set or yb not in bridge_set:
+            raise InvalidInput("unknown bridge")
+        if xb == yb:
+            raise InvalidInput("link endpoints must be on different bridges")
+        if tuple(x) in endpoints or tuple(y) in endpoints:
+            raise InvalidInput("link endpoints must be unique")
+        endpoints.add(tuple(x))
+        endpoints.add(tuple(y))
+        if not _is_int(cost) or cost <= 0:
+            raise InvalidInput("cost must be a positive integer")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+    if not _is_int(delay) or delay <= 0:
+        raise InvalidInput("delay must be a positive integer")
+    return bridges, links, delay
+
+
+def validate_stp_events(events, links):
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    link_ids = {link["id"] for link in links}
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict) or frozenset(event) != STP_EVENT_KEYS:
+            raise InvalidInput("bad event")
+        t = event["t"]
+        lid = event["id"]
+        up = event["up"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(lid, str) or not lid or lid not in link_ids:
+            raise InvalidInput("unknown link id")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        result.append((t, lid, up))
+    return result
+
+
+def _stp_roles(bridges, links, link_up):
+    # 仅在 up 链路上按连通分量计算：分量根为分量内最小桥名，
+    # 最短路按 (总cost, 下一跳桥名, 对端口, 本端口) 比较。
+    adj = {b: [] for b in bridges}
+    for link in links:
+        if not link_up[link["id"]]:
+            continue
+        xb, xp = link["x"]
+        yb, yp = link["y"]
+        adj[xb].append((yb, link["cost"], xp, yp))
+        adj[yb].append((xb, link["cost"], yp, xp))
+    seen = set()
+    root_of = {}
+    costs = {}
+    best = {}
+    for start in bridges:
+        if start in seen:
+            continue
+        stack = [start]
+        component = []
+        seen.add(start)
+        while stack:
+            u = stack.pop()
+            component.append(u)
+            for v, _, _, _ in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        root = min(component)
+        root_of[root] = root
+        dist = {root: (0, None, None, None)}
+        done = set()
+        while True:
+            u = None
+            for b in component:
+                if b not in done and b in dist and (u is None or dist[b] < dist[u]):
+                    u = b
+            if u is None:
+                break
+            du = dist[u][0]
+            done.add(u)
+            for v, c, local_p, peer_p in adj[u]:
+                cand = (du + c, u, local_p, peer_p)
+                if v not in dist or cand < dist[v]:
+                    dist[v] = cand
+        for b in component:
+            root_of[b] = root
+            costs[b] = dist[b][0]
+            best[b] = dist[b]
+    # 各 up 链路先按通告向量取 designated 端：(根名, 根路径cost, 桥名, 端口)
+    # 较小者胜，相等时取配置序在先的一端。
+    designated_end = {}
+    for link in links:
+        lid = link["id"]
+        if not link_up[lid]:
+            continue
+        xb, xp = link["x"]
+        yb, yp = link["y"]
+        vx = (root_of[xb], costs[xb], xb, xp)
+        vy = (root_of[yb], costs[yb], yb, yp)
+        if vy < vx:
+            win = 1
+        else:
+            win = 0  # vx 更小或完全相等：配置序在先端
+        designated_end[lid] = win
+    roles = {}
+    for link in links:
+        xb, xp = link["x"]
+        yb, yp = link["y"]
+        if not link_up[link["id"]]:
+            roles[(xb, xp)] = "disabled"
+            roles[(yb, yp)] = "disabled"
+            continue
+        win = designated_end[link["id"]]
+        roles[(xb, xp)] = "designated" if win == 0 else "alternate"
+        roles[(yb, yp)] = "designated" if win == 1 else "alternate"
+    component_roots = {}
+    for b in bridges:
+        component_roots.setdefault(root_of[b], set()).add(b)
+    for root, members in component_roots.items():
+        for b in members:
+            if b == root:
+                continue
+            _, _, _, local_p = best[b]
+            roles[(b, local_p)] = "root"
+    return root_of, costs, roles
+
+
+def stp(bridges, links, delay, events):
+    ports = {b: set() for b in bridges}
+    for link in links:
+        xb, xp = link["x"]
+        yb, yp = link["y"]
+        ports[xb].add(xp)
+        ports[yb].add(yp)
+    link_up = {link["id"]: link["up"] for link in links}
+    role = {}
+    state = {}
+    timers = []  # (time, seq, bridge, port, expected_role, new_state)
+    seq = 0
+
+    def clear_timers(bp):
+        timers[:] = [item for item in timers if (item[2], item[3]) != bp]
+        heapq.heapify(timers)
+
+    def pop_due(now):
+        changed = False
+        while timers and timers[0][0] <= now:
+            tm, _, b, p, expected_role, new_state = heapq.heappop(timers)
+            if role.get((b, p)) == expected_role:
+                state[(b, p)] = new_state
+                changed = True
+        return changed
+
+    def snapshot(t):
+        return {
+            "t": t,
+            "bridges": [
+                {
+                    "name": b,
+                    "root": root_of[b],
+                    "cost": costs[b],
+                    "ports": [
+                        {"name": p, "role": role[(b, p)], "state": state[(b, p)]}
+                        for p in sorted(ports[b])
+                    ],
+                }
+                for b in bridges
+            ],
+        }
+
+    root_of, costs, new_roles = _stp_roles(bridges, links, link_up)
+    for b in bridges:
+        for p in ports[b]:
+            bp = (b, p)
+            r = new_roles[bp]
+            role[bp] = r
+            if r in ("root", "designated"):
+                state[bp] = "discarding"
+                heapq.heappush(timers, (delay, seq, b, p, r, "learning"))
+                seq += 1
+                heapq.heappush(timers, (2 * delay, seq, b, p, r, "forwarding"))
+                seq += 1
+            else:
+                state[bp] = "discarding"
+    results = [snapshot(0)]
+
+    for t, lid, up in events:
+        pop_due(t)
+        if link_up[lid] != up:
+            link_up[lid] = up
+            root_of, costs, new_roles = _stp_roles(bridges, links, link_up)
+            for b in bridges:
+                for p in ports[b]:
+                    bp = (b, p)
+                    r = new_roles[bp]
+                    if role[bp] == r:
+                        continue
+                    clear_timers(bp)
+                    role[bp] = r
+                    if r in ("root", "designated"):
+                        state[bp] = "discarding"
+                        heapq.heappush(timers, (t + delay, seq, b, p, r, "learning"))
+                        seq += 1
+                        heapq.heappush(
+                            timers, (t + 2 * delay, seq, b, p, r, "forwarding")
+                        )
+                        seq += 1
+                    else:
+                        state[bp] = "discarding"
+        results.append(snapshot(t))
+    return {"results": results}
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -437,7 +695,7 @@ def _fail(message):
 
 def main(argv):
     args = argv[1:]
-    if len(args) != 3 or args[0] not in ("fdb", "forward"):
+    if len(args) != 3 or args[0] not in ("fdb", "forward", "stp"):
         _fail("usage")
         return 2
     mode = args[0]
@@ -456,6 +714,9 @@ def main(argv):
         if mode == "fdb":
             ports, age = validate_config(config)
             result = simulate(validate_events(data, ports), age)
+        elif mode == "stp":
+            bridges, links, delay = validate_stp_config(config)
+            result = stp(bridges, links, delay, validate_stp_events(data, links))
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
