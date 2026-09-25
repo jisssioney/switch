@@ -95,6 +95,10 @@ class ForwardStpWorkLimit(Exception):
     pass
 
 
+class StormWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -1358,6 +1362,197 @@ def forward_stp_storm(
             for vlan in sorted(vlan_stats)
         ],
     }
+
+
+def forward_stp_storm_work(
+    bridges, links, delay, bridge_name, ports, age, storm, events, limit
+):
+    """forward-stp-storm 的工作量预演：按既有规则更新状态，无副作用。
+
+    B、L、P 为桥、链路、端口数，U 为 up 链路数；初始收敛计 B+L+2U。
+    各事件在按 t 老化 FDB 和解封前取 K=FDB 项数、H=封锁项数、
+    Q=速率与迁移队列时间戳总数：帧计 K+H+Q+P+1；链路先应用 up，
+    改变计 K+H+Q+B+L+2U+2P+1，幂等计 K+H+Q+1。
+    链路状态在独立副本上跟踪；累计等于上限合法，首次超过即抛
+    StormWorkLimit。
+    """
+    window = storm["window"]
+    limits = storm["limits"]
+    move_limit = storm["move_limit"]
+    hold = storm["hold"]
+    sim_links = [dict(link) for link in links]  # 独立副本，不改共享配置
+    by_id = {link["id"]: link for link in sim_links}
+    by_name = {port["name"]: port for port in ports}
+    port_link = {}  # 本桥桥链路口名 -> link 副本
+    for link in sim_links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    rate_queues = {}  # (入端口, vlan, 类别) -> 放行时刻 deque
+    move_queues = {}  # (vlan, src) -> 迁移时刻 deque
+    last_learn = {}  # (vlan, src) -> 最后学习端口
+    blocked = {}  # (入端口, vlan) -> 封锁截止时刻
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, sim_links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def suppress(t, port_name, vlan, src, dst, state):
+        """风暴控制：返回 True 表示本帧被抑制（不学习、不发送）。"""
+        if (port_name, vlan) in blocked:  # 封锁帧不检测
+            return True
+        if state not in ("learning", "forwarding"):
+            return False
+        is_group = int(dst[:2], 16) & 1
+        if dst == BROADCAST_MAC:
+            category = "broadcast"
+        elif is_group:
+            category = "multicast"
+        else:
+            category = None if fdb.get((vlan, dst)) else "unknown"
+        if category is not None:
+            queue = rate_queues.get((port_name, vlan, category))
+            if queue is None:
+                queue = deque(maxlen=limits[category])
+                rate_queues[(port_name, vlan, category)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
+                return True
+        prev = last_learn.get((vlan, src))
+        if prev is not None and prev != port_name:  # 学习端口迁移
+            queue = move_queues.get((vlan, src))
+            if queue is None:
+                queue = deque(maxlen=move_limit)
+                move_queues[(vlan, src)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            queue.append(t)
+            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+                blocked[(port_name, vlan)] = t + hold
+                return True
+        if category is not None:  # 速率名额仅在帧实际放行时占用
+            rate_queues[(port_name, vlan, category)].append(t)
+        fdb[(vlan, src)] = [port_name, t]
+        last_learn[(vlan, src)] = port_name
+        return False
+
+    B = len(bridges)
+    L = len(links)
+    P = len(ports)
+    sim_up = {link["id"]: link["up"] for link in links}
+    U = sum(1 for link in links if link["up"])
+    work = B + L + 2 * U  # 初始收敛
+    if work > limit:
+        raise StormWorkLimit
+    converge(0)
+    for item in events:
+        t = item[1]
+        # 老化与解封前取 K、H、Q
+        K = len(fdb)
+        H = len(blocked)
+        Q = sum(len(queue) for queue in rate_queues.values()) + sum(
+            len(queue) for queue in move_queues.values()
+        )
+        if item[0] == "link":
+            _, _, lid, up = item
+            if sim_up[lid] != up:  # 先应用 up 再计费
+                sim_up[lid] = up
+                U += 1 if up else -1
+                work += K + H + Q + B + L + 2 * U + 2 * P + 1
+            else:
+                work += K + H + Q + 1
+        else:
+            work += K + H + Q + P + 1
+        if work > limit:
+            raise StormWorkLimit
+        # 以下按既有规则处理并更新预演状态
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        for key in [k for k, until in blocked.items() if t >= until]:
+            del blocked[key]
+        if item[0] == "link":
+            _, t, lid, up = item
+            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+                old_forwarding = forwarding_ports(t)
+                by_id[lid]["up"] = up
+                converge(t)
+                for name in old_forwarding - forwarding_ports(t):
+                    for key in [
+                        k for k, (p, _) in fdb.items() if p == name
+                    ]:
+                        del fdb[key]
+            continue
+        _, t, port_name, src, dst, tag = item
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习
+            continue
+        _, state = port_status(port_name, t)
+        suppress(t, port_name, vlan, src, dst, state)
 
 
 def validate_lag_config(config):
@@ -4154,6 +4349,7 @@ DEFAULT_MAX_STP_WORK = 10000000
 DEFAULT_MAX_FDB_WORK = 10000000
 DEFAULT_MAX_FORWARD_WORK = 10000000
 DEFAULT_MAX_FORWARD_STP_WORK = 10000000
+DEFAULT_MAX_STORM_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4569,16 +4765,21 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    # stp/fdb/forward/forward-stp 额外允许 5 项上限（末尾分别为
-    # MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK）；
+    # stp/fdb/forward/forward-stp/forward-stp-storm 额外允许 5 项上限（末尾分别为
+    # MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK）；
     # 其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
     is_forward_stp = args[:1] == ["forward-stp"]
+    is_forward_stp_storm = args[:1] == ["forward-stp-storm"]
     allowed_counts = (
         (3, 5, 7, 8)
-        if is_stp or is_fdb or is_forward or is_forward_stp
+        if is_stp
+        or is_fdb
+        or is_forward
+        or is_forward_stp
+        or is_forward_stp_storm
         else (3, 5, 7)
     )
     if len(args) not in allowed_counts or args[0] not in (
@@ -4596,7 +4797,7 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK]]]
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK|MAX_STORM_WORK]]]
     # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
@@ -4620,6 +4821,7 @@ def main(argv):
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
+        max_storm_work = None
     elif is_fdb:
         fdb_limits = limits + (DEFAULT_MAX_FDB_WORK,)
         (
@@ -4632,6 +4834,7 @@ def main(argv):
         max_stp_work = None
         max_forward_work = None
         max_forward_stp_work = None
+        max_storm_work = None
     elif is_forward:
         forward_limits = limits + (DEFAULT_MAX_FORWARD_WORK,)
         (
@@ -4644,6 +4847,7 @@ def main(argv):
         max_stp_work = None
         max_fdb_work = None
         max_forward_stp_work = None
+        max_storm_work = None
     elif is_forward_stp:
         forward_stp_limits = limits + (DEFAULT_MAX_FORWARD_STP_WORK,)
         (
@@ -4656,6 +4860,20 @@ def main(argv):
         max_stp_work = None
         max_fdb_work = None
         max_forward_work = None
+        max_storm_work = None
+    elif is_forward_stp_storm:
+        storm_limits = limits + (DEFAULT_MAX_STORM_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_storm_work,
+        ) = parsed + storm_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
+        max_forward_stp_work = None
     else:
         max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
             parsed + limits[len(parsed):]
@@ -4664,6 +4882,7 @@ def main(argv):
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
+        max_storm_work = None
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4730,6 +4949,19 @@ def main(argv):
                 validate_forward_stp_storm_config(config)
             )
             link_ids = {link["id"] for link in links}
+            events = validate_forward_stp_events(data, ports, link_ids)
+            # 全量语义校验后无副作用预演；超限时不得调用正式仿真
+            forward_stp_storm_work(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                events,
+                max_storm_work,
+            )
             result = forward_stp_storm(
                 bridges,
                 links,
@@ -4738,7 +4970,7 @@ def main(argv):
                 ports,
                 age,
                 storm,
-                validate_forward_stp_events(data, ports, link_ids),
+                events,
             )
         elif mode == "lag":
             (
@@ -4937,6 +5169,9 @@ def main(argv):
         return 5
     except ForwardStpWorkLimit:
         _fail("forward_stp_work_limit")
+        return 5
+    except StormWorkLimit:
+        _fail("storm_work_limit")
         return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
