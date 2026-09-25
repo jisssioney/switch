@@ -555,6 +555,202 @@ class RecordFailureTest(unittest.TestCase):
                 self.assertEqual(handle.read(), original)
 
 
+class LogLimitTest(unittest.TestCase):
+    """MAX_EVENTS / MAX_LOG_BYTES 上界：默认值、边界、优先级与 LOG 不动。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.cfg = os.path.join(d, "config.json")
+        self.evt = os.path.join(d, "events.json")
+        self.log = os.path.join(d, "out.log")
+        self.inlog = os.path.join(d, "in.log")
+        self.config = base_config()
+        self.events = [
+            frame(i, "p1", "00:00:00:00:00:01") for i in range(5)
+        ]
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(self.config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(self.events).encode())
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.record_out = rec.stdout
+        with open(self.log, "rb") as handle:
+            self.log_bytes = handle.read()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args):
+        proc = subprocess.run(
+            [sys.executable, SWITCH, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def test_record_event_limit_exceeded(self):
+        os.unlink(self.log)  # 仅校验超限不创建 LOG
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, "4", "16777216"
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"event_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_record_event_limit_equal_is_legal(self):
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "5", "16777216"
+        )
+        self.assertEqual(code, 0, err)
+
+    def test_replay_records_limit_exceeded(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        code, out, err = self._run(
+            "replay", self.inlog, "4", "16777216"
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"event_limit"}\n')
+
+    def test_replay_records_limit_equal_is_legal_and_byte_identical(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        code, out, err = self._run(
+            "replay", self.inlog, "5", "16777216"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_record_log_byte_boundary(self):
+        size = len(self.log_bytes)
+        # 等于上限合法，且与无上限输出逐字节一致
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "100000", str(size)
+        )
+        self.assertEqual(code, 0, err)
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+        os.unlink(self.log)
+        # 超一字节即拒，且不创建 LOG
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, "100000", str(size - 1)
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_replay_log_byte_boundary(self):
+        size = len(self.log_bytes)
+        code, _, err = self._run(
+            "replay", self.log, "100000", str(size)
+        )
+        self.assertEqual(code, 0, err)
+        code, out, err = self._run(
+            "replay", self.log, "100000", str(size - 1)
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+
+    def test_record_leaves_existing_log_untouched_on_log_limit(self):
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "100000", "5"
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_record_double_overflow_prefers_event_limit(self):
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "1", "1"
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"event_limit"}\n')
+
+    def test_replay_double_overflow_prefers_log_limit(self):
+        code, _, err = self._run("replay", self.log, "1", "1")
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+
+    def test_replay_byte_limit_checked_before_parse(self):
+        bulky = os.path.join(self.tmp.name, "bulky.log")
+        with open(bulky, "wb") as handle:
+            handle.write(b"{not json" + b" " * 200)
+        code, _, err = self._run("replay", bulky, "100000", "10")
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+
+    def test_replay_event_limit_after_shape_validation(self):
+        # records 类型非法：结构校验失败（invalid_input）优先于条数上界
+        doc = json.loads(self.log_bytes.decode())
+        doc["records"] = {}
+        digest, _ = prefix_digest(doc)
+        doc["sha256"] = digest
+        bad = os.path.join(self.tmp.name, "bad.log")
+        with open(bad, "wb") as handle:
+            handle.write(
+                (json.dumps(doc, separators=(",", ":")) + "\n").encode()
+            )
+        code, _, err = self._run("replay", bad, "1", "99999999")
+        self.assertEqual(code, 4)
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_nonlist_events_remains_invalid_input_under_limit(self):
+        with open(self.evt, "wb") as handle:
+            handle.write(b"{}")
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "1", "1"
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_bad_event_remains_invalid_input(self):
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps([{"t": 0}]).encode())
+        code, _, err = self._run(
+            "record", self.cfg, self.evt, self.log, "100", "100000"
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_defaults_and_explicit_limits_byte_identical(self):
+        code, out, err = self._run("record", self.cfg, self.evt, self.log)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+        code, out, err = self._run("replay", self.log)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        code, out, err = self._run(
+            "replay", self.log, "100000", "16777216"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_bad_limit_arguments_are_usage_errors(self):
+        bad = [
+            ("0", "10"), ("1", "0"), ("-1", "10"), ("a", "10"),
+            ("1", "1.5"), ("01", "10"), ("1", "0x10"), ("+1", "10"),
+            ("", "10"), ("10",), ("1", "2", "3"),
+        ]
+        for extra in bad:
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+            code, _, err = self._run("replay", self.log, *extra)
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+
+
 class CliErrorTest(unittest.TestCase):
     def test_record_usage(self):
         code, out, err, _ = run_cli(["record", "a", "b"])
