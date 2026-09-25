@@ -83,6 +83,10 @@ class StpWorkLimit(Exception):
     pass
 
 
+class FdbWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -191,6 +195,23 @@ def simulate(events, age):
             {"vlan": vlan, "mac": mac, "port": port, "seen": seen}
         )
     return {"fdb": entries}
+
+
+def fdb_work(events, age, limit):
+    """按既有老化/学习规则用独立空映射无副作用预演并累计工作量。
+
+    逐事件以老化前表项数 K 计 K+1（首事件成本 1，重复源与迁移同样计费）；
+    累计等于上限合法，首次超过上限即抛 FdbWorkLimit。
+    """
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    work = 0
+    for t, port, mac, vlan in events:
+        work += len(fdb) + 1
+        if work > limit:
+            raise FdbWorkLimit
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        fdb[(vlan, mac)] = [port, t]
 
 
 def validate_forward_config(config):
@@ -4040,6 +4061,7 @@ DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_STP_WORK = 10000000
+DEFAULT_MAX_FDB_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4455,9 +4477,11 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    # stp 额外允许 5 项上限（末尾为 MAX_STP_WORK）；其余 MODE 仅 0、2、4 项
+    # stp/fdb 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK）；
+    # 其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
-    allowed_counts = (3, 5, 7, 8) if is_stp else (3, 5, 7)
+    is_fdb = args[:1] == ["fdb"]
+    allowed_counts = (3, 5, 7, 8) if is_stp or is_fdb else (3, 5, 7)
     if len(args) not in allowed_counts or args[0] not in (
         "fdb",
         "forward",
@@ -4494,11 +4518,23 @@ def main(argv):
             max_output_bytes,
             max_stp_work,
         ) = parsed + stp_limits[len(parsed):]
+        max_fdb_work = None
+    elif is_fdb:
+        fdb_limits = limits + (DEFAULT_MAX_FDB_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_fdb_work,
+        ) = parsed + fdb_limits[len(parsed):]
+        max_stp_work = None
     else:
         max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
             parsed + limits[len(parsed):]
         )
         max_stp_work = None
+        max_fdb_work = None
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4526,7 +4562,11 @@ def main(argv):
             return 5
         if mode == "fdb":
             ports, age = validate_config(config)
-            result = simulate(validate_events(data, ports), age)
+            events = validate_events(data, ports)
+            # 两文件解析及全量语义校验后，用独立空映射无副作用预演；
+            # 超限时不得调用正式仿真
+            fdb_work(events, age, max_fdb_work)
+            result = simulate(events, age)
         elif mode == "stp":
             bridges, links, delay = validate_stp_config(config)
             link_ids = {link["id"] for link in links}
@@ -4748,6 +4788,9 @@ def main(argv):
         return 4
     except StpWorkLimit:
         _fail("stp_work_limit")
+        return 5
+    except FdbWorkLimit:
+        _fail("fdb_work_limit")
         return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
