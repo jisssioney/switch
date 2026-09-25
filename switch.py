@@ -4001,6 +4001,18 @@ def _fail(message):
 
 RECORD_SCHEMA = 1
 LOG_KEYS = ("schema", "config", "records", "sha256")
+DEFAULT_MAX_EVENTS = 100000
+DEFAULT_MAX_LOG_BYTES = 16777216
+LIMIT_RE = re.compile(r"[1-9][0-9]*\Z")
+
+
+def _parse_limits(args):
+    """可选上限对 [MAX_EVENTS MAX_LOG_BYTES]：缺省给默认；非法返回 None。"""
+    if not args:
+        return DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_BYTES
+    if len(args) != 2 or not all(LIMIT_RE.fullmatch(arg) for arg in args):
+        return None
+    return int(args[0]), int(args[1])
 RECORD_KEYS = ("t", "version", "event", "applied", "output")
 EVENT_KIND_BY_KEYS = {
     STP_EVENT_KEYS: "link",
@@ -4227,7 +4239,7 @@ def _emit_result(result):
     sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
 
 
-def _cmd_record(config_path, events_path, log_path):
+def _cmd_record(config_path, events_path, log_path, max_events, max_log_bytes):
     try:
         with open(config_path, "rb") as handle:
             config_raw = handle.read()
@@ -4237,16 +4249,27 @@ def _cmd_record(config_path, events_path, log_path):
         _fail("file_not_found")
         return 3
     try:
-        # 先无副作用预演：解析、全部校验与各重载点检测均在内存完成
         config = parse_json(config_raw)
         events = parse_json(events_raw)
-        result, observer = _run_reload(config, events, True)
-        doc = _build_log_doc(config, events, observer["items"])
-        payload = _log_bytes(doc)
-        _atomic_write(log_path, payload)  # 成功后才原子写 LOG
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    if isinstance(events, list) and len(events) > max_events:  # 预演前判事件数
+        _fail("event_limit")
+        return 5
+    try:
+        # 先无副作用预演：全部校验与各重载点检测均在内存完成
+        result, observer = _run_reload(config, events, True)
+        doc = _build_log_doc(config, events, observer["items"])
+        payload = _log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    if len(payload) > max_log_bytes:  # 写入前判序列化字节数；不触碰 LOG
+        _fail("log_limit")
+        return 5
+    try:
+        _atomic_write(log_path, payload)  # 成功后才原子写 LOG
     except OSError:
         _fail("file_not_found")
         return 3
@@ -4254,18 +4277,24 @@ def _cmd_record(config_path, events_path, log_path):
     return 0
 
 
-def _cmd_replay(log_path):
+def _cmd_replay(log_path, max_events, max_log_bytes):
     try:
         with open(log_path, "rb") as handle:
-            log_raw = handle.read()
+            log_raw = handle.read(max_log_bytes + 1)  # 至多上限+1字节判字节数
     except OSError:
         _fail("file_not_found")
         return 3
+    if len(log_raw) > max_log_bytes:
+        _fail("log_limit")
+        return 5
     try:
         log = parse_json(log_raw)  # 全量校验先于重放
         _validate_log_shape(log)
         if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
             raise InvalidInput("bad log sha256")
+        if len(log["records"]) > max_events:  # 解析校验后、重放前判 records 数
+            _fail("event_limit")
+            return 5
         config = log["config"]
         events = [record["event"] for record in log["records"]]
         result, observer = _run_reload(config, events, True)
@@ -4284,15 +4313,25 @@ def _cmd_replay(log_path):
 def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
-        if len(args) != 4:  # record CONFIG EVENTS LOG
+        # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES]
+        if len(args) not in (4, 6):
             _fail("usage")
             return 2
-        return _cmd_record(args[1], args[2], args[3])
+        limits = _parse_limits(args[4:])
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_record(args[1], args[2], args[3], *limits)
     if args[:1] == ["replay"]:
-        if len(args) != 2:  # replay LOG
+        # replay LOG [MAX_EVENTS MAX_LOG_BYTES]
+        if len(args) not in (2, 4):
             _fail("usage")
             return 2
-        return _cmd_replay(args[1])
+        limits = _parse_limits(args[2:])
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_replay(args[1], *limits)
     if len(args) != 3 or args[0] not in (
         "fdb",
         "forward",
