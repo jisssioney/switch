@@ -740,7 +740,7 @@ class LogLimitTest(unittest.TestCase):
         bad = [
             ("0", "10"), ("1", "0"), ("-1", "10"), ("a", "10"),
             ("1", "1.5"), ("01", "10"), ("1", "0x10"), ("+1", "10"),
-            ("", "10"), ("10",), ("1", "2", "3"),
+            ("", "10"), ("10",),
         ]
         for extra in bad:
             code, _, err = self._run(
@@ -749,6 +749,108 @@ class LogLimitTest(unittest.TestCase):
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
             code, _, err = self._run("replay", self.log, *extra)
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+
+    def test_limit_arity_per_subcommand(self):
+        # record 可选上限仅 0、2、4、5 个；replay 仅 0、2、3 个
+        for extra in [("1", "2", "3"), ("1", "2", "3", "4", "5", "6")]:
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+        for extra in [("1", "2", "3", "4"), ("1", "2", "3", "4", "5")]:
+            code, _, err = self._run("replay", self.log, *extra)
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+        # 合法个数：record 5 个、replay 3 个
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", "16777216",
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        code, out, err = self._run(
+            "replay", self.log, "100000", "16777216", "16777216"
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+
+    def test_record_output_limit_exceeded(self):
+        os.unlink(self.log)  # 仅校验超限不创建 LOG
+        limit = str(len(self.record_out) - 1)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", limit,
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_record_output_limit_does_not_replace_log(self):
+        limit = str(len(self.record_out) - 1)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", limit,
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_record_output_limit_equal_is_legal(self):
+        limit = str(len(self.record_out))
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", limit,
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_record_output_limit_after_log_limit(self):
+        # log_limit 先于 output_limit 判定
+        limit = str(len(self.record_out) - 1)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "1", "1048576", "16777216", limit,
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+
+    def test_replay_output_limit_exceeded(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        limit = str(len(self.record_out) - 1)
+        code, out, err = self._run(
+            "replay", self.inlog, "100000", "16777216", limit
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        with open(self.inlog, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_replay_output_limit_equal_is_legal(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        limit = str(len(self.record_out))
+        code, out, err = self._run(
+            "replay", self.inlog, "100000", "16777216", limit
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+
+    def test_replay_output_limit_after_log_checks(self):
+        # 日志语义错误仍按 invalid_input，先于 output_limit
+        doc = json.loads(self.log_bytes.decode())
+        doc["records"][0]["applied"] = not doc["records"][0]["applied"]
+        digest, _ = prefix_digest(doc)
+        doc["sha256"] = digest
+        bad = (json.dumps(doc, separators=(",", ":")) + "\n").encode()
+        with open(self.inlog, "wb") as handle:
+            handle.write(bad)
+        code, out, err = self._run("replay", self.inlog, "100000", "99999999", "1")
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
 
 
 class CliErrorTest(unittest.TestCase):
