@@ -736,17 +736,157 @@ class LogLimitTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(out, self.record_out)
 
+    def test_record_output_limit_exceeded_creates_nothing(self):
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216",
+            str(len(self.record_out) - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_record_output_limit_exceeded_keeps_existing_log(self):
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216",
+            str(len(self.record_out) - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)  # 不被替换
+
+    def test_record_output_limit_equal_is_legal(self):
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216",
+            str(len(self.record_out)),
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_record_output_limit_explicit_default_is_byte_identical(self):
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", "16777216",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_record_log_limit_precedes_output_limit(self):
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", str(len(self.log_bytes) - 1),
+            "1048576", "16777216", "1",
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"log_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_replay_output_limit_exceeded(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        code, out, err = self._run(
+            "replay", self.inlog, "100000", "16777216",
+            str(len(self.record_out) - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"output_limit"}\n')
+        with open(self.inlog, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)  # LOG 不动
+
+    def test_replay_output_limit_equal_is_legal(self):
+        with open(self.inlog, "wb") as handle:
+            handle.write(self.log_bytes)
+        code, out, err = self._run(
+            "replay", self.inlog, "100000", "16777216",
+            str(len(self.record_out)),
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
+    def test_replay_output_limit_after_verification(self):
+        # 核对失败的日志仍判 invalid_input，而非 output_limit
+        doc = json.loads(self.log_bytes)
+        doc["records"][0]["applied"] = not doc["records"][0]["applied"]
+        prefix = {key: doc[key] for key in ("schema", "config", "records")}
+        doc["sha256"] = hashlib.sha256(
+            (
+                json.dumps(prefix, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        with open(self.inlog, "wb") as handle:
+            handle.write(
+                (
+                    json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+            )
+        code, out, err = self._run(
+            "replay", self.inlog, "100000", "16777216", "1"
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_output_limit_accepts_arbitrary_length_decimal(self):
+        big = "9" * 40
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", big,
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+        code, out, err = self._run(
+            "replay", self.log, "100000", "16777216", big
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, self.record_out)
+
     def test_bad_limit_arguments_are_usage_errors(self):
         bad = [
             ("0", "10"), ("1", "0"), ("-1", "10"), ("a", "10"),
             ("1", "1.5"), ("01", "10"), ("1", "0x10"), ("+1", "10"),
-            ("", "10"), ("10",), ("1", "2", "3"),
+            ("", "10"), ("10",),
         ]
         for extra in bad:
             code, _, err = self._run(
                 "record", self.cfg, self.evt, self.log, *extra
             )
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+            code, _, err = self._run("replay", self.log, *extra)
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+        # 上限个数：record 仅 0/2/4/5，replay 仅 0/2/3
+        for extra in [("1", "2", "3"), ("1", "2", "3", "4", "5", "6")]:
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+        code, _, err = self._run("replay", self.log, "1", "2", "3", "4")
+        self.assertEqual((code, err), (2, b'{"error":"usage"}\n'))
+        # MAX_OUTPUT_BYTES 位置同样须匹配 [1-9][0-9]*
+        for extra in [
+            ("100000", "16777216", "1048576", "16777216", "0"),
+            ("100000", "16777216", "1048576", "16777216", "01"),
+        ]:
+            code, _, err = self._run(
+                "record", self.cfg, self.evt, self.log, *extra
+            )
+            self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
+        for extra in [("100000", "16777216", "0"), ("100000", "16777216", "x")]:
             code, _, err = self._run("replay", self.log, *extra)
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
 
