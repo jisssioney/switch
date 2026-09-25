@@ -11,6 +11,9 @@ CONFIG_KEYS = frozenset(("ports", "age"))
 EVENT_KEYS = frozenset(("t", "port", "mac", "vlan"))
 PORT_KEYS = frozenset(("name", "vlan", "up"))
 FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
+PORT_KEYS_V2 = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
+FRAME_KEYS_V2 = frozenset(("t", "port", "src", "dst", "vlan"))
+PORT_MODES = ("access", "trunk", "hybrid")
 
 
 class InvalidInput(Exception):
@@ -237,6 +240,195 @@ def forward(frames, ports, age):
     }
 
 
+def _valid_vlan_id(value):
+    return _is_int(value) and 1 <= value <= 4094
+
+
+def _strictly_increasing(values):
+    return all(values[i] < values[i + 1] for i in range(len(values) - 1))
+
+
+def is_v2_config(config):
+    if not isinstance(config, dict) or frozenset(config) != CONFIG_KEYS:
+        return False
+    ports = config["ports"]
+    return (
+        isinstance(ports, list)
+        and bool(ports)
+        and all(
+            isinstance(port, dict) and frozenset(port) == PORT_KEYS_V2
+            for port in ports
+        )
+    )
+
+
+def validate_forward_config_v2(config):
+    if not isinstance(config, dict) or frozenset(config) != CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    ports = config["ports"]
+    age = config["age"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    names = []
+    for port in ports:
+        if not isinstance(port, dict) or frozenset(port) != PORT_KEYS_V2:
+            raise InvalidInput("bad port")
+        name = port["name"]
+        mode = port["mode"]
+        pvid = port["pvid"]
+        allowed = port["allowed"]
+        untagged = port["untagged"]
+        up = port["up"]
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("bad port name")
+        if mode not in PORT_MODES:
+            raise InvalidInput("bad mode")
+        if not _valid_vlan_id(pvid):
+            raise InvalidInput("bad pvid")
+        if (
+            not isinstance(allowed, list)
+            or not allowed
+            or not all(_valid_vlan_id(vlan) for vlan in allowed)
+            or not _strictly_increasing(allowed)
+            or pvid not in allowed
+        ):
+            raise InvalidInput("bad allowed")
+        if (
+            not isinstance(untagged, list)
+            or not all(_valid_vlan_id(vlan) for vlan in untagged)
+            or not _strictly_increasing(untagged)
+            or not all(vlan in allowed for vlan in untagged)
+        ):
+            raise InvalidInput("bad untagged")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        if mode == "access" and (allowed != [pvid] or untagged != [pvid]):
+            raise InvalidInput("bad access port")
+        if mode == "trunk" and untagged:
+            raise InvalidInput("bad trunk port")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise InvalidInput("ports must be distinct")
+    if not _is_int(age) or age <= 0:
+        raise InvalidInput("age must be a positive integer")
+    return ports, age
+
+
+def validate_frames_v2(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for frame in frames:
+        if not isinstance(frame, dict) or frozenset(frame) != FRAME_KEYS_V2:
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        src = frame["src"]
+        dst = frame["dst"]
+        vlan = frame["vlan"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in names:
+            raise InvalidInput("unknown port")
+        if not valid_mac(src):
+            raise InvalidInput("bad src")
+        if dst != BROADCAST_MAC and not valid_mac(dst):
+            raise InvalidInput("bad dst")
+        if vlan is not None and not _valid_vlan_id(vlan):
+            raise InvalidInput("bad vlan")
+        result.append((t, port, src, dst, vlan))
+    return result
+
+
+def forward_v2(frames, ports, age):
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, src, dst, tag in frames:
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append({"t": t, "action": "drop", "ports": []})
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target = by_name[hit[0]]
+                if target["up"] and vlan in target["allowed"]:
+                    egress = [hit[0]]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["up"]
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append({"t": t, "action": action, "ports": out_ports})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -265,8 +457,12 @@ def main(argv):
             ports, age = validate_config(config)
             result = simulate(validate_events(data, ports), age)
         else:
-            ports, age = validate_forward_config(config)
-            result = forward(validate_frames(data, ports), ports, age)
+            if is_v2_config(config):
+                ports, age = validate_forward_config_v2(config)
+                result = forward_v2(validate_frames_v2(data, ports), ports, age)
+            else:
+                ports, age = validate_forward_config(config)
+                result = forward(validate_frames(data, ports), ports, age)
     except InvalidInput:
         _fail("invalid_input")
         return 4
