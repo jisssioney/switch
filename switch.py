@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """二层以太网交换机仿真（仅标准库）。"""
 
+import heapq
 import json
 import re
 import sys
@@ -14,6 +15,10 @@ FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
 PORT_KEYS_V2 = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
 FRAME_KEYS_V2 = frozenset(("t", "port", "src", "dst", "vlan"))
 PORT_MODES = ("access", "trunk", "hybrid")
+STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
+STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
+STP_EVENT_KEYS = frozenset(("t", "id", "up"))
+STP_TIMED_ROLES = ("root", "designated")
 
 
 class InvalidInput(Exception):
@@ -429,6 +434,210 @@ def forward_v2(frames, ports, age):
     }
 
 
+def validate_stp_config(config):
+    if not isinstance(config, dict) or frozenset(config) != STP_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges = config["bridges"]
+    links = config["links"]
+    delay = config["delay"]
+    if (
+        not isinstance(bridges, list)
+        or not bridges
+        or not all(isinstance(name, str) and name for name in bridges)
+        or len(set(bridges)) != len(bridges)
+    ):
+        raise InvalidInput("bad bridges")
+    if not _is_int(delay) or delay <= 0:
+        raise InvalidInput("bad delay")
+    if not isinstance(links, list):
+        raise InvalidInput("links must be a list")
+    bridge_set = set(bridges)
+    ids = []
+    endpoints = set()
+    parsed = []
+    for link in links:
+        if not isinstance(link, dict) or frozenset(link) != STP_LINK_KEYS:
+            raise InvalidInput("bad link")
+        lid = link["id"]
+        cost = link["cost"]
+        up = link["up"]
+        if not isinstance(lid, str) or not lid:
+            raise InvalidInput("bad link id")
+        ends = []
+        for end in (link["x"], link["y"]):
+            if (
+                not isinstance(end, list)
+                or len(end) != 2
+                or not isinstance(end[0], str)
+                or end[0] not in bridge_set
+                or not isinstance(end[1], str)
+                or not end[1]
+            ):
+                raise InvalidInput("bad link endpoint")
+            ends.append((end[0], end[1]))
+        if ends[0][0] == ends[1][0]:
+            raise InvalidInput("link endpoints on the same bridge")
+        if ends[0] in endpoints or ends[1] in endpoints:
+            raise InvalidInput("duplicate link endpoint")
+        endpoints.update(ends)
+        if not _is_int(cost) or cost <= 0:
+            raise InvalidInput("bad cost")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        ids.append(lid)
+        parsed.append(
+            {"id": lid, "x": ends[0], "y": ends[1], "cost": cost, "up": up}
+        )
+    if len(set(ids)) != len(ids):
+        raise InvalidInput("link ids must be distinct")
+    return bridges, parsed, delay
+
+
+def validate_stp_events(events, link_ids):
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict) or frozenset(event) != STP_EVENT_KEYS:
+            raise InvalidInput("bad event")
+        t = event["t"]
+        lid = event["id"]
+        up = event["up"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(lid, str) or not lid or lid not in link_ids:
+            raise InvalidInput("bad event id")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        result.append((t, lid, up))
+    return result
+
+
+def stp_converge(bridges, links):
+    """按当前 up 状态计算各桥分量根、根路径开销与端口角色。"""
+    parent = {name: name for name in bridges}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    adjacency = {name: [] for name in bridges}
+    for link in links:
+        if not link["up"]:
+            continue
+        (bx, px), (by, py) = link["x"], link["y"]
+        rx, ry = find(bx), find(by)
+        if rx != ry:
+            parent[rx] = ry
+        adjacency[bx].append((px, by, py, link["cost"]))
+        adjacency[by].append((py, bx, px, link["cost"]))
+    members_of = {}
+    for name in bridges:
+        members_of.setdefault(find(name), []).append(name)
+    root_of = {}
+    for members in members_of.values():
+        root = min(members)
+        for name in members:
+            root_of[name] = root
+    cost = {name: 0 if root_of[name] == name else None for name in bridges}
+    heap = [(0, name) for name in bridges if root_of[name] == name]
+    heapq.heapify(heap)
+    while heap:
+        current, name = heapq.heappop(heap)
+        if current > cost[name]:
+            continue
+        for _, neighbor, _, link_cost in adjacency[name]:
+            new_cost = current + link_cost
+            if cost[neighbor] is None or new_cost < cost[neighbor]:
+                cost[neighbor] = new_cost
+                heapq.heappush(heap, (new_cost, neighbor))
+    roles = {name: {} for name in bridges}
+    for name in bridges:
+        if root_of[name] == name:
+            continue
+        best = None
+        for port, neighbor, peer_port, link_cost in adjacency[name]:
+            candidate = (cost[neighbor] + link_cost, neighbor, peer_port, port)
+            if best is None or candidate < best:
+                best = candidate
+        if best is not None:
+            roles[name][best[3]] = "root"
+    for link in links:
+        if not link["up"]:
+            continue
+        (bx, px), (by, py) = link["x"], link["y"]
+        vector_x = (root_of[bx], cost[bx], bx, px)
+        vector_y = (root_of[by], cost[by], by, py)
+        winner = (bx, px) if vector_x < vector_y else (by, py)
+        roles[winner[0]][winner[1]] = "designated"
+    for link in links:
+        for bridge, port in (link["x"], link["y"]):
+            if link["up"]:
+                roles[bridge].setdefault(port, "alternate")
+            else:
+                roles[bridge][port] = "disabled"
+    return root_of, cost, roles
+
+
+def stp(bridges, links, delay, events):
+    by_id = {link["id"]: link for link in links}
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    results = []
+
+    def snapshot(t):
+        root_of, cost, roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in roles[name].items():
+                previous[(name, port)] = role
+        entry = {"t": t, "bridges": []}
+        for name in bridges:
+            ports = []
+            for port in sorted(roles[name]):
+                role = roles[name][port]
+                if role in STP_TIMED_ROLES:
+                    elapsed = t - since[(name, port)]
+                    if elapsed < delay:
+                        state = "discarding"
+                    elif elapsed < 2 * delay:
+                        state = "learning"
+                    else:
+                        state = "forwarding"
+                else:
+                    state = "discarding"
+                ports.append({"name": port, "role": role, "state": state})
+            entry["bridges"].append(
+                {
+                    "name": name,
+                    "root": root_of[name],
+                    "cost": cost[name],
+                    "ports": ports,
+                }
+            )
+        results.append(entry)
+
+    snapshot(0)
+    for t, lid, up in events:
+        by_id[lid]["up"] = up
+        snapshot(t)
+    return {"results": results}
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -437,7 +646,7 @@ def _fail(message):
 
 def main(argv):
     args = argv[1:]
-    if len(args) != 3 or args[0] not in ("fdb", "forward"):
+    if len(args) != 3 or args[0] not in ("fdb", "forward", "stp"):
         _fail("usage")
         return 2
     mode = args[0]
@@ -456,6 +665,12 @@ def main(argv):
         if mode == "fdb":
             ports, age = validate_config(config)
             result = simulate(validate_events(data, ports), age)
+        elif mode == "stp":
+            bridges, links, delay = validate_stp_config(config)
+            link_ids = {link["id"] for link in links}
+            result = stp(
+                bridges, links, delay, validate_stp_events(data, link_ids)
+            )
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
