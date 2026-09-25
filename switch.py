@@ -4001,23 +4001,52 @@ def _fail(message):
 
 DEFAULT_MAX_EVENTS = 100000
 DEFAULT_MAX_LOG_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_CONFIG_BYTES = 1024 * 1024
+DEFAULT_MAX_EVENTS_BYTES = 16 * 1024 * 1024
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
+_READ_CHUNK = 65536
+
+
+def _limit_value(token):
+    """十进制上限串转整数：逐位累加，任意长度按数学整数处理。"""
+    value = 0
+    for char in token:
+        value = value * 10 + ord(char) - ord("0")
+    return value
 
 
 def _parse_limits(tokens):
-    """解析可选的 MAX_EVENTS MAX_LOG_BYTES（须成对、[1-9][0-9]*）。
+    """解析可选上限（只准 0、2 或 4 项，均须匹配 [1-9][0-9]*）。
 
-    空序列取默认值；个数不对或任一参数非法返回 None（调用方按 usage 处理）。
+    返回 (MAX_EVENTS, MAX_LOG_BYTES, MAX_CONFIG_BYTES, MAX_EVENTS_BYTES)，
+    缺省项取默认值；个数不对或任一参数非法返回 None（调用方按 usage 处理）。
     """
-    if not tokens:
-        return DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_BYTES
-    if len(tokens) != 2:
+    if len(tokens) not in (0, 2, 4):
         return None
-    if _LIMIT_RE.fullmatch(tokens[0]) is None:
+    if any(_LIMIT_RE.fullmatch(token) is None for token in tokens):
         return None
-    if _LIMIT_RE.fullmatch(tokens[1]) is None:
-        return None
-    return int(tokens[0]), int(tokens[1])
+    defaults = (
+        DEFAULT_MAX_EVENTS,
+        DEFAULT_MAX_LOG_BYTES,
+        DEFAULT_MAX_CONFIG_BYTES,
+        DEFAULT_MAX_EVENTS_BYTES,
+    )
+    parsed = tuple(_limit_value(token) for token in tokens)
+    return parsed + defaults[len(parsed):]
+
+
+def _read_limited(handle, limit):
+    """按至多 65536 字节分块读取；超过 limit 即停止并返回 None。"""
+    chunks = []
+    total = 0
+    while True:
+        chunk = handle.read(min(_READ_CHUNK, limit + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            return None
 
 
 RECORD_SCHEMA = 1
@@ -4248,12 +4277,28 @@ def _emit_result(result):
     sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
 
 
-def _cmd_record(config_path, events_path, log_path, max_events, max_log_bytes):
+def _cmd_record(
+    config_path,
+    events_path,
+    log_path,
+    max_events,
+    max_log_bytes,
+    max_config_bytes,
+    max_events_bytes,
+):
     try:
-        with open(config_path, "rb") as handle:
-            config_raw = handle.read()
-        with open(events_path, "rb") as handle:
-            events_raw = handle.read()
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            # 两文件均可读后，先判 CONFIG 原始字节，再判 EVENTS 原始字节
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_events_bytes)
+            if events_raw is None:
+                _fail("events_limit")
+                return 5
     except OSError:
         _fail("file_not_found")
         return 3
@@ -4287,12 +4332,12 @@ def _cmd_record(config_path, events_path, log_path, max_events, max_log_bytes):
 def _cmd_replay(log_path, max_events, max_log_bytes):
     try:
         with open(log_path, "rb") as handle:
-            log_raw = handle.read(max_log_bytes + 1)
+            log_raw = _read_limited(handle, max_log_bytes)
     except OSError:
         _fail("file_not_found")
         return 3
-    # 字节上界先判定（至多读取 MAX_LOG_BYTES+1 字节，含末尾 LF）
-    if len(log_raw) > max_log_bytes:
+    # 字节上界先判定（分块读取、超限即停，含末尾 LF）
+    if log_raw is None:
         _fail("log_limit")
         return 5
     try:
@@ -4322,14 +4367,15 @@ def _cmd_replay(log_path, max_events, max_log_bytes):
 def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
-        if len(args) not in (4, 6):  # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES]
+        # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES [MAX_CONFIG_BYTES MAX_EVENTS_BYTES]]
+        if len(args) not in (4, 6, 8):
             _fail("usage")
             return 2
         limits = _parse_limits(args[4:])
         if limits is None:
             _fail("usage")
             return 2
-        return _cmd_record(args[1], args[2], args[3], limits[0], limits[1])
+        return _cmd_record(args[1], args[2], args[3], *limits)
     if args[:1] == ["replay"]:
         if len(args) not in (2, 4):  # replay LOG [MAX_EVENTS MAX_LOG_BYTES]
             _fail("usage")
