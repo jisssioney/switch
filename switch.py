@@ -79,6 +79,10 @@ class InvalidInput(Exception):
     pass
 
 
+class StpWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -648,14 +652,41 @@ def stp_converge(bridges, links):
     return root_of, cost, roles
 
 
-def stp(bridges, links, delay, events):
+def stp(bridges, links, delay, events, max_work=None):
     by_id = {link["id"]: link for link in links}
+    B = len(bridges)
+    L = len(links)
+
+    def up_count():
+        return sum(1 for link in links if link["up"])
+
+    def work_for(up):
+        return B + L + 2 * up
+
+    # 仅当 up 链路集合改变时才真正收敛；幂等事件复用缓存结果。
+    # 先以独立链路状态无副作用预演，累计工作量超限即在仿真前报错。
+    work = 0
+    up = up_count()
+    work += work_for(up)  # 初始 t=0 收敛
+    sim_up = {lid: link["up"] for lid, link in by_id.items()}
+    for _t, lid, new_up in events:
+        if sim_up[lid] != new_up:
+            sim_up[lid] = new_up
+            up += 1 if new_up else -1
+            work += work_for(up)
+    if max_work is not None and work > max_work:
+        raise StpWorkLimit
+
     previous = {}  # (bridge, port) -> 上一轮角色
     since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
     results = []
+    cached = None  # 最近一次实际收敛的 (root_of, cost, roles)
 
     def snapshot(t):
-        root_of, cost, roles = stp_converge(bridges, links)
+        nonlocal cached
+        if cached is None:
+            cached = stp_converge(bridges, links)
+        root_of, cost, roles = cached
         for name in bridges:
             for port, role in roles[name].items():
                 key = (name, port)
@@ -695,8 +726,10 @@ def stp(bridges, links, delay, events):
         results.append(entry)
 
     snapshot(0)
-    for t, lid, up in events:
-        by_id[lid]["up"] = up
+    for t, lid, new_up in events:
+        if by_id[lid]["up"] != new_up:
+            by_id[lid]["up"] = new_up
+            cached = None
         snapshot(t)
     return {"results": results}
 
@@ -4006,6 +4039,7 @@ DEFAULT_MAX_EVENTS_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_STP_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4421,7 +4455,10 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    if len(args) not in (3, 5, 7) or args[0] not in (
+    # stp 额外允许 5 项上限（末尾为 MAX_STP_WORK）；其余 MODE 仅 0、2、4 项
+    is_stp = args[:1] == ["stp"]
+    allowed_counts = (3, 5, 7, 8) if is_stp else (3, 5, 7)
+    if len(args) not in allowed_counts or args[0] not in (
         "fdb",
         "forward",
         "stp",
@@ -4436,8 +4473,8 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES]]
-    # 上限只准 0、2 或 4 项，均须匹配 [1-9][0-9]*，按数学整数比较
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK]]]
+    # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
         return 2
@@ -4448,9 +4485,20 @@ def main(argv):
         DEFAULT_MAX_OUTPUT_BYTES,
     )
     parsed = tuple(_limit_value(token) for token in args[3:])
-    max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
-        parsed + limits[len(parsed):]
-    )
+    if is_stp:
+        stp_limits = limits + (DEFAULT_MAX_STP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_stp_work,
+        ) = parsed + stp_limits[len(parsed):]
+    else:
+        max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
+            parsed + limits[len(parsed):]
+        )
+        max_stp_work = None
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4483,7 +4531,11 @@ def main(argv):
             bridges, links, delay = validate_stp_config(config)
             link_ids = {link["id"] for link in links}
             result = stp(
-                bridges, links, delay, validate_stp_events(data, link_ids)
+                bridges,
+                links,
+                delay,
+                validate_stp_events(data, link_ids),
+                max_stp_work,
             )
         elif mode == "forward-stp":
             bridges, links, delay, bridge, ports, age = (
@@ -4694,6 +4746,9 @@ def main(argv):
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except StpWorkLimit:
+        _fail("stp_work_limit")
+        return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
