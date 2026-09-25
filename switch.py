@@ -91,6 +91,10 @@ class ForwardWorkLimit(Exception):
     pass
 
 
+class ForwardStpWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -1063,6 +1067,37 @@ def forward_stp(bridges, links, delay, bridge_name, ports, age, events):
             for vlan in sorted(vlan_stats)
         ],
     }
+
+
+def forward_stp_work(bridges, links, ports, events, limit):
+    """forward-stp 的工作量预演：仅跟踪 up 链路数与帧数，无副作用。
+
+    B、L、P 分别为桥、链路、端口数，U 为 up 链路数，E 为此前帧数。
+    初始收敛计 B+L+2U；逐事件先按原规则老化：帧计 E+P+1 再令 E 加 1；
+    链路先应用 up，再计 E*(P+1)+B+L+2U+2P+1，幂等也计。
+    累计等于上限合法，首次超过即抛 ForwardStpWorkLimit。
+    """
+    B = len(bridges)
+    L = len(links)
+    P = len(ports)
+    sim_up = {link["id"]: link["up"] for link in links}
+    U = sum(1 for link in links if link["up"])
+    E = 0
+    work = B + L + 2 * U  # 初始收敛
+    if work > limit:
+        raise ForwardStpWorkLimit
+    for item in events:
+        if item[0] == "link":
+            _, _, lid, up = item
+            if sim_up[lid] != up:
+                sim_up[lid] = up
+                U += 1 if up else -1
+            work += E * (P + 1) + B + L + 2 * U + 2 * P + 1
+        else:
+            work += E + P + 1
+            E += 1
+        if work > limit:
+            raise ForwardStpWorkLimit
 
 
 def validate_forward_stp_storm_config(config):
@@ -4118,6 +4153,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_STP_WORK = 10000000
 DEFAULT_MAX_FDB_WORK = 10000000
 DEFAULT_MAX_FORWARD_WORK = 10000000
+DEFAULT_MAX_FORWARD_STP_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4533,13 +4569,17 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    # stp/fdb/forward 额外允许 5 项上限（末尾分别为
-    # MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK）；其余 MODE 仅 0、2、4 项
+    # stp/fdb/forward/forward-stp 额外允许 5 项上限（末尾分别为
+    # MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK）；
+    # 其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
+    is_forward_stp = args[:1] == ["forward-stp"]
     allowed_counts = (
-        (3, 5, 7, 8) if is_stp or is_fdb or is_forward else (3, 5, 7)
+        (3, 5, 7, 8)
+        if is_stp or is_fdb or is_forward or is_forward_stp
+        else (3, 5, 7)
     )
     if len(args) not in allowed_counts or args[0] not in (
         "fdb",
@@ -4556,7 +4596,7 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK]]]
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK]]]
     # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
@@ -4579,6 +4619,7 @@ def main(argv):
         ) = parsed + stp_limits[len(parsed):]
         max_fdb_work = None
         max_forward_work = None
+        max_forward_stp_work = None
     elif is_fdb:
         fdb_limits = limits + (DEFAULT_MAX_FDB_WORK,)
         (
@@ -4590,6 +4631,7 @@ def main(argv):
         ) = parsed + fdb_limits[len(parsed):]
         max_stp_work = None
         max_forward_work = None
+        max_forward_stp_work = None
     elif is_forward:
         forward_limits = limits + (DEFAULT_MAX_FORWARD_WORK,)
         (
@@ -4601,6 +4643,19 @@ def main(argv):
         ) = parsed + forward_limits[len(parsed):]
         max_stp_work = None
         max_fdb_work = None
+        max_forward_stp_work = None
+    elif is_forward_stp:
+        forward_stp_limits = limits + (DEFAULT_MAX_FORWARD_STP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_forward_stp_work,
+        ) = parsed + forward_stp_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
     else:
         max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
             parsed + limits[len(parsed):]
@@ -4608,6 +4663,7 @@ def main(argv):
         max_stp_work = None
         max_fdb_work = None
         max_forward_work = None
+        max_forward_stp_work = None
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4655,6 +4711,11 @@ def main(argv):
                 validate_forward_stp_config(config)
             )
             link_ids = {link["id"] for link in links}
+            events = validate_forward_stp_events(data, ports, link_ids)
+            # 全量语义校验后无副作用预演；超限时不得调用正式仿真
+            forward_stp_work(
+                bridges, links, ports, events, max_forward_stp_work
+            )
             result = forward_stp(
                 bridges,
                 links,
@@ -4662,7 +4723,7 @@ def main(argv):
                 bridge,
                 ports,
                 age,
-                validate_forward_stp_events(data, ports, link_ids),
+                events,
             )
         elif mode == "forward-stp-storm":
             bridges, links, delay, bridge, ports, age, storm = (
@@ -4873,6 +4934,9 @@ def main(argv):
         return 5
     except ForwardWorkLimit:
         _fail("forward_work_limit")
+        return 5
+    except ForwardStpWorkLimit:
+        _fail("forward_stp_work_limit")
         return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
