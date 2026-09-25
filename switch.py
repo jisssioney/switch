@@ -6,8 +6,11 @@ import re
 import sys
 
 MAC_RE = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
+BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
 CONFIG_KEYS = frozenset(("ports", "age"))
 EVENT_KEYS = frozenset(("t", "port", "mac", "vlan"))
+PORT_KEYS = frozenset(("name", "vlan", "up"))
+FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
 
 
 class InvalidInput(Exception):
@@ -115,6 +118,125 @@ def simulate(events, age):
     return {"fdb": entries}
 
 
+def validate_forward_config(config):
+    if not isinstance(config, dict) or frozenset(config) != CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    ports = config["ports"]
+    age = config["age"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    names = []
+    for port in ports:
+        if not isinstance(port, dict) or frozenset(port) != PORT_KEYS:
+            raise InvalidInput("bad port")
+        name = port["name"]
+        vlan = port["vlan"]
+        up = port["up"]
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("bad port name")
+        if not _is_int(vlan) or not 1 <= vlan <= 4094:
+            raise InvalidInput("bad vlan")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise InvalidInput("ports must be distinct")
+    if not _is_int(age) or age <= 0:
+        raise InvalidInput("age must be a positive integer")
+    return ports, age
+
+
+def validate_frames(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for frame in frames:
+        if not isinstance(frame, dict) or frozenset(frame) != FRAME_KEYS:
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        src = frame["src"]
+        dst = frame["dst"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in names:
+            raise InvalidInput("unknown port")
+        if not valid_mac(src):
+            raise InvalidInput("bad src")
+        if dst != BROADCAST_MAC and not valid_mac(dst):
+            raise InvalidInput("bad dst")
+        result.append((t, port, src, dst))
+    return result
+
+
+def forward(frames, ports, age):
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        vlan_stats.setdefault(port["vlan"], {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, src, dst in frames:
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        vlan = ingress["vlan"]
+        port_stats[port_name]["rx"] += 1
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                egress = [hit[0]]
+                action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if port["vlan"] == vlan
+                    and port["up"]
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[by_name[name]["vlan"]]["tx"] += 1
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append({"t": t, "action": action, "ports": egress})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -123,25 +245,31 @@ def _fail(message):
 
 def main(argv):
     args = argv[1:]
-    if len(args) != 3 or args[0] != "fdb":
+    if len(args) != 3 or args[0] not in ("fdb", "forward"):
         _fail("usage")
         return 2
-    config_path, events_path = args[1], args[2]
+    mode = args[0]
+    config_path, data_path = args[1], args[2]
     try:
         with open(config_path, "rb") as handle:
             config_raw = handle.read()
-        with open(events_path, "rb") as handle:
-            events_raw = handle.read()
+        with open(data_path, "rb") as handle:
+            data_raw = handle.read()
     except OSError:
         _fail("file_not_found")
         return 3
     try:
-        ports, age = validate_config(parse_json(config_raw))
-        events = validate_events(parse_json(events_raw), ports)
+        config = parse_json(config_raw)
+        data = parse_json(data_raw)
+        if mode == "fdb":
+            ports, age = validate_config(config)
+            result = simulate(validate_events(data, ports), age)
+        else:
+            ports, age = validate_forward_config(config)
+            result = forward(validate_frames(data, ports), ports, age)
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    result = simulate(events, age)
     payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
     return 0
