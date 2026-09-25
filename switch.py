@@ -2,10 +2,13 @@
 """二层以太网交换机仿真（仅标准库）。"""
 
 from collections import deque
+import hashlib
 import heapq
 import json
+import os
 import re
 import sys
+import tempfile
 import zlib
 
 MAC_RE = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
@@ -70,6 +73,11 @@ SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
 RELOAD_EVENT_KEYS = frozenset(("t", "config"))
 RELOAD_MUTABLE_KEYS = ("age", "acl", "security")
+HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+RECORD_SCHEMA = 1
+LOG_KEYS = ("schema", "config", "records", "sha256")
+LOG_HEADER_KEYS = ("schema", "config", "records")
+RECORD_KEYS = ("t", "version", "event", "applied", "output")
 
 
 class InvalidInput(Exception):
@@ -3946,15 +3954,801 @@ def forward_security(
     }
 
 
+def _forward_security_recorded(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+    acl, qos, security, events
+):
+    """forward_security 的逐事件生成器版本：每事件产出
+
+    (t, version, applied, output)，结束时 return 末态结果（同
+    forward_security 返回值）。仿真主体逐行沿用 forward_security；
+    version 为配置版本，每次 reload（无变化亦算）加 1；applied 仅
+    链路/成员事件在转发态实际改变时为 True；output 为本事件新增的
+    results 项，链路/成员事件为 None。
+    """
+    window = storm["window"]
+    limits = storm["limits"]
+    move_limit = storm["move_limit"]
+    hold = storm["hold"]
+    sources = mirror["sources"]
+    mirror_target = mirror["target"]
+    direction = mirror["direction"]
+    source_set = set(sources)
+    qos_map = qos["map"]
+    cap = qos["cap"]
+    sched_mode = qos["mode"]
+    weights = qos["weights"]
+    drop_mode = qos["drop"]
+    weight_total = sum(weights)
+    quotas = [-(-(cap * w) // weight_total) for w in weights]  # 上取整
+    sec_by_port = {entry["port"]: entry for entry in security}
+    sec_order = [entry["port"] for entry in security]
+    static_owner = {}  # (vlan, mac) -> 所属物理口
+    for entry in security:
+        for item in entry["static"]:
+            static_owner[(item["vlan"], item["mac"])] = entry["port"]
+    sec_down = set()  # 被 shutdown 永久禁用的物理口
+    bound = {}  # (vlan, mac) -> 动态绑定的物理口（不老化、状态变化不清除）
+    dynamic = {entry["port"]: set() for entry in security}  # 口 -> 动态绑定集
+    violations = {entry["port"]: 0 for entry in security}
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    lag_by_name = {lag["name"]: lag for lag in lags}
+    lag_of = {}  # 成员物理口 -> lag
+    member_up = {}  # 成员物理口 -> 动态可用（初始可用）
+    for lag in lags:
+        for member in lag["members"]:
+            lag_of[member] = lag
+            member_up[member] = True
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [逻辑口（物理口名或 lag 名）, seen]
+    port_stats = {
+        port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    rate_queues = {}  # (入端口, vlan, 类别) -> 放行时刻 deque
+    move_queues = {}  # (vlan, src) -> 迁移时刻 deque
+    last_learn = {}  # (vlan, src) -> 最后学习逻辑口
+    blocked = {}  # (入端口, vlan) -> 封锁截止时刻
+    results = []
+    # 出口队列：每端口 4 个优先级 FIFO，存 {"id","vlan","mirror"}
+    egress_queues = {
+        port["name"]: [deque(), deque(), deque(), deque()] for port in ports
+    }
+    # 每物理出口持久 WRR 状态 (当前队, 剩余配额)；初始服务 3 队
+    wrr_state = {
+        port["name"]: [3, weights[3]] for port in ports
+    }
+    frame_seq = 0  # 全局零基帧序号（仅帧事件占用）
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and name not in sec_down
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        if name in sec_down:  # shutdown：永久按 down 口处理
+            return False, "down"
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def is_forwarding(name, t):
+        """LAG 成员还需动态 up 才算 forwarding。"""
+        phys_up, state = port_status(name, t)
+        if not phys_up or state != "forwarding":
+            return False
+        return name not in member_up or member_up[name]
+
+    def member_available(name, t, vlan):
+        """成员可用：动态 up、端口 up、STP forwarding 且允许该 VLAN。"""
+        port = by_name[name]
+        if not member_up[name] or not port["up"] or vlan not in port["allowed"]:
+            return False
+        return port_status(name, t) == (True, "forwarding")
+
+    def lag_candidates(lag, t, vlan):
+        """可用候选成员，按 members 顺序。"""
+        return [
+            member
+            for member in lag["members"]
+            if member_available(member, t, vlan)
+        ]
+
+    def lag_pick(lag, candidates, src, dst, vlan):
+        parts = []
+        for field in lag["hash"]:
+            if field == "src":
+                parts.append(src)
+            elif field == "dst":
+                parts.append(dst)
+            else:
+                parts.append(str(vlan))
+        digest = zlib.crc32("|".join(parts).encode("utf-8")) & 0xFFFFFFFF
+        return candidates[digest % len(candidates)]
+
+    def suppress(t, port_name, vlan, src, dst, state, learn_port):
+        """风暴控制：返回 True 表示本帧被抑制（不学习、不发送）。"""
+        if (port_name, vlan) in blocked:  # 封锁帧不检测
+            return True
+        if state not in ("learning", "forwarding"):
+            return False
+        is_group = int(dst[:2], 16) & 1
+        if dst == BROADCAST_MAC:
+            category = "broadcast"
+        elif is_group:
+            category = "multicast"
+        else:
+            category = None if fdb.get((vlan, dst)) else "unknown"
+        if category is not None:
+            queue = rate_queues.get((port_name, vlan, category))
+            if queue is None:
+                queue = deque(maxlen=limits[category])
+                rate_queues[(port_name, vlan, category)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
+                return True
+        prev = last_learn.get((vlan, src))
+        if prev is not None and prev != learn_port:  # 学习端口迁移
+            queue = move_queues.get((vlan, src))
+            if queue is None:
+                queue = deque(maxlen=move_limit)
+                move_queues[(vlan, src)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            queue.append(t)
+            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+                blocked[(port_name, vlan)] = t + hold
+                return True
+        if category is not None:  # 速率名额仅在帧实际放行时占用
+            rate_queues[(port_name, vlan, category)].append(t)
+        fdb[(vlan, src)] = [learn_port, t]
+        last_learn[(vlan, src)] = learn_port
+        return False
+
+    def target_available(t):
+        """镜像输出口须物理 up；其本桥链路（若有）也须 up。STP 不阻止镜像。"""
+        if mirror_target in sec_down:
+            return False
+        port = by_name[mirror_target]
+        if not port["up"]:
+            return False
+        link = port_link.get(mirror_target)
+        if link is not None and not link["up"]:
+            return False
+        return True
+
+    def mirror_entry(direction_name, tag, source, t):
+        """构造镜像副本；tag 为源侧线路上实际携带的标签（可为 None）。"""
+        if not target_available(t):  # 不可用则无副本
+            return None
+        port_stats[mirror_target]["tx"] += 1  # 副本只计 target 的 tx
+        return {
+            "name": mirror_target,
+            "vlan": tag,
+            "direction": direction_name,
+            "source": source,
+        }
+
+    def acl_match(vlan, src, dst, ethertype, priority):
+        """按数组序首条命中；未命中视为 allow。"""
+        for rule in acl:
+            if (
+                (rule["src"] is None or rule["src"] == src)
+                and (rule["dst"] is None or rule["dst"] == dst)
+                and (rule["vlan"] is None or rule["vlan"] == vlan)
+                and (
+                    rule["ethertype"] is None
+                    or rule["ethertype"] == ethertype
+                )
+                and (
+                    rule["priority"] is None or rule["priority"] == priority
+                )
+            ):
+                return rule["action"], rule["to_vlan"]
+        return "allow", None
+
+    def clear_queue(name):
+        """非 forwarding 清队：逐帧计出口与 VLAN drop。"""
+        for q in range(4):
+            while egress_queues[name][q]:
+                frame = egress_queues[name][q].popleft()
+                port_stats[name]["drop"] += 1
+                vlan_stats[frame["vlan"]]["drop"] += 1
+
+    def admit(name, queue_idx):
+        """tail：总数达 cap 即拒；weighted：任一队列配额满即拒。"""
+        queues = egress_queues[name]
+        if drop_mode == "tail":
+            return sum(len(q) for q in queues) < cap
+        return all(len(queues[q]) < quotas[q] for q in range(4))
+
+    def security_check(port_name, vlan, src):
+        """端口安全：返回 True 表示违例（丢本帧；shutdown 另永久禁口）。"""
+        entry = sec_by_port[port_name]
+        key = (vlan, src)
+        owner = static_owner.get(key)
+        if owner is not None:  # 静态源只准从所属口进入
+            if owner == port_name:
+                return False
+        else:
+            bound_port = bound.get(key)
+            if bound_port == port_name:  # 重复源不增数
+                return False
+            if bound_port is None and len(dynamic[port_name]) < entry["limit"]:
+                bound[key] = port_name  # 首次绑定入端口
+                dynamic[port_name].add(key)
+                return False
+            # 已绑定别口，或本口动态数达到 limit
+        violations[port_name] += 1
+        if entry["action"] == "shutdown":
+            sec_down.add(port_name)  # 永久按 down 口禁用
+            for old in dynamic[port_name]:  # 清动态绑定
+                del bound[old]
+            dynamic[port_name].clear()
+            clear_queue(port_name)  # 离开 forwarding：清队
+        return True
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    converge(0)
+
+    def process(item):
+        # reload 原子替换的五项与帧序号跨事件保留，须 nonlocal 回写
+        nonlocal frame_seq, age, acl, sec_by_port, sec_order, static_owner
+        t = item[1]
+        if item[0] == "link":
+            _, t, lid, up = item
+            applied = by_id[lid]["up"] != up  # 幂等链路事件不重算拓扑
+            if applied:
+                old_forwarding = forwarding_ports(t)
+                by_id[lid]["up"] = up
+                converge(t)
+                for name in old_forwarding - forwarding_ports(t):
+                    for key in [k for k, (p, _) in fdb.items() if p == name]:
+                        del fdb[key]
+                    clear_queue(name)  # 离开 forwarding：清队
+            return applied
+        if item[0] == "member":
+            _, t, member, up = item
+            applied = member_up[member] != up  # 幂等无作用
+            member_up[member] = up
+            if not up:  # 成员下线即非 forwarding：清队
+                clear_queue(member)
+            return applied
+        if item[0] == "service":
+            _, t, port_name, count = item
+            frames = []
+            mirrors = []
+            if not is_forwarding(port_name, t):  # 非 forwarding：清队不服务
+                clear_queue(port_name)
+            else:
+                queues = egress_queues[port_name]
+                served = 0
+
+                def dequeue_one():
+                    frame = queues[q].popleft()
+                    port_stats[port_name]["tx"] += 1  # tx 仅服务时计
+                    vlan_stats[frame["vlan"]]["tx"] += 1
+                    frames.append(frame["id"])
+                    # 仅实际产生出站副本才追加（无 null 占位），与发送帧同序
+                    if (
+                        direction in ("egress", "both")
+                        and port_name in source_set
+                    ):
+                        copy = mirror_entry(
+                            "egress", frame["mirror"], port_name, t
+                        )
+                        if copy is not None:
+                            mirrors.append(copy)
+
+                while served < count:
+                    if sched_mode == "sp":
+                        q = next(
+                            (q for q in (3, 2, 1, 0) if queues[q]), None
+                        )
+                        if q is None:
+                            break
+                        dequeue_one()
+                        served += 1
+                    else:  # wrr：持久状态 (q, rem)
+                        q, rem = wrr_state[port_name]
+                        if not any(queues):  # 四队全空：停止且状态不变
+                            break
+                        while not queues[q]:  # 当前队空：推进并重置配额
+                            q = (q - 1) % 4
+                            rem = weights[q]
+                        dequeue_one()
+                        served += 1
+                        rem -= 1  # 每发一帧 rem 减 1
+                        if rem == 0 or not queues[q]:
+                            # rem 用尽或当前队变空：推进并重置配额；
+                            # count 用尽而 rem 未尽且队非空：状态保留续用
+                            q = (q - 1) % 4
+                            rem = weights[q]
+                        wrr_state[port_name] = [q, rem]
+            results.append(
+                {"t": t, "port": port_name, "frames": frames,
+                 "mirrors": mirrors}
+            )
+            return True
+        if item[0] == "reload":
+            _, t, new_age, new_acl, new_security, changes = item
+            new_by_port = {entry["port"]: entry for entry in new_security}
+            new_static_owner = {}
+            for entry in new_security:
+                for static in entry["static"]:
+                    new_static_owner[(static["vlan"], static["mac"])] = (
+                        entry["port"]
+                    )
+            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static：整批无效
+            for name, macs in dynamic.items():
+                if len(macs) > new_by_port[name]["limit"]:
+                    raise InvalidInput("dynamic bindings exceed new limit")
+            for key in bound:
+                if key in new_static_owner:
+                    raise InvalidInput("dynamic binding in new static")
+            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
+            # 风暴记录与计数全部保留，新规则自下一事件生效
+            age = new_age
+            acl = new_acl
+            sec_by_port = new_by_port
+            sec_order = [entry["port"] for entry in new_security]
+            static_owner = new_static_owner
+            results.append({"t": t, "action": "reload", "changes": changes})
+            return True
+        _, t, port_name, src, dst, tag, ethertype, priority = item
+        fid = frame_seq
+        frame_seq += 1
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "action": "drop", "ports": [], "dropped": [],
+                 "mirrors": []}
+            )
+            return True
+        # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
+        acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
+        if acl_action == "remark":
+            if to_vlan in by_name[port_name]["allowed"]:
+                vlan = to_vlan  # 新 VLAN 用于后续全部处理
+            else:  # remark 目标不在入端口 allowed：按 drop 处理
+                acl_action = "drop"
+        if acl_action == "drop":  # 不学习、不计风暴、不镜像、不发送
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["rx"] += 1
+            vlan_stats[vlan]["drop"] += 1
+            results.append(
+                {"t": t, "action": "drop", "ports": [], "dropped": [],
+                 "mirrors": []}
+            )
+            return True
+        ingress_lag = lag_of.get(port_name)
+        if ingress_lag is not None:
+            usable = member_available(port_name, t, vlan)
+            state = "forwarding" if usable else None
+        else:
+            usable = True
+            _, state = port_status(port_name, t)
+        # 可学习帧在 FDB 前做端口安全检查；违例不学习、不计风暴、不镜像
+        if (
+            usable
+            and state in ("learning", "forwarding")
+            and security_check(port_name, vlan, src)
+        ):
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["rx"] += 1
+            vlan_stats[vlan]["drop"] += 1
+            results.append(
+                {"t": t, "action": "drop", "ports": [], "dropped": [],
+                 "mirrors": []}
+            )
+            return True
+        # 入端口命中 sources 则复制；remark 后副本携带新 VLAN（镜像不入队）
+        ingress_copy = None
+        if direction in ("ingress", "both") and port_name in source_set:
+            copy_tag = vlan if acl_action == "remark" else tag
+            ingress_copy = mirror_entry("ingress", copy_tag, port_name, t)
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if usable:  # 不可用成员入帧丢弃且不学习
+            learn_port = ingress_lag["name"] if ingress_lag else port_name
+            suppressed = suppress(
+                t, port_name, vlan, src, dst, state, learn_port
+            )
+            if not suppressed and state == "forwarding":
+                is_group = int(dst[:2], 16) & 1
+                hit = None if is_group else fdb.get((vlan, dst))
+                if hit is not None and hit[0] != learn_port:
+                    target = hit[0]
+                    target_lag = lag_by_name.get(target)
+                    if target_lag is not None:
+                        candidates = lag_candidates(target_lag, t, vlan)
+                        if candidates:  # 无候选按无出口丢弃
+                            egress = [
+                                lag_pick(target_lag, candidates, src, dst, vlan)
+                            ]
+                            action = "unicast"
+                    else:
+                        target_up, target_state = port_status(target, t)
+                        if (
+                            target_up
+                            and target_state == "forwarding"
+                            and vlan in by_name[target]["allowed"]
+                        ):
+                            egress = [target]
+                            action = "unicast"
+                elif hit is None:
+                    selected = {}  # lag 名 -> 本帧选中的成员
+                    for lag in lags:
+                        if ingress_lag is not None and lag is ingress_lag:
+                            continue  # 禁止组内回送
+                        candidates = lag_candidates(lag, t, vlan)
+                        if candidates:
+                            selected[lag["name"]] = lag_pick(
+                                lag, candidates, src, dst, vlan
+                            )
+                    for port in ports:
+                        name = port["name"]
+                        lag = lag_of.get(name)
+                        if lag is not None:
+                            if selected.get(lag["name"]) == name:
+                                egress.append(name)
+                        elif (
+                            vlan in port["allowed"]
+                            and name != port_name
+                            and port_status(name, t) == (True, "forwarding")
+                        ):
+                            egress.append(name)
+                    if egress:
+                        action = "flood"
+        out_ports = []
+        dropped = []
+        queue_idx = qos_map[priority]
+        for name in egress:  # 按 egress 序逐口入队；镜像不随之产生
+            out_tag = None if vlan in by_name[name]["untagged"] else vlan
+            if admit(name, queue_idx):
+                egress_queues[name][queue_idx].append(
+                    {"id": fid, "vlan": vlan, "mirror": out_tag}
+                )
+                out_ports.append({"name": name, "vlan": out_tag})
+            else:  # 拒绝：计出口与 VLAN drop，不入队
+                port_stats[name]["drop"] += 1
+                vlan_stats[vlan]["drop"] += 1
+                dropped.append(name)
+        if not egress:  # 无出口：沿用 acl，计入口与 VLAN drop
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {"t": t, "action": action, "ports": out_ports,
+             "dropped": dropped,
+             "mirrors": [ingress_copy] if ingress_copy is not None else []}
+        )
+        return True
+
+    version = 0  # 配置版本：初值 0，每次 reload（无变化亦算）加 1
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        for key in [k for k, until in blocked.items() if t >= until]:
+            del blocked[key]
+        out0 = len(results)
+        applied = process(item)
+        output = results[-1] if len(results) > out0 else None
+        if item[0] == "reload":
+            version += 1
+        yield t, version, applied, output
+
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "security": [
+            {
+                "port": name,
+                "learned": [
+                    {"vlan": vlan, "mac": mac}
+                    for vlan, mac in sorted(dynamic[name])
+                ],
+                "violations": violations[name],
+                "shutdown": name in sec_down,
+            }
+            for name in sec_order
+        ],
+    }
+
+
+def _reload_validated(config, data):
+    """record/replay 共用：沿用 reload 的配置/事件校验。"""
+    (
+        bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+        acl, qos, security,
+    ) = validate_security_config(config)
+    link_ids = {link["id"] for link in links}
+    reload_events, final_config = validate_reload_events(
+        data, ports, link_ids, lags, config
+    )
+    return (
+        (bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+         acl, qos, security),
+        reload_events,
+        final_config,
+    )
+
+
+def _record_payloads(config, data):
+    """无副作用预演整条事件流；成功返回 (LOG 字节, reload 输出字节)。"""
+    validated, reload_events, final_config = _reload_validated(config, data)
+    gen = _forward_security_recorded(*validated, reload_events)
+    records = []
+    index = 0
+    while True:
+        try:
+            t, version, applied, output = next(gen)
+        except StopIteration as stop:
+            result = stop.value
+            break
+        records.append(
+            {
+                "t": t,
+                "version": version,
+                "event": _canonical(data[index]),
+                "applied": applied,
+                "output": output,
+            }
+        )
+        index += 1
+    result["config"] = _canonical(final_config)
+    log = {
+        "schema": RECORD_SCHEMA,
+        "config": _canonical(config),
+        "records": records,
+    }
+    prefix = json.dumps(log, ensure_ascii=False, separators=(",", ":"))
+    log["sha256"] = hashlib.sha256(
+        (prefix + "\n").encode("utf-8")
+    ).hexdigest()
+    log_text = (
+        json.dumps(log, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    out_text = (
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return log_text.encode("utf-8"), out_text.encode("utf-8")
+
+
+def _validate_log_shape(log):
+    if not isinstance(log, dict) or list(log) != list(LOG_KEYS):
+        raise InvalidInput("bad log")
+    if not _is_int(log["schema"]) or log["schema"] != RECORD_SCHEMA:
+        raise InvalidInput("bad log schema")
+    if not isinstance(log["config"], dict):
+        raise InvalidInput("bad log config")
+    if not isinstance(log["records"], list):
+        raise InvalidInput("bad log records")
+    if not isinstance(log["sha256"], str):
+        raise InvalidInput("bad log sha256")
+    for record in log["records"]:
+        if not isinstance(record, dict) or list(record) != list(RECORD_KEYS):
+            raise InvalidInput("bad log record")
+        if not _is_int(record["t"]) or record["t"] < 0:
+            raise InvalidInput("bad log record t")
+        if not _is_int(record["version"]) or record["version"] < 0:
+            raise InvalidInput("bad log record version")
+        if not isinstance(record["event"], dict):
+            raise InvalidInput("bad log record event")
+        if not isinstance(record["applied"], bool):
+            raise InvalidInput("bad log record applied")
+        output = record["output"]
+        if output is not None and not isinstance(output, dict):
+            raise InvalidInput("bad log record output")
+
+
+def _replay_payload(raw):
+    """全量校验 LOG 与 sha256，按 config/events 重放并逐项核对。"""
+    log = parse_json(raw)
+    _validate_log_shape(log)
+    digest = log["sha256"]
+    header = {key: log[key] for key in LOG_HEADER_KEYS}
+    header_text = json.dumps(header, ensure_ascii=False, separators=(",", ":"))
+    actual = hashlib.sha256(
+        (header_text + "\n").encode("utf-8")
+    ).hexdigest()
+    if HEX64_RE.fullmatch(digest) is None or actual != digest:
+        raise InvalidInput("bad log sha256")
+    config = log["config"]
+    events = [record["event"] for record in log["records"]]
+    validated, reload_events, final_config = _reload_validated(config, events)
+    gen = _forward_security_recorded(*validated, reload_events)
+    expected = []
+    index = 0
+    while True:
+        try:
+            t, version, applied, output = next(gen)
+        except StopIteration as stop:
+            result = stop.value
+            break
+        expected.append(
+            {
+                "t": t,
+                "version": version,
+                "event": _canonical(events[index]),
+                "applied": applied,
+                "output": output,
+            }
+        )
+        index += 1
+    if len(expected) != len(log["records"]):
+        raise InvalidInput("log record count mismatch")
+    for record, want in zip(log["records"], expected):
+        if record != want:
+            raise InvalidInput("log record mismatch")
+    result["config"] = _canonical(final_config)
+    out_text = (
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return out_text.encode("utf-8")
+
+
+def _atomic_write(path, data):
+    """同目录临时文件 + os.replace 原子写入；失败不改动目标。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".switch-log-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
     )
 
 
+def _cmd_record(config_path, events_path, log_path):
+    """record CONFIG EVENTS LOG：无副作用预演成功后原子写 LOG 并输出 reload 结果。"""
+    try:
+        with open(config_path, "rb") as handle:
+            config_raw = handle.read()
+        with open(events_path, "rb") as handle:
+            data_raw = handle.read()
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        data = parse_json(data_raw)
+        log_bytes, out_bytes = _record_payloads(config, data)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    try:  # 失败不改 LOG：临时文件 + 原子替换
+        _atomic_write(log_path, log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    sys.stdout.buffer.write(out_bytes)
+    return 0
+
+
+def _cmd_replay(log_path):
+    """replay LOG：全量校验与逐项核对后输出与 record 逐字节相同的结果。"""
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = handle.read()
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        out_bytes = _replay_payload(log_raw)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    sys.stdout.buffer.write(out_bytes)
+    return 0
+
+
 def main(argv):
     args = argv[1:]
-    if len(args) != 3 or args[0] not in (
+    mode = args[0] if args else None
+    if mode == "record" and len(args) == 4:
+        return _cmd_record(args[1], args[2], args[3])
+    if mode == "replay" and len(args) == 2:
+        return _cmd_replay(args[1])
+    if len(args) != 3 or mode not in (
         "fdb",
         "forward",
         "stp",
@@ -3969,7 +4763,6 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
         with open(config_path, "rb") as handle:
