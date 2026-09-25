@@ -4385,7 +4385,7 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], limits[0], limits[1])
-    if len(args) != 3 or args[0] not in (
+    if len(args) not in (3, 5) or args[0] not in (
         "fdb",
         "forward",
         "stp",
@@ -4402,11 +4402,30 @@ def main(argv):
         return 2
     mode = args[0]
     config_path, data_path = args[1], args[2]
+    # 可选上限对 MAX_CONFIG_BYTES MAX_DATA_BYTES：均须匹配 [1-9][0-9]*，
+    # 任意长度按数学整数处理；缺省取默认值
+    max_config_bytes = DEFAULT_MAX_CONFIG_BYTES
+    max_data_bytes = DEFAULT_MAX_EVENTS_BYTES
+    if len(args) == 5:
+        if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
+            _fail("usage")
+            return 2
+        max_config_bytes = _limit_value(args[3])
+        max_data_bytes = _limit_value(args[4])
     try:
-        with open(config_path, "rb") as handle:
-            config_raw = handle.read()
-        with open(data_path, "rb") as handle:
-            data_raw = handle.read()
+        # 先打开两文件；任一失败即停。均可读后按 CONFIG、DATA 顺序
+        # 分块（至多 65536 字节）读取，超限立即停读
+        with open(config_path, "rb") as config_handle, open(
+            data_path, "rb"
+        ) as data_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            data_raw = _read_limited(data_handle, max_data_bytes)
+            if data_raw is None:
+                _fail("data_limit")
+                return 5
     except OSError:
         _fail("file_not_found")
         return 3
