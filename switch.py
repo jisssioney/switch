@@ -87,6 +87,10 @@ class FdbWorkLimit(Exception):
     pass
 
 
+class ForwardWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -520,6 +524,43 @@ def forward_v2(frames, ports, age):
             for vlan in sorted(vlan_stats)
         ],
     }
+
+
+def forward_work(frames, ports, age, limit, v2):
+    """按既有老化/学习规则用独立空映射无副作用预演并累计工作量。
+
+    逐帧以老化前表项数 K 与配置端口数 P 计 K+P+1，随后老化并按旧式
+    access（v2 为 False）或新式 802.1Q（v2 为 True）规则，仅在入端口
+    up 且通过 VLAN 准入时学习、刷新或迁移源 MAC；拒绝、down 口、重复
+    源及迁移帧均计费。累计等于上限合法，首次超过上限即抛
+    ForwardWorkLimit。
+    """
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    work = 0
+    for frame in frames:
+        work += len(fdb) + len(ports) + 1
+        if work > limit:
+            raise ForwardWorkLimit
+        t, port_name, src = frame[0], frame[1], frame[2]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        if v2:
+            tag = frame[4]
+            if tag is None:
+                vlan = ingress["pvid"]
+            else:
+                vlan = tag
+                if (
+                    ingress["mode"] == "access"
+                    or vlan not in ingress["allowed"]
+                ):
+                    continue  # VLAN 准入拒绝：不学习
+        else:
+            vlan = ingress["vlan"]
+        if ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
 
 
 def validate_stp_config(config):
@@ -4062,6 +4103,7 @@ DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_STP_WORK = 10000000
 DEFAULT_MAX_FDB_WORK = 10000000
+DEFAULT_MAX_FORWARD_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4477,11 +4519,14 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    # stp/fdb 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK）；
-    # 其余 MODE 仅 0、2、4 项
+    # stp/fdb/forward 额外允许 5 项上限（末尾分别为
+    # MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK）；其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
     is_fdb = args[:1] == ["fdb"]
-    allowed_counts = (3, 5, 7, 8) if is_stp or is_fdb else (3, 5, 7)
+    is_forward = args[:1] == ["forward"]
+    allowed_counts = (
+        (3, 5, 7, 8) if is_stp or is_fdb or is_forward else (3, 5, 7)
+    )
     if len(args) not in allowed_counts or args[0] not in (
         "fdb",
         "forward",
@@ -4497,7 +4542,7 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK]]]
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK]]]
     # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
@@ -4519,6 +4564,7 @@ def main(argv):
             max_stp_work,
         ) = parsed + stp_limits[len(parsed):]
         max_fdb_work = None
+        max_forward_work = None
     elif is_fdb:
         fdb_limits = limits + (DEFAULT_MAX_FDB_WORK,)
         (
@@ -4529,12 +4575,25 @@ def main(argv):
             max_fdb_work,
         ) = parsed + fdb_limits[len(parsed):]
         max_stp_work = None
+        max_forward_work = None
+    elif is_forward:
+        forward_limits = limits + (DEFAULT_MAX_FORWARD_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_forward_work,
+        ) = parsed + forward_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
     else:
         max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
             parsed + limits[len(parsed):]
         )
         max_stp_work = None
         max_fdb_work = None
+        max_forward_work = None
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4779,10 +4838,16 @@ def main(argv):
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
-                result = forward_v2(validate_frames_v2(data, ports), ports, age)
+                frames = validate_frames_v2(data, ports)
+                # 两文件解析及全量语义校验后，用独立空 FDB 无副作用预演；
+                # 超限时不得正式转发
+                forward_work(frames, ports, age, max_forward_work, True)
+                result = forward_v2(frames, ports, age)
             else:
                 ports, age = validate_forward_config(config)
-                result = forward(validate_frames(data, ports), ports, age)
+                frames = validate_frames(data, ports)
+                forward_work(frames, ports, age, max_forward_work, False)
+                result = forward(frames, ports, age)
     except InvalidInput:
         _fail("invalid_input")
         return 4
@@ -4791,6 +4856,9 @@ def main(argv):
         return 5
     except FdbWorkLimit:
         _fail("fdb_work_limit")
+        return 5
+    except ForwardWorkLimit:
+        _fail("forward_work_limit")
         return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
