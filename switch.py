@@ -36,6 +36,9 @@ LAG_CONFIG_KEYS = frozenset(
 LAG_KEYS = frozenset(("name", "members", "hash"))
 LAG_HASH_FIELDS = ("src", "dst", "vlan")
 MEMBER_EVENT_KEYS = frozenset(("t", "member", "up"))
+MIRROR_CONFIG_KEYS = LAG_CONFIG_KEYS | frozenset(("mirror",))
+MIRROR_KEYS = frozenset(("sources", "target", "direction"))
+MIRROR_DIRECTIONS = ("ingress", "egress", "both")
 
 
 class InvalidInput(Exception):
@@ -1238,6 +1241,55 @@ def validate_lag_config(config):
     return bridges, links, delay, bridge, ports, age, storm, parsed
 
 
+def validate_mirror_config(config):
+    if not isinstance(config, dict) or frozenset(config) != MIRROR_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges, links, delay, bridge, ports, age, storm, lags = (
+        validate_lag_config(
+            {
+                "bridges": config["bridges"],
+                "links": config["links"],
+                "delay": config["delay"],
+                "bridge": config["bridge"],
+                "ports": config["ports"],
+                "age": config["age"],
+                "storm": config["storm"],
+                "lags": config["lags"],
+            }
+        )
+    )
+    mirror = config["mirror"]
+    if not isinstance(mirror, dict) or frozenset(mirror) != MIRROR_KEYS:
+        raise InvalidInput("bad mirror")
+    sources = mirror["sources"]
+    target = mirror["target"]
+    direction = mirror["direction"]
+    by_name = {port["name"]: port for port in ports}
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not all(isinstance(s, str) and s in by_name for s in sources)
+        or len(set(sources)) != len(sources)
+    ):
+        raise InvalidInput("bad mirror sources")
+    member_set = {member for lag in lags for member in lag["members"]}
+    if (
+        not isinstance(target, str)
+        or target not in by_name
+        or target in sources
+        or target in member_set
+    ):
+        raise InvalidInput("bad mirror target")
+    if direction not in MIRROR_DIRECTIONS:
+        raise InvalidInput("bad mirror direction")
+    parsed = {
+        "sources": list(sources),
+        "target": target,
+        "direction": direction,
+    }
+    return bridges, links, delay, bridge, ports, age, storm, lags, parsed
+
+
 def validate_lag_events(events, ports, link_ids, lags):
     if not isinstance(events, list):
         raise InvalidInput("events must be a list")
@@ -1301,7 +1353,8 @@ def validate_lag_events(events, ports, link_ids, lags):
 
 
 def forward_lag(
-    bridges, links, delay, bridge_name, ports, age, storm, lags, events
+    bridges, links, delay, bridge_name, ports, age, storm, lags, events,
+    mirror=None,
 ):
     window = storm["window"]
     limits = storm["limits"]
@@ -1321,6 +1374,9 @@ def forward_lag(
         for end_bridge, end_port in (link["x"], link["y"]):
             if end_bridge == bridge_name:
                 port_link[end_port] = link
+    mirror_sources = frozenset(mirror["sources"]) if mirror else frozenset()
+    mirror_target = mirror["target"] if mirror else None
+    mirror_direction = mirror["direction"] if mirror else None
     fdb = {}  # (vlan, mac) -> [逻辑口（物理口名或 lag 名）, seen]
     port_stats = {
         port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports
@@ -1493,11 +1549,27 @@ def forward_lag(
             rejected = (
                 ingress["mode"] == "access" or vlan not in ingress["allowed"]
             )
-        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN、不镜像
             port_stats[port_name]["drop"] += 1
-            results.append({"t": t, "action": "drop", "ports": []})
+            entry = {"t": t, "action": "drop", "ports": []}
+            if mirror is not None:
+                entry["mirrors"] = []
+            results.append(entry)
             continue
         vlan_stats[vlan]["rx"] += 1
+        mirror_hits = []  # (方向, 源物理口, 标签)
+        mirror_ok = False
+        if mirror is not None:
+            target_link = port_link.get(mirror_target)
+            mirror_ok = by_name[mirror_target]["up"] and (
+                target_link is None or target_link["up"]
+            )
+            if (  # 入站镜像：VLAN 准入后即复制入站标签
+                mirror_ok
+                and mirror_direction != "egress"
+                and port_name in mirror_sources
+            ):
+                mirror_hits.append(("ingress", port_name, tag))
         ingress_lag = lag_of.get(port_name)
         if ingress_lag is not None:
             usable = member_available(port_name, t, vlan)
@@ -1568,10 +1640,28 @@ def forward_lag(
                     "vlan": None if vlan in by_name[name]["untagged"] else vlan,
                 }
             )
+        if mirror_ok and mirror_direction != "ingress":
+            for out in out_ports:  # 出站镜像：复制出站标签，按 ports 序
+                if out["name"] in mirror_sources:
+                    mirror_hits.append(("egress", out["name"], out["vlan"]))
         if not egress:
             port_stats[port_name]["drop"] += 1
             vlan_stats[vlan]["drop"] += 1
-        results.append({"t": t, "action": action, "ports": out_ports})
+        entry = {"t": t, "action": action, "ports": out_ports}
+        if mirror is not None:
+            mirrors = []
+            for hit_direction, source, hit_tag in mirror_hits:
+                port_stats[mirror_target]["tx"] += 1  # 副本仅计 target 的 tx
+                mirrors.append(
+                    {
+                        "name": mirror_target,
+                        "vlan": hit_tag,
+                        "direction": hit_direction,
+                        "source": source,
+                    }
+                )
+            entry["mirrors"] = mirrors
+        results.append(entry)
     return {
         "results": results,
         "ports": [
@@ -1610,6 +1700,7 @@ def main(argv):
         "forward-stp",
         "forward-stp-storm",
         "lag",
+        "mirror",
     ):
         _fail("usage")
         return 2
@@ -1686,6 +1777,31 @@ def main(argv):
                 storm,
                 lags,
                 validate_lag_events(data, ports, link_ids, lags),
+            )
+        elif mode == "mirror":
+            (
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                mirror,
+            ) = validate_mirror_config(config)
+            link_ids = {link["id"] for link in links}
+            result = forward_lag(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                validate_lag_events(data, ports, link_ids, lags),
+                mirror,
             )
         else:
             if is_v2_config(config):
