@@ -2,10 +2,13 @@
 """二层以太网交换机仿真（仅标准库）。"""
 
 from collections import deque
+import hashlib
 import heapq
 import json
+import os
 import re
 import sys
+import tempfile
 import zlib
 
 MAC_RE = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
@@ -3385,7 +3388,7 @@ def forward_qos(
 
 def forward_security(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
-    acl, qos, security, events
+    acl, qos, security, events, observer=None
 ):
     window = storm["window"]
     limits = storm["limits"]
@@ -3412,6 +3415,8 @@ def forward_security(
     bound = {}  # (vlan, mac) -> 动态绑定的物理口（不老化、状态变化不清除）
     dynamic = {entry["port"]: set() for entry in security}  # 口 -> 动态绑定集
     violations = {entry["port"]: 0 for entry in security}
+    if observer is not None:  # record：逐事件记录 applied 与新增输出
+        observer["items"] = []
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
     lag_by_name = {lag["name"]: lag for lag in lags}
@@ -3677,7 +3682,8 @@ def forward_security(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            link_changed = by_id[lid]["up"] != up
+            if link_changed:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
@@ -3685,12 +3691,23 @@ def forward_security(
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
                     clear_queue(name)  # 离开 forwarding：清队
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": link_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "member":
             _, t, member, up = item
+            member_changed = member_up[member] != up
             member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
             if not up:  # 成员下线即非 forwarding：清队
                 clear_queue(member)
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "member", "t": t, "applied": member_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "service":
             _, t, port_name, count = item
@@ -3747,6 +3764,11 @@ def forward_security(
                 {"t": t, "port": port_name, "frames": frames,
                  "mirrors": mirrors}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "service", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         if item[0] == "reload":
             _, t, new_age, new_acl, new_security, changes = item
@@ -3772,6 +3794,11 @@ def forward_security(
             sec_order = [entry["port"] for entry in new_security]
             static_owner = new_static_owner
             results.append({"t": t, "action": "reload", "changes": changes})
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "reload", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         _, t, port_name, src, dst, tag, ethertype, priority = item
         fid = frame_seq
@@ -3792,6 +3819,11 @@ def forward_security(
                 {"t": t, "action": "drop", "ports": [], "dropped": [],
                  "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
         acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
@@ -3808,6 +3840,11 @@ def forward_security(
                 {"t": t, "action": "drop", "ports": [], "dropped": [],
                  "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         ingress_lag = lag_of.get(port_name)
         if ingress_lag is not None:
@@ -3829,6 +3866,11 @@ def forward_security(
                 {"t": t, "action": "drop", "ports": [], "dropped": [],
                  "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # 入端口命中 sources 则复制；remark 后副本携带新 VLAN（镜像不入队）
         ingress_copy = None
@@ -3911,6 +3953,11 @@ def forward_security(
              "dropped": dropped,
              "mirrors": [ingress_copy] if ingress_copy is not None else []}
         )
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True,
+                 "output": results[-1]}
+            )
     return {
         "results": results,
         "ports": [
@@ -3952,8 +3999,300 @@ def _fail(message):
     )
 
 
+RECORD_SCHEMA = 1
+LOG_KEYS = ("schema", "config", "records", "sha256")
+RECORD_KEYS = ("t", "version", "event", "applied", "output")
+EVENT_KIND_BY_KEYS = {
+    STP_EVENT_KEYS: "link",
+    MEMBER_EVENT_KEYS: "member",
+    SERVICE_EVENT_KEYS: "service",
+    FRAME_KEYS_ACL: "frame",
+    RELOAD_EVENT_KEYS: "reload",
+}
+_HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _event_kind(event):
+    if not isinstance(event, dict):
+        raise InvalidInput("bad log event")
+    kind = EVENT_KIND_BY_KEYS.get(frozenset(event))
+    if kind is None:
+        raise InvalidInput("bad log event")
+    return kind
+
+
+def _run_reload(config, events, observe):
+    """reload/record/replay 共用：校验配置与事件并执行 port-security 仿真。
+
+    返回 (reload 结果 dict, observer 或 None)。全部校验与非法重载检测先于返回。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        security,
+    ) = validate_security_config(config)
+    link_ids = {link["id"] for link in links}
+    reload_events, final_config = validate_reload_events(
+        events, ports, link_ids, lags, config
+    )
+    observer = {} if observe else None
+    result = forward_security(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        security,
+        reload_events,
+        observer=observer,
+    )
+    result["config"] = _canonical(final_config)
+    return result, observer
+
+
+def _build_log_doc(config, events, items):
+    """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
+    if len(events) != len(items):
+        raise InvalidInput("bad log")
+    records = []
+    version = 0  # version 初值 0，取事件后值；每次 reload（无变化亦算）加 1
+    for event, observed in zip(events, items):
+        kind = _event_kind(event)
+        if kind != observed["kind"]:
+            raise InvalidInput("bad log")
+        if kind == "reload":
+            version += 1
+        records.append(
+            {
+                "t": event["t"],
+                "version": version,
+                "event": _canonical(event),
+                "applied": observed["applied"],
+                "output": observed["output"],
+            }
+        )
+    doc = {
+        "schema": RECORD_SCHEMA,
+        "config": _canonical(config),
+        "records": records,
+    }
+    doc["sha256"] = hashlib.sha256(_log_prefix_bytes(doc)).hexdigest()
+    return doc
+
+
+def _log_prefix_bytes(doc):
+    """sha256 摘要文本：schema,config,records 规范序列化后含 LF。"""
+    prefix = {
+        "schema": doc["schema"],
+        "config": doc["config"],
+        "records": doc["records"],
+    }
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _log_bytes(doc):
+    ordered = {key: doc[key] for key in LOG_KEYS}
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _assert_canonical_order(value):
+    """config/event 内对象键须递归按 Unicode 码点升序，数组保序。"""
+    if isinstance(value, dict):
+        keys = list(value)
+        if keys != sorted(keys):
+            raise InvalidInput("bad log key order")
+        for item in value.values():
+            _assert_canonical_order(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_canonical_order(item)
+
+
+def _json_equal(a, b):
+    """JSON 值深比较；bool 不与 int 混同，键序无关，数组保序。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            _json_equal(a[key], b[key]) for key in a
+        )
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _json_equal(x, y) for x, y in zip(a, b)
+        )
+    if a is None or b is None:
+        return a is None and b is None
+    return type(a) is type(b) and a == b
+
+
+def _validate_log_shape(log):
+    """严格校验 LOG 字段、类型、键序；不含语义重放。"""
+    if not isinstance(log, dict) or list(log) != list(LOG_KEYS):
+        raise InvalidInput("bad log")
+    if not _is_int(log["schema"]) or log["schema"] != RECORD_SCHEMA:
+        raise InvalidInput("bad log schema")
+    config = log["config"]
+    if not isinstance(config, dict):
+        raise InvalidInput("bad log config")
+    _assert_canonical_order(config)
+    records = log["records"]
+    if not isinstance(records, list):
+        raise InvalidInput("bad log records")
+    for record in records:
+        if not isinstance(record, dict) or list(record) != list(RECORD_KEYS):
+            raise InvalidInput("bad log record")
+        if not _is_int(record["t"]) or record["t"] < 0:
+            raise InvalidInput("bad log t")
+        if not _is_int(record["version"]) or record["version"] < 0:
+            raise InvalidInput("bad log version")
+        event = record["event"]
+        if not isinstance(event, dict):
+            raise InvalidInput("bad log event")
+        _assert_canonical_order(event)
+        _event_kind(event)
+        if not isinstance(record["applied"], bool):
+            raise InvalidInput("bad log applied")
+        if record["output"] is not None and not isinstance(
+            record["output"], dict
+        ):
+            raise InvalidInput("bad log output")
+    digest = log["sha256"]
+    if not isinstance(digest, str) or _HEX64_RE.fullmatch(digest) is None:
+        raise InvalidInput("bad log sha256")
+
+
+def _verify_records(log, events, items):
+    """重放后逐项核对 t/version/event/applied/output。"""
+    records = log["records"]
+    if len(records) != len(items):
+        raise InvalidInput("bad log records")
+    version = 0
+    for event, observed, record in zip(events, items, records):
+        kind = _event_kind(event)
+        if kind != observed["kind"]:
+            raise InvalidInput("bad log record")
+        if kind == "reload":
+            version += 1
+        if record["t"] != event["t"]:
+            raise InvalidInput("bad log t")
+        if record["version"] != version:
+            raise InvalidInput("bad log version")
+        if not _json_equal(record["event"], _canonical(event)):
+            raise InvalidInput("bad log event")
+        if record["applied"] is not observed["applied"]:
+            raise InvalidInput("bad log applied")
+        if not _json_equal(record["output"], observed["output"]):
+            raise InvalidInput("bad log output")
+
+
+def _atomic_write(path, payload):
+    """同目录临时文件 + os.replace 原子写入；失败不改动目标。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".switch-log-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _emit_result(result):
+    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
+
+
+def _cmd_record(config_path, events_path, log_path):
+    try:
+        with open(config_path, "rb") as handle:
+            config_raw = handle.read()
+        with open(events_path, "rb") as handle:
+            events_raw = handle.read()
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        # 先无副作用预演：解析、全部校验与各重载点检测均在内存完成
+        config = parse_json(config_raw)
+        events = parse_json(events_raw)
+        result, observer = _run_reload(config, events, True)
+        doc = _build_log_doc(config, events, observer["items"])
+        payload = _log_bytes(doc)
+        _atomic_write(log_path, payload)  # 成功后才原子写 LOG
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    _emit_result(result)
+    return 0
+
+
+def _cmd_replay(log_path):
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = handle.read()
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        log = parse_json(log_raw)  # 全量校验先于重放
+        _validate_log_shape(log)
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        result, observer = _run_reload(config, events, True)
+        _verify_records(log, events, observer["items"])
+        # 重放重建的 LOG 须与原文件逐字节一致（含 sha256 与 LF）
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    _emit_result(result)
+    return 0
+
+
 def main(argv):
     args = argv[1:]
+    if args[:1] == ["record"]:
+        if len(args) != 4:  # record CONFIG EVENTS LOG
+            _fail("usage")
+            return 2
+        return _cmd_record(args[1], args[2], args[3])
+    if args[:1] == ["replay"]:
+        if len(args) != 2:  # replay LOG
+            _fail("usage")
+            return 2
+        return _cmd_replay(args[1])
     if len(args) != 3 or args[0] not in (
         "fdb",
         "forward",
