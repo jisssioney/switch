@@ -19,6 +19,9 @@ STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
 STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
 STP_EVENT_KEYS = frozenset(("t", "id", "up"))
 STP_TIMED_ROLES = ("root", "designated")
+FWDSTP_CONFIG_KEYS = frozenset(
+    ("bridges", "links", "delay", "bridge", "ports", "age")
+)
 
 
 class InvalidInput(Exception):
@@ -638,6 +641,227 @@ def stp(bridges, links, delay, events):
     return {"results": results}
 
 
+def valid_dst_mac(value):
+    if not isinstance(value, str) or MAC_RE.fullmatch(value) is None:
+        return False
+    return any(int(part, 16) for part in value.split(":"))
+
+
+def validate_forward_stp_config(config):
+    if not isinstance(config, dict) or frozenset(config) != FWDSTP_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges, links, delay = validate_stp_config(
+        {
+            "bridges": config["bridges"],
+            "links": config["links"],
+            "delay": config["delay"],
+        }
+    )
+    bridge = config["bridge"]
+    if not isinstance(bridge, str) or bridge not in bridges:
+        raise InvalidInput("bad bridge")
+    ports, age = validate_forward_config_v2(
+        {"ports": config["ports"], "age": config["age"]}
+    )
+    names = {port["name"] for port in ports}
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge and end_port not in names:
+                raise InvalidInput("ports must cover link ports")
+    return bridges, links, delay, bridge, ports, age
+
+
+def validate_forward_stp_events(events, link_ids, port_names):
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            t = event["t"]
+            lid = event["id"]
+            up = event["up"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == FRAME_KEYS_V2:
+            t = event["t"]
+            port = event["port"]
+            src = event["src"]
+            dst = event["dst"]
+            vlan = event["vlan"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if not isinstance(port, str) or port not in port_names:
+                raise InvalidInput("unknown port")
+            if not valid_mac(src):
+                raise InvalidInput("bad src")
+            if not valid_dst_mac(dst):
+                raise InvalidInput("bad dst")
+            if vlan is not None and not _valid_vlan_id(vlan):
+                raise InvalidInput("bad vlan")
+            result.append(("frame", t, port, src, dst, vlan))
+        else:
+            raise InvalidInput("bad event")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+    return result
+
+
+def forward_stp(bridges, links, delay, bridge, ports, age, events):
+    by_name = {port["name"]: port for port in ports}
+    by_id = {link["id"]: link for link in links}
+    link_by_port = {}
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge:
+                link_by_port[end_port] = link
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    previous = {}  # port -> 上一轮角色
+    since = {}  # port -> 获得当前 root/designated 角色的时刻
+    roles = {}
+
+    def migrate(t):
+        nonlocal roles
+        _, _, all_roles = stp_converge(bridges, links)
+        roles = all_roles[bridge]
+        for port, role in roles.items():
+            if role in STP_TIMED_ROLES:
+                if previous.get(port) != role:  # 同角色不重计时
+                    since[port] = t
+            else:
+                since.pop(port, None)
+        previous.clear()
+        previous.update(roles)
+
+    def state_of(name, t):
+        if not by_name[name]["up"]:
+            return "down"
+        link = link_by_port.get(name)
+        if link is None:
+            return "forwarding"  # 边缘口
+        if not link["up"]:
+            return "disabled"
+        role = roles[name]
+        if role not in STP_TIMED_ROLES:
+            return "discarding"
+        elapsed = t - since[name]
+        if elapsed < delay:
+            return "discarding"
+        if elapsed < 2 * delay:
+            return "learning"
+        return "forwarding"
+
+    migrate(0)
+    results = []
+    for event in events:
+        t = event[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        if event[0] == "link":
+            _, _, lid, up = event
+            before = {name: state_of(name, t) for name in link_by_port}
+            by_id[lid]["up"] = up
+            migrate(t)
+            for name, old_state in before.items():
+                if old_state == "forwarding" and state_of(name, t) != "forwarding":
+                    for key in [k for k, v in fdb.items() if v[0] == name]:
+                        del fdb[key]
+            continue
+        _, _, port_name, src, dst, tag = event
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append({"t": t, "action": "drop", "ports": []})
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        state = state_of(port_name, t)
+        if state in ("learning", "forwarding"):
+            fdb[(vlan, src)] = [port_name, t]
+        if state == "forwarding":
+            multicast = int(dst.split(":", 1)[0], 16) & 1
+            hit = None if multicast else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target = by_name[hit[0]]
+                if (
+                    target["up"]
+                    and state_of(hit[0], t) == "forwarding"
+                    and vlan in target["allowed"]
+                ):
+                    egress = [hit[0]]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["up"]
+                    and port["name"] != port_name
+                    and state_of(port["name"], t) == "forwarding"
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append({"t": t, "action": action, "ports": out_ports})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -646,7 +870,7 @@ def _fail(message):
 
 def main(argv):
     args = argv[1:]
-    if len(args) != 3 or args[0] not in ("fdb", "forward", "stp"):
+    if len(args) != 3 or args[0] not in ("fdb", "forward", "stp", "forward-stp"):
         _fail("usage")
         return 2
     mode = args[0]
@@ -670,6 +894,21 @@ def main(argv):
             link_ids = {link["id"] for link in links}
             result = stp(
                 bridges, links, delay, validate_stp_events(data, link_ids)
+            )
+        elif mode == "forward-stp":
+            (
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+            ) = validate_forward_stp_config(config)
+            link_ids = {link["id"] for link in links}
+            names = {port["name"] for port in ports}
+            events = validate_forward_stp_events(data, link_ids, names)
+            result = forward_stp(
+                bridges, links, delay, bridge, ports, age, events
             )
         else:
             if is_v2_config(config):
