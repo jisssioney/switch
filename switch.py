@@ -36,6 +36,12 @@ LAG_CONFIG_KEYS = frozenset(
 LAG_KEYS = frozenset(("name", "members", "hash"))
 LAG_HASH_FIELDS = ("src", "dst", "vlan")
 MEMBER_EVENT_KEYS = frozenset(("t", "member", "up"))
+MIRROR_CONFIG_KEYS = frozenset(
+    ("bridges", "links", "delay", "bridge", "ports", "age", "storm", "lags",
+     "mirror")
+)
+MIRROR_KEYS = frozenset(("sources", "target", "direction"))
+MIRROR_DIRECTIONS = ("ingress", "egress", "both")
 
 
 class InvalidInput(Exception):
@@ -1238,6 +1244,50 @@ def validate_lag_config(config):
     return bridges, links, delay, bridge, ports, age, storm, parsed
 
 
+def validate_mirror_config(config):
+    if not isinstance(config, dict) or frozenset(config) != MIRROR_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges, links, delay, bridge, ports, age, storm, lags = validate_lag_config(
+        {
+            "bridges": config["bridges"],
+            "links": config["links"],
+            "delay": config["delay"],
+            "bridge": config["bridge"],
+            "ports": config["ports"],
+            "age": config["age"],
+            "storm": config["storm"],
+            "lags": config["lags"],
+        }
+    )
+    mirror = config["mirror"]
+    if not isinstance(mirror, dict) or frozenset(mirror) != MIRROR_KEYS:
+        raise InvalidInput("bad mirror")
+    sources = mirror["sources"]
+    target = mirror["target"]
+    direction = mirror["direction"]
+    by_name = {port["name"]: port for port in ports}
+    member_set = {member for lag in lags for member in lag["members"]}
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not all(isinstance(name, str) and name in by_name for name in sources)
+        or len(set(sources)) != len(sources)
+    ):
+        raise InvalidInput("bad mirror sources")
+    if not isinstance(target, str) or target not in by_name:
+        raise InvalidInput("bad mirror target")
+    if target in sources or target in member_set:
+        raise InvalidInput("bad mirror target")
+    if direction not in MIRROR_DIRECTIONS:
+        raise InvalidInput("bad mirror direction")
+    parsed = {
+        "sources": list(sources),
+        "target": target,
+        "direction": direction,
+    }
+    return bridges, links, delay, bridge, ports, age, storm, lags, parsed
+
+
 def validate_lag_events(events, ports, link_ids, lags):
     if not isinstance(events, list):
         raise InvalidInput("events must be a list")
@@ -1595,6 +1645,347 @@ def forward_lag(
     }
 
 
+def forward_mirror(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, mirror, events
+):
+    window = storm["window"]
+    limits = storm["limits"]
+    move_limit = storm["move_limit"]
+    hold = storm["hold"]
+    sources = mirror["sources"]
+    mirror_target = mirror["target"]
+    direction = mirror["direction"]
+    source_set = set(sources)
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    lag_by_name = {lag["name"]: lag for lag in lags}
+    lag_of = {}  # 成员物理口 -> lag
+    member_up = {}  # 成员物理口 -> 动态可用（初始可用）
+    for lag in lags:
+        for member in lag["members"]:
+            lag_of[member] = lag
+            member_up[member] = True
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [逻辑口（物理口名或 lag 名）, seen]
+    port_stats = {
+        port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    rate_queues = {}  # (入端口, vlan, 类别) -> 放行时刻 deque
+    move_queues = {}  # (vlan, src) -> 迁移时刻 deque
+    last_learn = {}  # (vlan, src) -> 最后学习逻辑口
+    blocked = {}  # (入端口, vlan) -> 封锁截止时刻
+    results = []
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def member_available(name, t, vlan):
+        """成员可用：动态 up、端口 up、STP forwarding 且允许该 VLAN。"""
+        port = by_name[name]
+        if not member_up[name] or not port["up"] or vlan not in port["allowed"]:
+            return False
+        return port_status(name, t) == (True, "forwarding")
+
+    def lag_candidates(lag, t, vlan):
+        """可用候选成员，按 members 顺序。"""
+        return [
+            member
+            for member in lag["members"]
+            if member_available(member, t, vlan)
+        ]
+
+    def lag_pick(lag, candidates, src, dst, vlan):
+        parts = []
+        for field in lag["hash"]:
+            if field == "src":
+                parts.append(src)
+            elif field == "dst":
+                parts.append(dst)
+            else:
+                parts.append(str(vlan))
+        digest = zlib.crc32("|".join(parts).encode("utf-8")) & 0xFFFFFFFF
+        return candidates[digest % len(candidates)]
+
+    def suppress(t, port_name, vlan, src, dst, state, learn_port):
+        """风暴控制：返回 True 表示本帧被抑制（不学习、不发送）。"""
+        if (port_name, vlan) in blocked:  # 封锁帧不检测
+            return True
+        if state not in ("learning", "forwarding"):
+            return False
+        is_group = int(dst[:2], 16) & 1
+        if dst == BROADCAST_MAC:
+            category = "broadcast"
+        elif is_group:
+            category = "multicast"
+        else:
+            category = None if fdb.get((vlan, dst)) else "unknown"
+        if category is not None:
+            queue = rate_queues.get((port_name, vlan, category))
+            if queue is None:
+                queue = deque(maxlen=limits[category])
+                rate_queues[(port_name, vlan, category)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
+                return True
+        prev = last_learn.get((vlan, src))
+        if prev is not None and prev != learn_port:  # 学习端口迁移
+            queue = move_queues.get((vlan, src))
+            if queue is None:
+                queue = deque(maxlen=move_limit)
+                move_queues[(vlan, src)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            queue.append(t)
+            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+                blocked[(port_name, vlan)] = t + hold
+                return True
+        if category is not None:  # 速率名额仅在帧实际放行时占用
+            rate_queues[(port_name, vlan, category)].append(t)
+        fdb[(vlan, src)] = [learn_port, t]
+        last_learn[(vlan, src)] = learn_port
+        return False
+
+    def target_available(t):
+        """镜像输出口须物理 up；其本桥链路（若有）也须 up。STP 不阻止镜像。"""
+        port = by_name[mirror_target]
+        if not port["up"]:
+            return False
+        link = port_link.get(mirror_target)
+        if link is not None and not link["up"]:
+            return False
+        return True
+
+    def mirror_entry(direction_name, tag, source, t):
+        """构造镜像副本；tag 为源侧线路上实际携带的标签（可为 None）。"""
+        if not target_available(t):  # 不可用则无副本
+            return None
+        port_stats[mirror_target]["tx"] += 1  # 副本只计 target 的 tx
+        return {
+            "name": mirror_target,
+            "vlan": tag,
+            "direction": direction_name,
+            "source": source,
+        }
+
+    converge(0)
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        for key in [k for k, until in blocked.items() if t >= until]:
+            del blocked[key]
+        if item[0] == "link":
+            _, t, lid, up = item
+            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+                old_forwarding = forwarding_ports(t)
+                by_id[lid]["up"] = up
+                converge(t)
+                for name in old_forwarding - forwarding_ports(t):
+                    for key in [k for k, (p, _) in fdb.items() if p == name]:
+                        del fdb[key]
+            continue
+        if item[0] == "member":
+            _, t, member, up = item
+            member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
+            continue
+        _, t, port_name, src, dst, tag = item
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "action": "drop", "ports": [], "mirrors": []}
+            )
+            continue
+        # VLAN 准入后：入端口命中 sources 则复制入站标签
+        ingress_copy = None
+        if direction in ("ingress", "both") and port_name in source_set:
+            ingress_copy = mirror_entry("ingress", tag, port_name, t)
+        vlan_stats[vlan]["rx"] += 1
+        ingress_lag = lag_of.get(port_name)
+        if ingress_lag is not None:
+            usable = member_available(port_name, t, vlan)
+            state = "forwarding" if usable else None
+        else:
+            usable = True
+            _, state = port_status(port_name, t)
+        egress = []
+        action = "drop"
+        if usable:  # 不可用成员入帧丢弃且不学习
+            learn_port = ingress_lag["name"] if ingress_lag else port_name
+            suppressed = suppress(
+                t, port_name, vlan, src, dst, state, learn_port
+            )
+            if not suppressed and state == "forwarding":
+                is_group = int(dst[:2], 16) & 1
+                hit = None if is_group else fdb.get((vlan, dst))
+                if hit is not None and hit[0] != learn_port:
+                    target = hit[0]
+                    target_lag = lag_by_name.get(target)
+                    if target_lag is not None:
+                        candidates = lag_candidates(target_lag, t, vlan)
+                        if candidates:  # 无候选按无出口丢弃
+                            egress = [
+                                lag_pick(target_lag, candidates, src, dst, vlan)
+                            ]
+                            action = "unicast"
+                    else:
+                        target_up, target_state = port_status(target, t)
+                        if (
+                            target_up
+                            and target_state == "forwarding"
+                            and vlan in by_name[target]["allowed"]
+                        ):
+                            egress = [target]
+                            action = "unicast"
+                elif hit is None:
+                    selected = {}  # lag 名 -> 本帧选中的成员
+                    for lag in lags:
+                        if ingress_lag is not None and lag is ingress_lag:
+                            continue  # 禁止组内回送
+                        candidates = lag_candidates(lag, t, vlan)
+                        if candidates:
+                            selected[lag["name"]] = lag_pick(
+                                lag, candidates, src, dst, vlan
+                            )
+                    for port in ports:
+                        name = port["name"]
+                        lag = lag_of.get(name)
+                        if lag is not None:
+                            if selected.get(lag["name"]) == name:
+                                egress.append(name)
+                        elif (
+                            vlan in port["allowed"]
+                            and name != port_name
+                            and port_status(name, t) == (True, "forwarding")
+                        ):
+                            egress.append(name)
+                    if egress:
+                        action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        mirrors = []
+        if ingress_copy is not None:  # both 时 ingress 在前
+            mirrors.append(ingress_copy)
+        if direction in ("egress", "both"):
+            for name in egress:  # egress 按 ports 序
+                if name in source_set:
+                    out_tag = (
+                        None if vlan in by_name[name]["untagged"] else vlan
+                    )
+                    copy = mirror_entry("egress", out_tag, name, t)
+                    if copy is not None:
+                        mirrors.append(copy)
+        results.append(
+            {"t": t, "action": action, "ports": out_ports, "mirrors": mirrors}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -1610,6 +2001,7 @@ def main(argv):
         "forward-stp",
         "forward-stp-storm",
         "lag",
+        "mirror",
     ):
         _fail("usage")
         return 2
@@ -1685,6 +2077,31 @@ def main(argv):
                 age,
                 storm,
                 lags,
+                validate_lag_events(data, ports, link_ids, lags),
+            )
+        elif mode == "mirror":
+            (
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                mirror,
+            ) = validate_mirror_config(config)
+            link_ids = {link["id"] for link in links}
+            result = forward_mirror(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                mirror,
                 validate_lag_events(data, ports, link_ids, lags),
             )
         else:
