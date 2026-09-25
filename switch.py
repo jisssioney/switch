@@ -68,6 +68,8 @@ SECURITY_CONFIG_KEYS = frozenset(
 SECURITY_KEYS = frozenset(("port", "limit", "action", "static"))
 SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
+RELOAD_EVENT_KEYS = frozenset(("t", "config"))
+RELOAD_MUTABLE_KEYS = ("age", "acl", "security")
 
 
 class InvalidInput(Exception):
@@ -104,6 +106,15 @@ def parse_json(raw):
         )
     except (ValueError, RecursionError):
         raise InvalidInput("invalid json")
+
+
+def _canonical(value):
+    """配置值规范化：各层对象键按 Unicode 码点升序，数组保序。"""
+    if isinstance(value, dict):
+        return {key: _canonical(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical(item) for item in value]
+    return value
 
 
 def valid_mac(value):
@@ -1755,6 +1766,138 @@ def validate_qos_events(events, ports, link_ids, lags):
             raise InvalidInput("bad event")
         prev_t = t
     return result
+
+
+def validate_reload_events(events, ports, link_ids, lags, config):
+    """reload 子命令事件：普通事件沿用 qos，另含 {t, config} 重载事件。
+
+    返回 (事件序列, 末态原始配置)；重载事件的 config 须为完整有效配置，
+    且仅 age/acl/security 可与当时配置不同。全部校验先于执行。
+    """
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    member_set = {member for lag in lags for member in lag["members"]}
+    result = []
+    prev_t = None
+    current = config
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            t = event["t"]
+            lid = event["id"]
+            up = event["up"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == MEMBER_EVENT_KEYS:
+            t = event["t"]
+            member = event["member"]
+            up = event["up"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(member, str) or member not in member_set:
+                raise InvalidInput("bad event member")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("member", t, member, up))
+        elif keys == SERVICE_EVENT_KEYS:
+            t = event["t"]
+            port = event["port"]
+            count = event["count"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not _is_int(count) or count <= 0:
+                raise InvalidInput("bad count")
+            result.append(("service", t, port, count))
+        elif keys == FRAME_KEYS_ACL:
+            t = event["t"]
+            port = event["port"]
+            src = event["src"]
+            dst = event["dst"]
+            vlan = event["vlan"]
+            ethertype = event["ethertype"]
+            priority = event["priority"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not valid_mac(src):
+                raise InvalidInput("bad src")
+            if not valid_dst_mac(dst):
+                raise InvalidInput("bad dst")
+            if vlan is not None and not _valid_vlan_id(vlan):
+                raise InvalidInput("bad vlan")
+            if not _is_int(ethertype) or not 0 <= ethertype <= 65535:
+                raise InvalidInput("bad ethertype")
+            if not _is_int(priority) or not 0 <= priority <= 7:
+                raise InvalidInput("bad priority")
+            result.append(
+                ("frame", t, port, src, dst, vlan, ethertype, priority)
+            )
+        elif keys == RELOAD_EVENT_KEYS:
+            t = event["t"]
+            new_config = event["config"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(new_config, dict):
+                raise InvalidInput("bad reload config")
+            (
+                _bridges,
+                _links,
+                _delay,
+                _bridge,
+                _ports,
+                new_age,
+                _storm,
+                _lags,
+                _mirror,
+                new_acl,
+                _qos,
+                new_security,
+            ) = validate_security_config(new_config)
+            for key in current:
+                if (
+                    key not in RELOAD_MUTABLE_KEYS
+                    and new_config[key] != current[key]
+                ):
+                    raise InvalidInput("reload may only change age/acl/security")
+            changes = []
+            for key in RELOAD_MUTABLE_KEYS:
+                if new_config[key] != current[key]:
+                    changes.append(
+                        {
+                            "key": key,
+                            "before": _canonical(current[key]),
+                            "after": _canonical(new_config[key]),
+                        }
+                    )
+            current = new_config
+            result.append(
+                ("reload", t, new_age, new_acl, new_security, changes)
+            )
+        else:
+            raise InvalidInput("bad event")
+        prev_t = t
+    return result, current
 
 
 def forward_lag(
@@ -3605,6 +3748,31 @@ def forward_security(
                  "mirrors": mirrors}
             )
             continue
+        if item[0] == "reload":
+            _, t, new_age, new_acl, new_security, changes = item
+            new_by_port = {entry["port"]: entry for entry in new_security}
+            new_static_owner = {}
+            for entry in new_security:
+                for static in entry["static"]:
+                    new_static_owner[(static["vlan"], static["mac"])] = (
+                        entry["port"]
+                    )
+            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static：整批无效
+            for name, macs in dynamic.items():
+                if len(macs) > new_by_port[name]["limit"]:
+                    raise InvalidInput("dynamic bindings exceed new limit")
+            for key in bound:
+                if key in new_static_owner:
+                    raise InvalidInput("dynamic binding in new static")
+            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
+            # 风暴记录与计数全部保留，新规则自下一事件生效
+            age = new_age
+            acl = new_acl
+            sec_by_port = new_by_port
+            sec_order = [entry["port"] for entry in new_security]
+            static_owner = new_static_owner
+            results.append({"t": t, "action": "reload", "changes": changes})
+            continue
         _, t, port_name, src, dst, tag, ethertype, priority = item
         fid = frame_seq
         frame_seq += 1
@@ -3797,6 +3965,7 @@ def main(argv):
         "acl",
         "qos",
         "port-security",
+        "reload",
     ):
         _fail("usage")
         return 2
@@ -3986,6 +4155,41 @@ def main(argv):
                 security,
                 validate_qos_events(data, ports, link_ids, lags),
             )
+        elif mode == "reload":
+            (
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                mirror,
+                acl,
+                qos,
+                security,
+            ) = validate_security_config(config)
+            link_ids = {link["id"] for link in links}
+            reload_events, final_config = validate_reload_events(
+                data, ports, link_ids, lags, config
+            )
+            result = forward_security(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                mirror,
+                acl,
+                qos,
+                security,
+                reload_events,
+            )
+            result["config"] = _canonical(final_config)
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
