@@ -2,6 +2,7 @@
 """二层以太网交换机仿真（仅标准库）。"""
 
 from collections import deque
+import copy
 import hashlib
 import heapq
 import json
@@ -649,13 +650,30 @@ def stp_converge(bridges, links):
 
 
 def stp(bridges, links, delay, events):
+    result, _ = stp_run(bridges, links, delay, events)
+    return result
+
+
+def stp_run(bridges, links, delay, events, max_work=None):
+    """执行 STP 仿真；max_work 非 None 时限定累计收敛工作量。
+
+    每次实际收敛计 B+L+2U（B 桥数、L 链路数、U 当时 up 链路数）；
+    up 状态未改变的幂等事件复用缓存结果，不计工作量。累计工作量首次
+    超过 max_work 时返回 (None, 累计值)，等于上限合法。
+    """
     by_id = {link["id"]: link for link in links}
     previous = {}  # (bridge, port) -> 上一轮角色
     since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
     results = []
+    work = 0
+    cached = None  # 最近一次实际收敛的 (root_of, cost, roles)
 
-    def snapshot(t):
-        root_of, cost, roles = stp_converge(bridges, links)
+    def add_work(up_count):
+        nonlocal work
+        work += len(bridges) + len(links) + 2 * up_count
+        return max_work is None or work <= max_work
+
+    def snapshot(t, root_of, cost, roles):
         for name in bridges:
             for port, role in roles[name].items():
                 key = (name, port)
@@ -694,11 +712,21 @@ def stp(bridges, links, delay, events):
             )
         results.append(entry)
 
-    snapshot(0)
+    root_of, cost, roles = stp_converge(bridges, links)
+    cached = (root_of, cost, roles)
+    if not add_work(sum(1 for link in links if link["up"])):
+        return None, work
+    snapshot(0, root_of, cost, roles)
     for t, lid, up in events:
-        by_id[lid]["up"] = up
-        snapshot(t)
-    return {"results": results}
+        link = by_id[lid]
+        if link["up"] != up:
+            link["up"] = up
+            root_of, cost, roles = stp_converge(bridges, links)
+            cached = (root_of, cost, roles)
+            if not add_work(sum(1 for item in links if item["up"])):
+                return None, work
+        snapshot(t, *cached)
+    return {"results": results}, work
 
 
 def valid_dst_mac(value):
@@ -4006,6 +4034,7 @@ DEFAULT_MAX_EVENTS_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_STP_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4421,7 +4450,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits)
-    if len(args) not in (3, 5, 7) or args[0] not in (
+    # stp 额外支持第 5 个可选上限 MAX_STP_WORK（共 8 个参数）
+    stp_limits = None
+    if args[:1] == ["stp"] and len(args) in (3, 5, 7, 8):
+        # stp CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK]]]
+        stp_limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_STP_WORK,
+            ),
+        )
+        if stp_limits is None:
+            _fail("usage")
+            return 2
+    elif len(args) not in (3, 5, 7) or args[0] not in (
         "fdb",
         "forward",
         "stp",
@@ -4438,19 +4486,28 @@ def main(argv):
         return 2
     # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES]]
     # 上限只准 0、2 或 4 项，均须匹配 [1-9][0-9]*，按数学整数比较
-    if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
-        _fail("usage")
-        return 2
-    limits = (
-        DEFAULT_MAX_CONFIG_BYTES,
-        DEFAULT_MAX_DATA_BYTES,
-        DEFAULT_MAX_ITEMS,
-        DEFAULT_MAX_OUTPUT_BYTES,
-    )
-    parsed = tuple(_limit_value(token) for token in args[3:])
-    max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
-        parsed + limits[len(parsed):]
-    )
+    if stp_limits is not None:
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_stp_work,
+        ) = stp_limits
+    else:
+        if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
+            _fail("usage")
+            return 2
+        limits = (
+            DEFAULT_MAX_CONFIG_BYTES,
+            DEFAULT_MAX_DATA_BYTES,
+            DEFAULT_MAX_ITEMS,
+            DEFAULT_MAX_OUTPUT_BYTES,
+        )
+        parsed = tuple(_limit_value(token) for token in args[3:])
+        max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
+            parsed + limits[len(parsed):]
+        )
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4482,9 +4539,19 @@ def main(argv):
         elif mode == "stp":
             bridges, links, delay = validate_stp_config(config)
             link_ids = {link["id"] for link in links}
-            result = stp(
-                bridges, links, delay, validate_stp_events(data, link_ids)
+            events = validate_stp_events(data, link_ids)
+            # 全量校验后用独立链路状态无副作用预演工作量上限
+            probe_result, _ = stp_run(
+                bridges,
+                copy.deepcopy(links),
+                delay,
+                events,
+                max_stp_work,
             )
+            if probe_result is None:
+                _fail("stp_work_limit")
+                return 5
+            result = stp(bridges, links, delay, events)
         elif mode == "forward-stp":
             bridges, links, delay, bridge, ports, age = (
                 validate_forward_stp_config(config)
