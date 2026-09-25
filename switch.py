@@ -4004,6 +4004,8 @@ DEFAULT_MAX_LOG_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_CONFIG_BYTES = 1024 * 1024
 DEFAULT_MAX_EVENTS_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_ITEMS = 100000
+DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -4037,11 +4039,18 @@ def _parse_limits(tokens):
 
 
 def _read_limited(handle, limit):
-    """按至多 65536 字节分块读取；超过 limit 即停止并返回 None。"""
+    """按至多 65536 字节分块读取；超过 limit 即停止并返回 None。
+
+    额度未尽时单次至多请求剩余量，耗尽后只读 1 字节探测超限。
+    """
     chunks = []
     total = 0
     while True:
-        chunk = handle.read(min(_READ_CHUNK, limit + 1 - total))
+        remaining = limit - total
+        if remaining > 0:
+            chunk = handle.read(min(_READ_CHUNK, remaining))
+        else:
+            chunk = handle.read(1)
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -4386,7 +4395,7 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], limits[0], limits[1])
-    if len(args) not in (3, 5) or args[0] not in (
+    if len(args) not in (3, 5, 7) or args[0] not in (
         "fdb",
         "forward",
         "stp",
@@ -4401,16 +4410,21 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    if len(args) == 5:
-        # 两上限成对出现，均须匹配 [1-9][0-9]*，按数学整数比较
-        if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
-            _fail("usage")
-            return 2
-        max_config_bytes = _limit_value(args[3])
-        max_data_bytes = _limit_value(args[4])
-    else:
-        max_config_bytes = DEFAULT_MAX_CONFIG_BYTES
-        max_data_bytes = DEFAULT_MAX_DATA_BYTES
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES]]
+    # 上限只准 0、2 或 4 项，均须匹配 [1-9][0-9]*，按数学整数比较
+    if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
+        _fail("usage")
+        return 2
+    limits = (
+        DEFAULT_MAX_CONFIG_BYTES,
+        DEFAULT_MAX_DATA_BYTES,
+        DEFAULT_MAX_ITEMS,
+        DEFAULT_MAX_OUTPUT_BYTES,
+    )
+    parsed = tuple(_limit_value(token) for token in args[3:])
+    max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
+        parsed + limits[len(parsed):]
+    )
     mode = args[0]
     config_path, data_path = args[1], args[2]
     try:
@@ -4432,6 +4446,10 @@ def main(argv):
     try:
         config = parse_json(config_raw)
         data = parse_json(data_raw)
+        # 项数上界在解析后、语义校验前判定；DATA 非数组仍按非法输入处理
+        if isinstance(data, list) and len(data) > max_items:
+            _fail("item_limit")
+            return 5
         if mode == "fdb":
             ports, age = validate_config(config)
             result = simulate(validate_events(data, ports), age)
@@ -4650,8 +4668,17 @@ def main(argv):
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-    sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
+    payload = (
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )
+    # 输出字节上界（含末尾 LF）在写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
     return 0
 
 
