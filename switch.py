@@ -2726,7 +2726,10 @@ def forward_qos(
     egress_queues = {
         port["name"]: [deque(), deque(), deque(), deque()] for port in ports
     }
-    wrr_cursor = {port["name"]: 3 for port in ports}
+    # 每物理出口持久 WRR 状态 (当前队, 剩余配额)；初始服务 3 队
+    wrr_state = {
+        port["name"]: [3, weights[3]] for port in ports
+    }
     frame_seq = 0  # 全局零基帧序号（仅帧事件占用）
 
     def converge(t):
@@ -2956,7 +2959,7 @@ def forward_qos(
                     port_stats[port_name]["tx"] += 1  # tx 仅服务时计
                     vlan_stats[frame["vlan"]]["tx"] += 1
                     frames.append(frame["id"])
-                    copy = None
+                    # 仅实际产生出站副本才追加（无 null 占位），与发送帧同序
                     if (
                         direction in ("egress", "both")
                         and port_name in source_set
@@ -2964,7 +2967,8 @@ def forward_qos(
                         copy = mirror_entry(
                             "egress", frame["mirror"], port_name, t
                         )
-                    mirrors.append(copy)
+                        if copy is not None:
+                            mirrors.append(copy)
 
                 while served < count:
                     if sched_mode == "sp":
@@ -2975,17 +2979,22 @@ def forward_qos(
                             break
                         dequeue_one()
                         served += 1
-                    else:  # wrr：3 到 0 循环，空队跳过，游标跨事件保留
-                        q = wrr_cursor[port_name]
-                        take = min(weights[q], count - served)
-                        for _ in range(take):
-                            if not queues[q]:
-                                break
-                            dequeue_one()
-                            served += 1
-                        wrr_cursor[port_name] = (q - 1) % 4
-                        if not any(queues):
+                    else:  # wrr：持久状态 (q, rem)
+                        q, rem = wrr_state[port_name]
+                        if not any(queues):  # 四队全空：停止且状态不变
                             break
+                        while not queues[q]:  # 当前队空：推进并重置配额
+                            q = (q - 1) % 4
+                            rem = weights[q]
+                        dequeue_one()
+                        served += 1
+                        rem -= 1  # 每发一帧 rem 减 1
+                        if rem == 0 or not queues[q]:
+                            # rem 用尽或当前队变空：推进并重置配额；
+                            # count 用尽而 rem 未尽且队非空：状态保留续用
+                            q = (q - 1) % 4
+                            rem = weights[q]
+                        wrr_state[port_name] = [q, rem]
             results.append(
                 {"t": t, "port": port_name, "frames": frames,
                  "mirrors": mirrors}
