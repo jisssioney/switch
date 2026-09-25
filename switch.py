@@ -11,6 +11,9 @@ CONFIG_KEYS = frozenset(("ports", "age"))
 EVENT_KEYS = frozenset(("t", "port", "mac", "vlan"))
 PORT_KEYS = frozenset(("name", "vlan", "up"))
 FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
+Q_PORT_KEYS = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
+Q_FRAME_KEYS = frozenset(("t", "port", "src", "dst", "vlan"))
+PORT_MODES = frozenset(("access", "trunk", "hybrid"))
 
 
 class InvalidInput(Exception):
@@ -19,6 +22,10 @@ class InvalidInput(Exception):
 
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_vlan_id(value):
+    return _is_int(value) and 1 <= value <= 4094
 
 
 def _reject_constant(value):
@@ -237,6 +244,184 @@ def forward(frames, ports, age):
     }
 
 
+def _strictly_sorted(values):
+    return all(values[i] < values[i + 1] for i in range(len(values) - 1))
+
+
+def validate_q_config(config):
+    if not isinstance(config, dict) or frozenset(config) != CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    ports = config["ports"]
+    age = config["age"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    names = []
+    for port in ports:
+        if not isinstance(port, dict) or frozenset(port) != Q_PORT_KEYS:
+            raise InvalidInput("bad port")
+        name = port["name"]
+        mode = port["mode"]
+        pvid = port["pvid"]
+        allowed = port["allowed"]
+        untagged = port["untagged"]
+        up = port["up"]
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("bad port name")
+        if not isinstance(mode, str) or mode not in PORT_MODES:
+            raise InvalidInput("bad mode")
+        if not _valid_vlan_id(pvid):
+            raise InvalidInput("bad pvid")
+        if (
+            not isinstance(allowed, list)
+            or not allowed
+            or not all(_valid_vlan_id(v) for v in allowed)
+            or not _strictly_sorted(allowed)
+            or pvid not in allowed
+        ):
+            raise InvalidInput("bad allowed")
+        if (
+            not isinstance(untagged, list)
+            or not all(_valid_vlan_id(v) for v in untagged)
+            or not _strictly_sorted(untagged)
+            or not set(untagged) <= set(allowed)
+        ):
+            raise InvalidInput("bad untagged")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        if mode == "access" and (allowed != [pvid] or untagged != [pvid]):
+            raise InvalidInput("bad access port")
+        if mode == "trunk" and untagged:
+            raise InvalidInput("bad trunk port")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise InvalidInput("ports must be distinct")
+    if not _is_int(age) or age <= 0:
+        raise InvalidInput("age must be a positive integer")
+    return ports, age
+
+
+def validate_q_frames(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for frame in frames:
+        if not isinstance(frame, dict) or frozenset(frame) != Q_FRAME_KEYS:
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        src = frame["src"]
+        dst = frame["dst"]
+        vlan = frame["vlan"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in names:
+            raise InvalidInput("unknown port")
+        if not valid_mac(src):
+            raise InvalidInput("bad src")
+        if dst != BROADCAST_MAC and not valid_mac(dst):
+            raise InvalidInput("bad dst")
+        if vlan is not None and not _valid_vlan_id(vlan):
+            raise InvalidInput("bad vlan")
+        result.append((t, port, src, dst, vlan))
+    return result
+
+
+def forward_q(frames, ports, age):
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, src, dst, tag in frames:
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        rejected = tag is not None and (
+            ingress["mode"] == "access" or tag not in ingress["allowed"]
+        )
+        vlan = ingress["pvid"] if tag is None else tag
+        egress = []
+        action = "drop"
+        if not rejected:
+            vlan_stats[vlan]["rx"] += 1
+            if ingress["up"]:
+                fdb[(vlan, src)] = [port_name, t]
+                hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+                if hit is not None:
+                    candidates = [hit[0]]
+                else:
+                    candidates = [port["name"] for port in ports]
+                for name in candidates:
+                    port = by_name[name]
+                    if (
+                        name != port_name
+                        and port["up"]
+                        and vlan in port["allowed"]
+                    ):
+                        egress.append(
+                            {
+                                "name": name,
+                                "vlan": None if vlan in port["untagged"] else vlan,
+                            }
+                        )
+                if egress:
+                    action = "unicast" if hit is not None else "flood"
+        for item in egress:
+            port_stats[item["name"]]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            if not rejected:
+                vlan_stats[vlan]["drop"] += 1
+        results.append({"t": t, "action": action, "ports": egress})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
+def run_forward(config, data):
+    ports = config.get("ports") if isinstance(config, dict) else None
+    if (
+        isinstance(ports, list)
+        and ports
+        and all(
+            isinstance(port, dict) and frozenset(port) == Q_PORT_KEYS
+            for port in ports
+        )
+    ):
+        q_ports, q_age = validate_q_config(config)
+        return forward_q(validate_q_frames(data, q_ports), q_ports, q_age)
+    ports, age = validate_forward_config(config)
+    return forward(validate_frames(data, ports), ports, age)
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -265,8 +450,7 @@ def main(argv):
             ports, age = validate_config(config)
             result = simulate(validate_events(data, ports), age)
         else:
-            ports, age = validate_forward_config(config)
-            result = forward(validate_frames(data, ports), ports, age)
+            result = run_forward(config, data)
     except InvalidInput:
         _fail("invalid_input")
         return 4
