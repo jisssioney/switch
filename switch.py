@@ -72,6 +72,7 @@ SECURITY_KEYS = frozenset(("port", "limit", "action", "static"))
 SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
 RELOAD_EVENT_KEYS = frozenset(("t", "config"))
+ROLLBACK_EVENT_KEYS = frozenset(("t", "rollback"))
 RELOAD_MUTABLE_KEYS = ("age", "acl", "security")
 
 
@@ -2328,11 +2329,14 @@ def validate_security_check_events(events, ports, link_ids, lags):
     return validate_qos_check_events(events, ports, link_ids, lags)
 
 
-def validate_reload_events(events, ports, link_ids, lags, config):
+def validate_reload_events(events, ports, link_ids, lags, config,
+                           allow_rollback=False):
     """reload 子命令事件：普通事件沿用 qos，另含 {t, config} 重载事件。
 
     返回 (事件序列, 末态原始配置)；重载事件的 config 须为完整有效配置，
     且仅 age/acl/security 可与当时配置不同。全部校验先于执行。
+    allow_rollback 时另含 {t, rollback} 事件（rollback 只能为 true）：
+    reload 前压入当前配置，rollback 弹栈恢复，空栈为 invalid_input。
     """
     if not isinstance(events, list):
         raise InvalidInput("events must be a list")
@@ -2341,6 +2345,7 @@ def validate_reload_events(events, ports, link_ids, lags, config):
     result = []
     prev_t = None
     current = config
+    stack = []  # reload 前压入的原始配置；rollback 弹栈恢复
     for event in events:
         if not isinstance(event, dict):
             raise InvalidInput("bad event")
@@ -2450,9 +2455,50 @@ def validate_reload_events(events, ports, link_ids, lags, config):
                             "after": _canonical(new_config[key]),
                         }
                     )
+            if allow_rollback:
+                stack.append(current)  # reload 前压入当前配置
             current = new_config
             result.append(
                 ("reload", t, new_age, new_acl, new_security, changes)
+            )
+        elif allow_rollback and keys == ROLLBACK_EVENT_KEYS:
+            t = event["t"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if event["rollback"] is not True:
+                raise InvalidInput("bad rollback")
+            if not stack:
+                raise InvalidInput("rollback stack empty")
+            new_config = stack.pop()
+            (
+                _bridges,
+                _links,
+                _delay,
+                _bridge,
+                _ports,
+                new_age,
+                _storm,
+                _lags,
+                _mirror,
+                new_acl,
+                _qos,
+                new_security,
+            ) = validate_security_config(new_config)
+            changes = []
+            for key in RELOAD_MUTABLE_KEYS:
+                if new_config[key] != current[key]:
+                    changes.append(
+                        {
+                            "key": key,
+                            "before": _canonical(current[key]),
+                            "after": _canonical(new_config[key]),
+                        }
+                    )
+            current = new_config
+            result.append(
+                ("rollback", t, new_age, new_acl, new_security, changes)
             )
         else:
             raise InvalidInput("bad event")
@@ -9169,10 +9215,11 @@ def reload_work(
                 work += X + sum(egress_queues[item[2]]) + 1
         elif kind == "service":
             work += X + sum(egress_queues[item[2]]) + 1
-        elif kind == "reload":
+        elif kind in ("reload", "rollback"):
             # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static 的整批无效
             # 判定先于工作量累加与超限判断：record/replay 按 invalid_input
-            # 退出 4，且绝不触碰 LOG
+            # 退出 4，且绝不触碰 LOG；rollback 按 reload 分支计费，
+            # A/T 取恢复配置的 ACL 规则数/静态绑定数
             reload_by_port = {entry["port"]: entry for entry in item[4]}
             reload_static_owner = {}
             for entry in item[4]:
@@ -9251,7 +9298,7 @@ def reload_work(
                         rem = weights[q]
                     wrr_state[port_name] = [q, rem]
             continue
-        if kind == "reload":
+        if kind in ("reload", "rollback"):
             _, _, new_age, new_acl, new_security, _ = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
@@ -9741,7 +9788,7 @@ def forward_security(
                      "output": results[-1]}
                 )
             continue
-        if item[0] == "reload":
+        if item[0] in ("reload", "rollback"):
             _, t, new_age, new_acl, new_security, changes = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
@@ -9764,10 +9811,12 @@ def forward_security(
             sec_by_port = new_by_port
             sec_order = [entry["port"] for entry in new_security]
             static_owner = new_static_owner
-            results.append({"t": t, "action": "reload", "changes": changes})
+            results.append(
+                {"t": t, "action": item[0], "changes": changes}
+            )
             if observer is not None:
                 observer["items"].append(
-                    {"kind": "reload", "t": t, "applied": True,
+                    {"kind": item[0], "t": t, "applied": True,
                      "output": results[-1]}
                 )
             continue
@@ -12704,8 +12753,43 @@ def _cmd_forward_check(
     return 0
 
 
+SUBCOMMANDS = frozenset((
+    "record",
+    "replay",
+    "config-diff",
+    "config-export",
+    "config-import",
+    "frame-check",
+    "link-state",
+    "forward-check",
+    "fdb",
+    "forward",
+    "stp",
+    "forward-stp",
+    "stp-check",
+    "forward-stp-storm",
+    "storm-check",
+    "lag",
+    "lag-check",
+    "mirror",
+    "mirror-check",
+    "acl",
+    "acl-check",
+    "qos",
+    "qos-check",
+    "port-security",
+    "security-check",
+    "reload",
+    "reload-rollback",
+))
+
+
 def main(argv):
-    args = argv[1:]
+    # 首项为已知子命令时不丢弃（程序化调用），否则仅丢脚本名
+    if argv[:1] and argv[0] in SUBCOMMANDS:
+        args = list(argv)
+    else:
+        args = argv[1:]
     if args[:1] == ["record"]:
         # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES
         #   [MAX_CONFIG_BYTES MAX_EVENTS_BYTES [MAX_OUTPUT_BYTES
@@ -12873,7 +12957,7 @@ def main(argv):
         return _cmd_forward_check(args[1], args[2], *limits)
     # stp/fdb/forward/forward-stp/stp-check/forward-stp-storm/storm-check/lag/
     # lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/port-security/
-    # security-check/reload 额外允许 5 项
+    # security-check/reload/reload-rollback 额外允许 5 项
     # 上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/
     # MAX_FORWARD_STP_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/MAX_STORM_WORK/
     # MAX_LAG_WORK/MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_MIRROR_WORK/
@@ -12898,6 +12982,7 @@ def main(argv):
     is_security = args[:1] == ["port-security"]
     is_security_check = args[:1] == ["security-check"]
     is_reload = args[:1] == ["reload"]
+    is_reload_rollback = args[:1] == ["reload-rollback"]
     allowed_counts = (
         (3, 5, 7, 8)
         if is_stp or is_fdb or is_forward or is_forward_stp
@@ -12906,6 +12991,7 @@ def main(argv):
         or is_mirror or is_mirror_check
         or is_acl or is_acl_check or is_qos or is_qos_check
         or is_security or is_security_check or is_reload
+        or is_reload_rollback
         else (3, 5, 7)
     )
     if len(args) not in allowed_counts or args[0] not in (
@@ -12927,6 +13013,7 @@ def main(argv):
         "port-security",
         "security-check",
         "reload",
+        "reload-rollback",
     ):
         _fail("usage")
         return 2
@@ -13157,7 +13244,7 @@ def main(argv):
             max_output_bytes,
             max_security_work,
         ) = parsed + security_check_limits[len(parsed):]
-    elif is_reload:
+    elif is_reload or is_reload_rollback:
         reload_limits = limits + (DEFAULT_MAX_RELOAD_WORK,)
         (
             max_config_bytes,
@@ -13775,7 +13862,7 @@ def main(argv):
                 max_frame,
                 events,
             )
-        elif mode == "reload":
+        elif mode in ("reload", "reload-rollback"):
             (
                 bridges,
                 links,
@@ -13792,7 +13879,8 @@ def main(argv):
             ) = validate_security_config(config)
             link_ids = {link["id"] for link in links}
             reload_events, final_config = validate_reload_events(
-                data, ports, link_ids, lags, config
+                data, ports, link_ids, lags, config,
+                allow_rollback=(mode == "reload-rollback"),
             )
             # 既有语义（含动态绑定与新 limit/static 冲突）全量校验后
             # 无副作用预演；forward_security 就地改链路状态，预演用原值
