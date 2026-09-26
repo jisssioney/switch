@@ -911,12 +911,13 @@ def validate_loop_detect_config(config):
     return bridges, links, vlans
 
 
-def loop_detect(links, vlans, events, max_work=None):
+def loop_detect(links, vlans, events, max_work=None, observer=None):
     """逐 VLAN 以桥为并查集顶点做生成树扫描：连接不同分量的 up 链路
     列入 forwarding 并合并，已连通者列入 blocked。
 
     每个快照计 V*(L+1)；先以独立链路状态无副作用预演，累计超限即在
     仿真前报错。t=0 先输出快照，随后每个事件（含幂等事件）应用后输出。
+    observer 非 None 时（record/replay）逐事件记录 applied 与事件后快照。
     """
     by_id = {link["id"]: link for link in links}
     V = len(vlans)
@@ -925,6 +926,8 @@ def loop_detect(links, vlans, events, max_work=None):
     work = (1 + len(events)) * V * (L + 1)
     if max_work is not None and work > max_work:
         raise LoopWorkLimit
+    if observer is not None:  # record：逐事件记录 applied 与事件后快照
+        observer["items"] = []
 
     ordered_ids = sorted(by_id, key=lambda lid: [ord(char) for char in lid])
     results = []
@@ -962,8 +965,14 @@ def loop_detect(links, vlans, events, max_work=None):
 
     snapshot(0)
     for t, lid, new_up in events:
+        changed = by_id[lid]["up"] != new_up
         by_id[lid]["up"] = new_up
         snapshot(t)
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "link", "t": t, "applied": changed,
+                 "output": results[-1]}
+            )
     return {"results": results}
 
 
@@ -12623,17 +12632,46 @@ def _run_reload(config, events, observe, max_work=None):
     return result, observer
 
 
+def _log_mode(config):
+    """按 config 形状选 record/replay 模式：loop-detect 或 reload。"""
+    if isinstance(config, dict) and frozenset(config) == LOOP_CONFIG_KEYS:
+        return "loop"
+    return "reload"
+
+
+def _run_loop(config, events, observe, max_work=None):
+    """record/replay 环路模式：校验 loop-detect 配置与事件并做生成树扫描。
+
+    返回 (loop-detect 结果 dict, observer 或 None)。全部校验先于返回；
+    工作量按 V*(L+1)*(事件数+1) 在仿真前判定（loop_detect 内置：首次
+    超过即抛 LoopWorkLimit，不正式仿真），等于上限合法。
+    """
+    _bridges, links, vlans = validate_loop_detect_config(config)
+    link_ids = {link["id"] for link in links}
+    parsed_events = validate_stp_events(events, link_ids)
+    observer = {} if observe else None
+    result = loop_detect(
+        links, vlans, parsed_events, max_work, observer=observer
+    )
+    return result, observer
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
         raise InvalidInput("bad log")
     records = []
-    version = 0  # version 初值 0，取事件后值；每次 reload/rollback（无变化亦算）加 1
+    # version 初值 0，取事件后值；reload 模式每次 reload/rollback
+    # （无变化亦算）加 1，环路模式链路 up 实际改变才加 1
+    loop_mode = _log_mode(config) == "loop"
+    version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
         if kind in ("reload", "rollback"):
+            version += 1
+        elif loop_mode and observed["applied"]:
             version += 1
         records.append(
             {
@@ -12743,12 +12781,15 @@ def _verify_records(log, events, items):
     records = log["records"]
     if len(records) != len(items):
         raise InvalidInput("bad log records")
+    loop_mode = _log_mode(log["config"]) == "loop"
     version = 0
     for event, observed, record in zip(events, items, records):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
         if kind in ("reload", "rollback"):
+            version += 1
+        elif loop_mode and observed["applied"]:
             version += 1
         if record["t"] != event["t"]:
             raise InvalidInput("bad log t")
@@ -12827,7 +12868,12 @@ def _cmd_record(
         # 工作量预演在语义校验后、正式仿真与 LOG 构造前，超限绝不触碰 LOG
         config = parse_json(config_raw)
         events = events_preview
-        result, observer = _run_reload(config, events, True, max_record_work)
+        if _log_mode(config) == "loop":
+            result, observer = _run_loop(config, events, True, max_record_work)
+        else:
+            result, observer = _run_reload(
+                config, events, True, max_record_work
+            )
         doc = _build_log_doc(config, events, observer["items"])
         payload = _log_bytes(doc)
         # 字节上界（含末尾 LF）在写入前判定；等于上限合法
@@ -12844,6 +12890,9 @@ def _cmd_record(
         _fail("invalid_input")
         return 4
     except ReloadWorkLimit:
+        _fail("record_work_limit")
+        return 5
+    except LoopWorkLimit:
         _fail("record_work_limit")
         return 5
     except OSError:
@@ -12879,7 +12928,12 @@ def _cmd_replay(
             return 5
         # 状态语义校验后先按 record 同一公式无副作用预演；首次超限即停止，
         # 不正式重放，LOG 保持不动
-        result, observer = _run_reload(config, events, True, max_replay_work)
+        if _log_mode(config) == "loop":
+            result, observer = _run_loop(config, events, True, max_replay_work)
+        else:
+            result, observer = _run_reload(
+                config, events, True, max_replay_work
+            )
         _verify_records(log, events, observer["items"])
         # 重放重建的 LOG 须与原文件逐字节一致（含 sha256 与 LF）
         rebuilt = _build_log_doc(config, events, observer["items"])
@@ -12894,6 +12948,9 @@ def _cmd_replay(
         _fail("invalid_input")
         return 4
     except ReloadWorkLimit:
+        _fail("replay_work_limit")
+        return 5
+    except LoopWorkLimit:
         _fail("replay_work_limit")
         return 5
     sys.stdout.buffer.write(output)
