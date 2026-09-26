@@ -123,6 +123,10 @@ class ReloadWorkLimit(Exception):
     pass
 
 
+class DiffWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -6331,6 +6335,7 @@ DEFAULT_MAX_SECURITY_WORK = 10000000
 DEFAULT_MAX_RELOAD_WORK = 10000000
 DEFAULT_MAX_RECORD_WORK = 10000000
 DEFAULT_MAX_REPLAY_WORK = 10000000
+DEFAULT_MAX_DIFF_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -6781,7 +6786,44 @@ def _diff_collect(old, new, path, changes):
         )
 
 
-def _cmd_config_diff(old_path, new_path):
+def _diff_size(value):
+    """工作量公式的 S：标量 1；数组 1+各元素 S 之和；
+    对象 1+键数+各值 S 之和。"""
+    if isinstance(value, dict):
+        return 1 + len(value) + sum(_diff_size(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(_diff_size(item) for item in value)
+    return 1
+
+
+def _diff_work(old, new, remaining):
+    """按工作量公式无副作用预演 D，返回剩余额度（耗尽为 0）。
+
+    两值均为对象时计 1+并集键数，共有键递归计 D，单侧键计该侧 S；
+    其余（含数组整体）计 1+S(旧值)+S(新值)。键按 Unicode 码点升序
+    累计；等于上限合法，首次超过即抛 DiffWorkLimit。
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        cost = 1 + len(set(old) | set(new))
+        if cost > remaining:
+            raise DiffWorkLimit
+        remaining -= cost
+        for key in sorted(set(old) | set(new)):
+            if key in old and key in new:
+                remaining = _diff_work(old[key], new[key], remaining)
+            else:
+                cost = _diff_size(old[key] if key in old else new[key])
+                if cost > remaining:
+                    raise DiffWorkLimit
+                remaining -= cost
+        return remaining
+    cost = 1 + _diff_size(old) + _diff_size(new)
+    if cost > remaining:
+        raise DiffWorkLimit
+    return remaining - cost
+
+
+def _cmd_config_diff(old_path, new_path, max_diff_work=DEFAULT_MAX_DIFF_WORK):
     try:
         # 先打开两文件，任一失败即停；均可读后按 OLD、NEW 顺序分块读
         with open(old_path, "rb") as old_handle, open(
@@ -6804,9 +6846,14 @@ def _cmd_config_diff(old_path, new_path):
         # 两份均按既有 port-security 契约全量解析校验
         validate_security_config(old_config)
         validate_security_config(new_config)
+        # 语义校验后先无副作用预演根值 D；首次超过即停止，不生成差异
+        _diff_work(old_config, new_config, max_diff_work)
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except DiffWorkLimit:
+        _fail("diff_work_limit")
+        return 5
     changes = []
     _diff_collect(old_config, new_config, "", changes)
     result = {"equal": not changes, "changes": changes}
@@ -6865,11 +6912,18 @@ def main(argv):
             return 2
         return _cmd_replay(args[1], *limits)
     if args[:1] == ["config-diff"]:
-        # config-diff OLD NEW：逐字节仅这一种用法
-        if len(args) != 3:
+        # config-diff OLD NEW [MAX_DIFF_WORK]：逐字节仅这两种用法；
+        # 上限须匹配 [1-9][0-9]*，按数学整数比较
+        if len(args) not in (3, 4):
             _fail("usage")
             return 2
-        return _cmd_config_diff(args[1], args[2])
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_diff_work = (
+            _limit_value(args[3]) if len(args) == 4 else DEFAULT_MAX_DIFF_WORK
+        )
+        return _cmd_config_diff(args[1], args[2], max_diff_work)
     # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
     # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
     # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/

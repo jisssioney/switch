@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """config-diff 子命令回归：两份 port-security 配置的规范化深度比较。
 
-仅用标准库；通过 `python switch.py config-diff OLD NEW` 端到端驱动。
-比较忽略对象键序（对象递归，键按 Unicode 码点升序深度优先），数组整体
-顺序敏感，标量按 JSON 类型与值比较，path 采用 RFC6901 JSON Pointer。
+仅用标准库；通过 `python switch.py config-diff OLD NEW [MAX_DIFF_WORK]`
+端到端驱动。比较忽略对象键序（对象递归，键按 Unicode 码点升序深度
+优先），数组整体顺序敏感，标量按 JSON 类型与值比较，path 采用 RFC6901
+JSON Pointer。可选上限 MAX_DIFF_WORK 约束差异工作量预演。
 """
 
 import copy
@@ -464,6 +465,190 @@ class ConfigDiffLimitTest(unittest.TestCase):
         self.assertEqual(stdout.buffer.getvalue(), b"")
         self.assertEqual(stderr.buffer.getvalue(),
                          b'{"error":"output_limit"}\n')
+
+
+def ref_size(value):
+    """S 的独立参照实现：标量 1；数组 1+各元素 S；对象 1+键数+各值 S。"""
+    if isinstance(value, dict):
+        return 1 + len(value) + sum(ref_size(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(ref_size(item) for item in value)
+    return 1
+
+
+def ref_work(old, new):
+    """D 的独立参照实现：对象计 1+并集键数，共有键递归，单侧键计该侧 S；
+    其余计 1+S(旧值)+S(新值)。"""
+    if isinstance(old, dict) and isinstance(new, dict):
+        total = 1 + len(set(old) | set(new))
+        for key in set(old) | set(new):
+            if key in old and key in new:
+                total += ref_work(old[key], new[key])
+            else:
+                total += ref_size(old[key] if key in old else new[key])
+        return total
+    return 1 + ref_size(old) + ref_size(new)
+
+
+class DiffWorkFormulaTest(unittest.TestCase):
+    def test_size_formula(self):
+        self.assertEqual(switch._diff_size(1), 1)
+        self.assertEqual(switch._diff_size(None), 1)
+        self.assertEqual(switch._diff_size([]), 1)
+        self.assertEqual(switch._diff_size({}), 1)
+        self.assertEqual(switch._diff_size([1, 2]), 3)
+        self.assertEqual(switch._diff_size({"a": 1}), 3)
+        self.assertEqual(switch._diff_size({"a": 1, "b": [1]}), 6)
+        self.assertEqual(switch._diff_size({"a": {"b": [1, 2]}}), 7)
+
+    def test_work_formula(self):
+        self.assertEqual(ref_work(1, 2), 3)
+        self.assertEqual(ref_work({"a": 1}, {"a": 1}), 5)
+        self.assertEqual(ref_work({"a": 1}, {"a": 2, "b": [1]}), 8)
+        self.assertEqual(ref_work([1], [1]), 5)
+        # 类型不一致（含数组对对象）按“其余”整值计
+        self.assertEqual(ref_work({"a": 1}, [1]), 1 + 3 + 2)
+
+    def test_work_equal_to_limit_is_legal(self):
+        old = base_config()
+        new = copy.deepcopy(old)
+        new["age"] = 50
+        work = ref_work(old, new)
+        self.assertEqual(switch._diff_work(old, new, work), 0)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_work(old, new, work - 1)
+
+    def test_work_counts_structure_even_when_equal(self):
+        # 相同配置也按结构计费：D 非零，额度不足即超限
+        config = base_config()
+        work = ref_work(config, config)
+        self.assertGreater(work, 0)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_work(config, config, work - 1)
+
+
+class ConfigDiffWorkLimitTest(unittest.TestCase):
+    def setUp(self):
+        self.old = base_config()
+        self.new = copy.deepcopy(self.old)
+        self.new["age"] = 50
+        self.new["storm"]["hold"] = 11
+        self.old_raw = json.dumps(self.old).encode()
+        self.new_raw = json.dumps(self.new).encode()
+        self.work = ref_work(self.old, self.new)
+
+    def test_default_limit_is_ten_million(self):
+        self.assertEqual(switch.DEFAULT_MAX_DIFF_WORK, 10000000)
+
+    def test_exact_limit_succeeds_byte_identical(self):
+        code, out_default, err = run_cli(self.old_raw, self.new_raw)
+        self.assertEqual((code, err), (0, b""))
+        code, out, err = run_cli(
+            self.old_raw, self.new_raw, args=(str(self.work),)
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out, out_default)
+
+    def test_one_under_limit_fails(self):
+        code, out, err = run_cli(
+            self.old_raw, self.new_raw, args=(str(self.work - 1),)
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"diff_work_limit"}\n')
+
+    def test_equal_configs_also_bounded(self):
+        raw = json.dumps(self.old).encode()
+        work = ref_work(self.old, self.old)
+        code, out, err = run_cli(raw, raw, args=(str(work - 1),))
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"diff_work_limit"}\n')
+        code, out, err = run_cli(raw, raw, args=(str(work),))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out, b'{"equal":true,"changes":[]}\n')
+
+    def test_arbitrary_length_decimal_limit(self):
+        code, out, err = run_cli(
+            self.old_raw, self.new_raw, args=("9" * 40,)
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.startswith(b'{"equal":false,'))
+
+    def test_invalid_limit_tokens_are_usage(self):
+        for token in ("0", "00", "01", "1.5", "-1", "abc", "", "1 ", " 1"):
+            with self.subTest(token=token):
+                code, out, err = run_cli(
+                    self.old_raw, self.new_raw, args=(token,)
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, b"")
+                self.assertEqual(err, b'{"error":"usage"}\n')
+
+    def test_too_many_args_is_usage(self):
+        code, out, err = run_cli(
+            self.old_raw, self.new_raw, args=("1", "2")
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"usage"}\n')
+
+    def test_usage_precedes_file_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "nope")
+            proc = subprocess.run(
+                [sys.executable, SWITCH, "config-diff",
+                 missing, missing, "0"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stderr, b'{"error":"usage"}\n')
+            proc = subprocess.run(
+                [sys.executable, SWITCH, "config-diff",
+                 missing, missing, "1"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(proc.returncode, 3)
+            self.assertEqual(proc.stderr, b'{"error":"file_not_found"}\n')
+
+    def test_input_limit_precedes_work_limit(self):
+        pad = 1024 * 1024 - len(self.old_raw) + 1
+        code, out, err = run_cli(
+            self.old_raw + b" " * pad, self.new_raw, args=("1",)
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"input_limit"}\n')
+
+    def test_invalid_input_precedes_work_limit(self):
+        code, out, err = run_cli(b"{", self.new_raw, args=("1",))
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_work_limit_precedes_output_limit(self):
+        # 预演超限即停：不生成差异，output_limit 不参与判定
+        old = base_config()
+        new = copy.deepcopy(old)
+        new["age"] = 50
+        work = ref_work(old, new)
+        with tempfile.TemporaryDirectory() as d:
+            old_path = _write(d, "a", json.dumps(old).encode())
+            new_path = _write(d, "b", json.dumps(new).encode())
+            stdout = SimpleNamespace(buffer=io.BytesIO())
+            stderr = SimpleNamespace(buffer=io.BytesIO())
+            with mock.patch.object(sys, "stdout", stdout), \
+                    mock.patch.object(sys, "stderr", stderr), \
+                    mock.patch.object(
+                        switch, "DEFAULT_MAX_OUTPUT_BYTES", 1
+                    ):
+                code = switch._cmd_config_diff(old_path, new_path, work - 1)
+        self.assertEqual(code, 5)
+        self.assertEqual(stdout.buffer.getvalue(), b"")
+        self.assertEqual(stderr.buffer.getvalue(),
+                         b'{"error":"diff_work_limit"}\n')
 
 
 if __name__ == "__main__":
