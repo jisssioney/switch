@@ -6320,6 +6320,7 @@ DEFAULT_MAX_ACL_WORK = 10000000
 DEFAULT_MAX_QOS_WORK = 10000000
 DEFAULT_MAX_SECURITY_WORK = 10000000
 DEFAULT_MAX_RELOAD_WORK = 10000000
+DEFAULT_MAX_RECORD_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -6389,10 +6390,12 @@ def _event_kind(event):
     return kind
 
 
-def _run_reload(config, events, observe):
+def _run_reload(config, events, observe, max_work=None):
     """reload/record/replay 共用：校验配置与事件并执行 port-security 仿真。
 
     返回 (reload 结果 dict, observer 或 None)。全部校验与非法重载检测先于返回。
+    max_work 非 None 时（record），全量语义校验后先按 reload 公式无副作用
+    预演；首次超过即抛 ReloadWorkLimit，不正式仿真。
     """
     (
         bridges,
@@ -6412,6 +6415,23 @@ def _run_reload(config, events, observe):
     reload_events, final_config = validate_reload_events(
         events, ports, link_ids, lags, config
     )
+    if max_work is not None:
+        # 与 reload 入口同一公式：独立链路副本与空状态，不改动既有数据
+        reload_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            qos,
+            security,
+            reload_events,
+            max_work,
+        )
     observer = {} if observe else None
     result = forward_security(
         bridges,
@@ -6609,6 +6629,7 @@ def _cmd_record(
     max_config_bytes,
     max_events_bytes,
     max_output_bytes,
+    max_record_work,
 ):
     try:
         with open(config_path, "rb") as config_handle, open(
@@ -6632,10 +6653,11 @@ def _cmd_record(
         if isinstance(events_preview, list) and len(events_preview) > max_events:
             _fail("event_limit")
             return 5
-        # 先无副作用预演：解析、全部校验与各重载点检测均在内存完成
+        # 先无副作用预演：解析、全部校验与各重载点检测均在内存完成；
+        # 工作量预演在语义校验后、正式仿真与 LOG 构造前，超限绝不触碰 LOG
         config = parse_json(config_raw)
         events = events_preview
-        result, observer = _run_reload(config, events, True)
+        result, observer = _run_reload(config, events, True, max_record_work)
         doc = _build_log_doc(config, events, observer["items"])
         payload = _log_bytes(doc)
         # 字节上界（含末尾 LF）在写入前判定；等于上限合法
@@ -6651,6 +6673,9 @@ def _cmd_record(
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except ReloadWorkLimit:
+        _fail("record_work_limit")
+        return 5
     except OSError:
         _fail("file_not_found")
         return 3
@@ -6702,19 +6727,21 @@ def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
         # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES
-        #   [MAX_CONFIG_BYTES MAX_EVENTS_BYTES [MAX_OUTPUT_BYTES]]]
-        if len(args) not in (4, 6, 8, 9):
+        #   [MAX_CONFIG_BYTES MAX_EVENTS_BYTES [MAX_OUTPUT_BYTES
+        #   [MAX_RECORD_WORK]]]]
+        if len(args) not in (4, 6, 8, 9, 10):
             _fail("usage")
             return 2
         limits = _parse_limits(
             args[4:],
-            (0, 2, 4, 5),
+            (0, 2, 4, 5, 6),
             (
                 DEFAULT_MAX_EVENTS,
                 DEFAULT_MAX_LOG_BYTES,
                 DEFAULT_MAX_CONFIG_BYTES,
                 DEFAULT_MAX_EVENTS_BYTES,
                 DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_RECORD_WORK,
             ),
         )
         if limits is None:
