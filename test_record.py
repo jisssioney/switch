@@ -950,6 +950,28 @@ class RecordWorkLimitTest(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertEqual(err, b'{"error":"invalid_input"}\n')
 
+    def test_illegal_reload_precedes_work_limit(self):
+        # 动态绑定数超新 limit 的非法重载：其 invalid_input 判定须先于
+        # 重载工作量累加与超限判断；旧实现在此处误报 record_work_limit
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["security"][0]["limit"] = 0  # 前两帧已在 p1 动态绑定 2 > 0
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": new},
+        ]
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(events).encode())
+        os.unlink(self.log)
+        code, out, err = self._record(42)  # 仅够到重载前（累计 1+19+22）
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
     def test_arbitrary_length_decimal(self):
         code, out, err = self._record("9" * 40)
         self.assertEqual((code, out, err), (0, self.record_out, b""))
@@ -1055,6 +1077,42 @@ class ReplayWorkLimitTest(unittest.TestCase):
     def test_semantic_error_precedes_work_limit(self):
         self._rewrite(lambda doc: doc["config"].update(age=-1))
         code, out, err = self._replay(1)
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_illegal_reload_precedes_work_limit(self):
+        # 与 record 同形：日志内重载把新 limit 降到 0，前两帧已动态绑定 2。
+        # 形状与 sha 合法；重放预演中 invalid_input 判定须先于工作量超限
+        config = base_config()
+        legal = copy.deepcopy(config)
+        legal["security"][0]["limit"] = 5
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": legal},
+        ]
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(events).encode())
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        # 改写当前日志中的重载配置为非法（limit 0）并重算 sha：形状仍合法。
+        # 注意须读本文件（_rewrite 用的是 setUp 缓存的旧 log_bytes）。
+        with open(self.log, "rb") as handle:
+            doc = json.loads(handle.read().decode())
+        doc["records"][2]["event"]["config"]["security"][0]["limit"] = 0
+        doc["sha256"] = prefix_digest(doc)[0]
+        with open(self.log, "wb") as handle:
+            handle.write(
+                (json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                 + "\n").encode("utf-8")
+            )
+        code, out, err = self._replay(42)
         self.assertEqual(code, 4)
         self.assertEqual(out, b"")
         self.assertEqual(err, b'{"error":"invalid_input"}\n')
