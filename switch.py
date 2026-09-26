@@ -119,6 +119,10 @@ class SecurityWorkLimit(Exception):
     pass
 
 
+class ReloadWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -5222,6 +5226,469 @@ def security_work(
                 egress_queues[name][queue_idx] += 1
 
 
+def reload_work(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, acl, qos,
+    security, events, limit
+):
+    """reload 的工作量预演：独立链路副本与空状态，无副作用。
+
+    B、L、P、M、R 为桥、链路、物理端口、聚合成员、当前 ACL 规则数，U 为
+    up 链路数；累计值初始 B+L+2U。各事件在按 t 老化 FDB 与解封前取
+    X=FDB 项数+封锁项数+速率与迁移队列时间戳总数，D=动态绑定数，
+    N=全部出口排队帧数，S=所指端口排队帧数（帧取入端口）：帧计
+    X+3P+M+R+D+S+1；链路先应用 up，改变以新 U 计 X+N+B+L+2U+2P+1，
+    幂等计 X+1；成员 down 计 X+S+1、up 计 X+1；服务计 X+S+1；重载令
+    A/T 为新 ACL 规则数/新静态绑定数，计 X+D+P+A+T+1，再采用新
+    age/ACL/security。再按既有队列、调度、清队与安全规则处理并更新
+    预演状态。累计等于上限合法，首次超过即抛 ReloadWorkLimit。
+    """
+    window = storm["window"]
+    limits = storm["limits"]
+    move_limit = storm["move_limit"]
+    hold = storm["hold"]
+    qos_map = qos["map"]
+    cap = qos["cap"]
+    sched_mode = qos["mode"]
+    weights = qos["weights"]
+    drop_mode = qos["drop"]
+    weight_total = sum(weights)
+    quotas = [-(-(cap * w) // weight_total) for w in weights]  # 上取整
+    sec_by_port = {entry["port"]: entry for entry in security}
+    static_owner = {}  # (vlan, mac) -> 所属物理口
+    for entry in security:
+        for item in entry["static"]:
+            static_owner[(item["vlan"], item["mac"])] = entry["port"]
+    sec_down = set()  # 被 shutdown 永久禁用的物理口
+    bound = {}  # (vlan, mac) -> 动态绑定的物理口
+    dynamic = {entry["port"]: set() for entry in security}  # 口 -> 动态绑定集
+    B = len(bridges)
+    L = len(links)
+    P = len(ports)
+    R = len(acl)
+    sim_links = [dict(link) for link in links]
+    by_id = {link["id"]: link for link in sim_links}
+    by_name = {port["name"]: port for port in ports}
+    lag_by_name = {lag["name"]: lag for lag in lags}
+    lag_of = {}  # 成员物理口 -> lag
+    member_up = {}  # 成员物理口 -> 动态可用（初始可用）
+    for lag in lags:
+        for member in lag["members"]:
+            lag_of[member] = lag
+            member_up[member] = True
+    M = len(member_up)
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in sim_links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [逻辑口（物理口名或 lag 名）, seen]
+    rate_queues = {}  # (入端口, vlan, 类别) -> 放行时刻 deque
+    move_queues = {}  # (vlan, src) -> 迁移时刻 deque
+    last_learn = {}  # (vlan, src) -> 最后学习逻辑口
+    blocked = {}  # (入端口, vlan) -> 封锁截止时刻
+    # 出口队列预演仅跟踪各端口 4 个优先级队列的长度
+    egress_queues = {port["name"]: [0, 0, 0, 0] for port in ports}
+    # 每物理出口持久 WRR 状态 (当前队, 剩余配额)；初始服务 3 队
+    wrr_state = {port["name"]: [3, weights[3]] for port in ports}
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, sim_links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and name not in sec_down
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        if name in sec_down:  # shutdown：永久按 down 口处理
+            return False, "down"
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def is_forwarding(name, t):
+        """LAG 成员还需动态 up 才算 forwarding。"""
+        phys_up, state = port_status(name, t)
+        if not phys_up or state != "forwarding":
+            return False
+        return name not in member_up or member_up[name]
+
+    def member_available(name, t, vlan):
+        """成员可用：动态 up、端口 up、STP forwarding 且允许该 VLAN。"""
+        port = by_name[name]
+        if not member_up[name] or not port["up"] or vlan not in port["allowed"]:
+            return False
+        return port_status(name, t) == (True, "forwarding")
+
+    def lag_candidates(lag, t, vlan):
+        """可用候选成员，按 members 顺序。"""
+        return [
+            member
+            for member in lag["members"]
+            if member_available(member, t, vlan)
+        ]
+
+    def lag_pick(lag, candidates, src, dst, vlan):
+        parts = []
+        for field in lag["hash"]:
+            if field == "src":
+                parts.append(src)
+            elif field == "dst":
+                parts.append(dst)
+            else:
+                parts.append(str(vlan))
+        digest = zlib.crc32("|".join(parts).encode("utf-8")) & 0xFFFFFFFF
+        return candidates[digest % len(candidates)]
+
+    def suppress(t, port_name, vlan, src, dst, state, learn_port):
+        """风暴控制：返回 True 表示本帧被抑制（不学习、不发送）。"""
+        if (port_name, vlan) in blocked:  # 封锁帧不检测
+            return True
+        if state not in ("learning", "forwarding"):
+            return False
+        is_group = int(dst[:2], 16) & 1
+        if dst == BROADCAST_MAC:
+            category = "broadcast"
+        elif is_group:
+            category = "multicast"
+        else:
+            category = None if fdb.get((vlan, dst)) else "unknown"
+        if category is not None:
+            queue = rate_queues.get((port_name, vlan, category))
+            if queue is None:
+                queue = deque(maxlen=limits[category])
+                rate_queues[(port_name, vlan, category)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
+                return True
+        prev = last_learn.get((vlan, src))
+        if prev is not None and prev != learn_port:  # 学习端口迁移
+            queue = move_queues.get((vlan, src))
+            if queue is None:
+                queue = deque(maxlen=move_limit)
+                move_queues[(vlan, src)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            queue.append(t)
+            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+                blocked[(port_name, vlan)] = t + hold
+                return True
+        if category is not None:  # 速率名额仅在帧实际放行时占用
+            rate_queues[(port_name, vlan, category)].append(t)
+        fdb[(vlan, src)] = [learn_port, t]
+        last_learn[(vlan, src)] = learn_port
+        return False
+
+    def acl_match(vlan, src, dst, ethertype, priority):
+        """按数组序首条命中；未命中视为 allow。"""
+        for rule in acl:
+            if (
+                (rule["src"] is None or rule["src"] == src)
+                and (rule["dst"] is None or rule["dst"] == dst)
+                and (rule["vlan"] is None or rule["vlan"] == vlan)
+                and (
+                    rule["ethertype"] is None
+                    or rule["ethertype"] == ethertype
+                )
+                and (
+                    rule["priority"] is None
+                    or rule["priority"] == priority
+                )
+            ):
+                return rule["action"], rule["to_vlan"]
+        return "allow", None
+
+    def admit(name, queue_idx):
+        """tail：总数达 cap 即拒；weighted：任一队列配额满即拒。"""
+        counts = egress_queues[name]
+        if drop_mode == "tail":
+            return sum(counts) < cap
+        return all(counts[q] < quotas[q] for q in range(4))
+
+    def security_check(port_name, vlan, src):
+        """端口安全：返回 True 表示违例（shutdown 另永久禁口并清队）。"""
+        entry = sec_by_port[port_name]
+        key = (vlan, src)
+        owner = static_owner.get(key)
+        if owner is not None:  # 静态源只准从所属口进入
+            if owner == port_name:
+                return False
+        else:
+            bound_port = bound.get(key)
+            if bound_port == port_name:  # 重复源不增数
+                return False
+            if bound_port is None and len(dynamic[port_name]) < entry["limit"]:
+                bound[key] = port_name  # 首次绑定入端口
+                dynamic[port_name].add(key)
+                return False
+            # 已绑定别口，或本口动态数达到 limit
+        if entry["action"] == "shutdown":
+            sec_down.add(port_name)  # 永久按 down 口禁用
+            for old in dynamic[port_name]:  # 清动态绑定
+                del bound[old]
+            dynamic[port_name].clear()
+            egress_queues[port_name] = [0, 0, 0, 0]  # 离开 forwarding：清队
+        return True
+
+    U = sum(1 for link in sim_links if link["up"])
+    work = B + L + 2 * U  # 初始收敛
+    if work > limit:
+        raise ReloadWorkLimit
+    converge(0)
+    for item in events:
+        t = item[1]
+        # 老化与解封前取 X、D（N、S 按需同点取）
+        X = (
+            len(fdb)
+            + len(blocked)
+            + sum(len(queue) for queue in rate_queues.values())
+            + sum(len(queue) for queue in move_queues.values())
+        )
+        D = len(bound)
+        kind = item[0]
+        if kind == "link":
+            up = item[3]
+            changed = by_id[item[2]]["up"] != up
+            if changed:  # 先应用 up，再以新 U 计
+                U += 1 if up else -1
+                N = sum(sum(counts) for counts in egress_queues.values())
+                work += X + N + (B + L + 2 * U) + 2 * P + 1
+            else:
+                work += X + 1
+        elif kind == "member":
+            if item[3]:
+                work += X + 1
+            else:
+                work += X + sum(egress_queues[item[2]]) + 1
+        elif kind == "service":
+            work += X + sum(egress_queues[item[2]]) + 1
+        elif kind == "reload":
+            # A/T 为新 ACL 规则数/新静态绑定数
+            work += (
+                X
+                + D
+                + P
+                + len(item[3])
+                + sum(len(entry["static"]) for entry in item[4])
+                + 1
+            )
+        else:  # 帧：S 取入端口排队帧数
+            work += X + 3 * P + M + R + D + sum(egress_queues[item[2]]) + 1
+        if work > limit:
+            raise ReloadWorkLimit
+        # 以下按既有规则处理并更新预演状态
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        for key in [k for k, until in blocked.items() if t >= until]:
+            del blocked[key]
+        if kind == "link":
+            if changed:  # 幂等链路事件不重算拓扑
+                old_forwarding = forwarding_ports(t)
+                by_id[item[2]]["up"] = item[3]
+                converge(t)
+                for name in old_forwarding - forwarding_ports(t):
+                    for key in [k for k, (p, _) in fdb.items() if p == name]:
+                        del fdb[key]
+                    egress_queues[name] = [0, 0, 0, 0]  # 离开 forwarding：清队
+            continue
+        if kind == "member":
+            member_up[item[2]] = item[3]  # 幂等无作用；可用性变化不清 FDB
+            if not item[3]:  # 成员下线即非 forwarding：清队
+                egress_queues[item[2]] = [0, 0, 0, 0]
+            continue
+        if kind == "service":
+            _, _, port_name, count = item
+            counts = egress_queues[port_name]
+            if not is_forwarding(port_name, t):  # 非 forwarding：清队不服务
+                egress_queues[port_name] = [0, 0, 0, 0]
+            elif sched_mode == "sp":
+                served = 0
+                while served < count:
+                    q = next((q for q in (3, 2, 1, 0) if counts[q]), None)
+                    if q is None:
+                        break
+                    counts[q] -= 1
+                    served += 1
+            else:  # wrr：持久状态 (q, rem)
+                served = 0
+                while served < count:
+                    q, rem = wrr_state[port_name]
+                    if not any(counts):  # 四队全空：停止且状态不变
+                        break
+                    while not counts[q]:  # 当前队空：推进并重置配额
+                        q = (q - 1) % 4
+                        rem = weights[q]
+                    counts[q] -= 1
+                    served += 1
+                    rem -= 1  # 每发一帧 rem 减 1
+                    if rem == 0 or not counts[q]:
+                        # rem 用尽或当前队变空：推进并重置配额；
+                        # count 用尽而 rem 未尽且队非空：状态保留续用
+                        q = (q - 1) % 4
+                        rem = weights[q]
+                    wrr_state[port_name] = [q, rem]
+            continue
+        if kind == "reload":
+            _, _, new_age, new_acl, new_security, _ = item
+            new_by_port = {entry["port"]: entry for entry in new_security}
+            new_static_owner = {}
+            for entry in new_security:
+                for static in entry["static"]:
+                    new_static_owner[(static["vlan"], static["mac"])] = (
+                        entry["port"]
+                    )
+            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static：整批无效
+            for name, macs in dynamic.items():
+                if len(macs) > new_by_port[name]["limit"]:
+                    raise InvalidInput("dynamic bindings exceed new limit")
+            for key in bound:
+                if key in new_static_owner:
+                    raise InvalidInput("dynamic binding in new static")
+            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
+            # 风暴记录全部保留，新规则自下一事件生效
+            age = new_age
+            acl = new_acl
+            R = len(new_acl)
+            sec_by_port = new_by_port
+            static_owner = new_static_owner
+            continue
+        _, _, port_name, src, dst, tag, ethertype, priority = item
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习
+            continue
+        # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
+        acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
+        if acl_action == "remark":
+            if to_vlan in by_name[port_name]["allowed"]:
+                vlan = to_vlan  # 新 VLAN 用于后续全部处理
+            else:  # remark 目标不在入端口 allowed：按 drop 处理
+                acl_action = "drop"
+        if acl_action == "drop":  # 不学习、不计风暴
+            continue
+        ingress_lag = lag_of.get(port_name)
+        if ingress_lag is not None:
+            usable = member_available(port_name, t, vlan)
+            state = "forwarding" if usable else None
+        else:
+            usable = True
+            _, state = port_status(port_name, t)
+        # 可学习帧在 FDB 前做端口安全检查；违例不学习、不计风暴
+        if (
+            usable
+            and state in ("learning", "forwarding")
+            and security_check(port_name, vlan, src)
+        ):
+            continue
+        egress = []
+        if usable:  # 不可用成员入帧丢弃且不学习
+            learn_port = ingress_lag["name"] if ingress_lag else port_name
+            suppressed = suppress(
+                t, port_name, vlan, src, dst, state, learn_port
+            )
+            if not suppressed and state == "forwarding":
+                is_group = int(dst[:2], 16) & 1
+                hit = None if is_group else fdb.get((vlan, dst))
+                if hit is not None and hit[0] != learn_port:
+                    target = hit[0]
+                    target_lag = lag_by_name.get(target)
+                    if target_lag is not None:
+                        candidates = lag_candidates(target_lag, t, vlan)
+                        if candidates:  # 无候选按无出口丢弃
+                            egress = [
+                                lag_pick(target_lag, candidates, src, dst, vlan)
+                            ]
+                    else:
+                        target_up, target_state = port_status(target, t)
+                        if (
+                            target_up
+                            and target_state == "forwarding"
+                            and vlan in by_name[target]["allowed"]
+                        ):
+                            egress = [target]
+                elif hit is None:
+                    selected = {}  # lag 名 -> 本帧选中的成员
+                    for lag in lags:
+                        if ingress_lag is not None and lag is ingress_lag:
+                            continue  # 禁止组内回送
+                        candidates = lag_candidates(lag, t, vlan)
+                        if candidates:
+                            selected[lag["name"]] = lag_pick(
+                                lag, candidates, src, dst, vlan
+                            )
+                    for port in ports:
+                        name = port["name"]
+                        lag = lag_of.get(name)
+                        if lag is not None:
+                            if selected.get(lag["name"]) == name:
+                                egress.append(name)
+                        elif (
+                            vlan in port["allowed"]
+                            and name != port_name
+                            and port_status(name, t) == (True, "forwarding")
+                        ):
+                            egress.append(name)
+        queue_idx = qos_map[priority]
+        for name in egress:  # 按 egress 序逐口入队；镜像不随之产生
+            if admit(name, queue_idx):
+                egress_queues[name][queue_idx] += 1
+
+
 def forward_security(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
     acl, qos, security, events, observer=None
@@ -5852,6 +6319,7 @@ DEFAULT_MAX_MIRROR_WORK = 10000000
 DEFAULT_MAX_ACL_WORK = 10000000
 DEFAULT_MAX_QOS_WORK = 10000000
 DEFAULT_MAX_SECURITY_WORK = 10000000
+DEFAULT_MAX_RELOAD_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -6268,10 +6736,10 @@ def main(argv):
             return 2
         return _cmd_replay(args[1], *limits)
     # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
-    # port-security 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK/
-    # MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/MAX_LAG_WORK/
-    # MAX_MIRROR_WORK/MAX_ACL_WORK/MAX_QOS_WORK/MAX_SECURITY_WORK）；
-    # 其余 MODE 仅 0、2、4 项
+    # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
+    # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/
+    # MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_ACL_WORK/MAX_QOS_WORK/
+    # MAX_SECURITY_WORK/MAX_RELOAD_WORK）；其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
@@ -6282,11 +6750,12 @@ def main(argv):
     is_acl = args[:1] == ["acl"]
     is_qos = args[:1] == ["qos"]
     is_security = args[:1] == ["port-security"]
+    is_reload = args[:1] == ["reload"]
     allowed_counts = (
         (3, 5, 7, 8)
         if is_stp or is_fdb or is_forward or is_forward_stp
         or is_forward_stp_storm or is_lag or is_mirror or is_acl or is_qos
-        or is_security
+        or is_security or is_reload
         else (3, 5, 7)
     )
     if len(args) not in allowed_counts or args[0] not in (
@@ -6304,7 +6773,7 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK|MAX_STORM_WORK|MAX_LAG_WORK|MAX_MIRROR_WORK|MAX_ACL_WORK|MAX_QOS_WORK|MAX_SECURITY_WORK]]]
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK|MAX_STORM_WORK|MAX_LAG_WORK|MAX_MIRROR_WORK|MAX_ACL_WORK|MAX_QOS_WORK|MAX_SECURITY_WORK|MAX_RELOAD_WORK]]]
     # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
@@ -6438,6 +6907,15 @@ def main(argv):
             max_output_bytes,
             max_security_work,
         ) = parsed + security_limits[len(parsed):]
+    elif is_reload:
+        reload_limits = limits + (DEFAULT_MAX_RELOAD_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_reload_work,
+        ) = parsed + reload_limits[len(parsed):]
     else:
         max_config_bytes, max_data_bytes, max_items, max_output_bytes = (
             parsed + limits[len(parsed):]
@@ -6768,9 +7246,11 @@ def main(argv):
             reload_events, final_config = validate_reload_events(
                 data, ports, link_ids, lags, config
             )
+            # 既有语义（含动态绑定与新 limit/static 冲突）全量校验后
+            # 无副作用预演；forward_security 就地改链路状态，预演用原值
             result = forward_security(
                 bridges,
-                links,
+                [dict(link) for link in links],
                 delay,
                 bridge,
                 ports,
@@ -6782,6 +7262,21 @@ def main(argv):
                 qos,
                 security,
                 reload_events,
+            )
+            reload_work(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                acl,
+                qos,
+                security,
+                reload_events,
+                max_reload_work,
             )
             result["config"] = _canonical(final_config)
         else:
@@ -6829,6 +7324,9 @@ def main(argv):
         return 5
     except SecurityWorkLimit:
         _fail("security_work_limit")
+        return 5
+    except ReloadWorkLimit:
+        _fail("reload_work_limit")
         return 5
     payload = (
         json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode(

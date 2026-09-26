@@ -85,7 +85,7 @@ def frame(t, port, src, dst="ff:ff:ff:ff:ff:ff"):
     }
 
 
-def run_cli(config, events, mode="reload"):
+def run_cli(config, events, mode="reload", extra=()):
     """返回 (returncode, stdout_bytes, stderr_bytes)。"""
     with tempfile.TemporaryDirectory() as tmp:
         cfg = os.path.join(tmp, "config.json")
@@ -95,7 +95,7 @@ def run_cli(config, events, mode="reload"):
         with open(evt, "wb") as handle:
             handle.write(json.dumps(events).encode("utf-8"))
         proc = subprocess.run(
-            [sys.executable, SWITCH, mode, cfg, evt],
+            [sys.executable, SWITCH, mode, cfg, evt] + list(extra),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -354,6 +354,95 @@ class ReloadUsageTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(proc.stdout, b"")
         self.assertEqual(proc.stderr, b'{"error":"file_not_found"}\n')
+
+
+class ReloadWorkLimitTest(unittest.TestCase):
+    """reload CONFIG EVENTS 后可带 0/2/4/5 项上限，末项 MAX_RELOAD_WORK。"""
+
+    LIMITS_OK = ["1048576", "16777216", "100000", "16777216"]
+
+    def events(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["age"] = 50
+        new["security"][0]["limit"] = 5
+        return config, [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": new},
+            frame(3, "p1", "00:00:00:00:00:03"),
+        ]
+
+    def test_explicit_limits_byte_identical(self):
+        config, events = self.events()
+        base = run_cli(config, events)
+        self.assertEqual(base[0], 0)
+        for extra in (
+            self.LIMITS_OK[:2],
+            self.LIMITS_OK,
+            self.LIMITS_OK + ["10000000"],
+            self.LIMITS_OK + ["9" * 40],  # 长度不限的数学整数
+        ):
+            with self.subTest(extra=extra):
+                code, out, err = run_cli(config, events, extra=extra)
+                self.assertEqual((code, out, err), (0, base[1], b""))
+
+    def test_usage_bad_count_or_token(self):
+        config, events = self.events()
+        for extra in (
+            ["1"],
+            ["1", "2", "3"],
+            ["1", "2", "3", "4", "5", "6"],
+            ["0", "1"],
+            ["1", "2", "3", "4", "0"],
+            ["1", "2", "3", "4", "10x"],
+        ):
+            with self.subTest(extra=extra):
+                code, out, err = run_cli(config, events, extra=extra)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, b"")
+                self.assertEqual(err, b'{"error":"usage"}\n')
+
+    def test_equal_legal_first_exceed_exit5(self):
+        # 工作量：初始 B+L+2U=1；帧 19/22；重载 X+D+P+A+T+1=4+2+5+1+0+1=13；
+        # 末帧 X+3P+M+R+D+S+1=4+15+2+1+2+0+1=25；累计 80
+        config, events = self.events()
+        code, out, err = run_cli(
+            config, events, extra=self.LIMITS_OK + ["80"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, b"")
+        code, out, err = run_cli(
+            config, events, extra=self.LIMITS_OK + ["79"]
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"reload_work_limit"}\n')
+
+    def test_semantic_error_precedes_work_limit(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["security"][0]["limit"] = 1  # 动态绑定 2 > 新 limit 1
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": new},
+        ]
+        code, out, err = run_cli(
+            config, events, extra=self.LIMITS_OK + ["1"]
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+    def test_work_limit_precedes_output_limit(self):
+        config, events = self.events()
+        code, out, err = run_cli(
+            config, events, extra=["1048576", "16777216", "100000", "1", "1"]
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"reload_work_limit"}\n')
 
 
 if __name__ == "__main__":
