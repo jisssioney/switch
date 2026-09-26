@@ -6309,6 +6309,106 @@ def forward_security(
     }
 
 
+FRAME_CHECK_CONFIG_KEYS = frozenset({"ports", "max_frame"})
+FRAME_CHECK_FRAME_KEYS = frozenset({"t", "port", "length", "fcs", "alignment"})
+FRAME_CHECK_MIN_MAX_FRAME = 1518
+FRAME_CHECK_MAX_MAX_FRAME = 9216
+FRAME_CHECK_RUNT_LENGTH = 64
+
+
+def validate_frame_check_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != FRAME_CHECK_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    ports = config["ports"]
+    max_frame = config["max_frame"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    if not all(isinstance(p, str) and p for p in ports):
+        raise InvalidInput("ports must be non-empty strings")
+    if len(set(ports)) != len(ports):
+        raise InvalidInput("ports must be distinct")
+    if (
+        not _is_int(max_frame)
+        or not FRAME_CHECK_MIN_MAX_FRAME
+        <= max_frame
+        <= FRAME_CHECK_MAX_MAX_FRAME
+    ):
+        raise InvalidInput("bad max_frame")
+    return ports, max_frame
+
+
+def validate_frame_check_frames(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    port_set = set(ports)
+    result = []
+    prev_t = None
+    for frame in frames:
+        if (
+            not isinstance(frame, dict)
+            or frozenset(frame) != FRAME_CHECK_FRAME_KEYS
+        ):
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        length = frame["length"]
+        fcs = frame["fcs"]
+        alignment = frame["alignment"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in port_set:
+            raise InvalidInput("unknown port")
+        if not _is_int(length) or length < 0:
+            raise InvalidInput("bad length")
+        if not isinstance(fcs, bool):
+            raise InvalidInput("bad fcs")
+        if not isinstance(alignment, bool):
+            raise InvalidInput("bad alignment")
+        result.append((t, port, length, fcs, alignment))
+    return result
+
+
+def frame_check(frames, ports, max_frame):
+    counts = {
+        name: {"good": 0, "runt": 0, "giant": 0, "alignment": 0, "bad_fcs": 0}
+        for name in ports
+    }
+    results = []
+    for t, port, length, fcs, alignment in frames:
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif not alignment:
+            cls = "alignment"
+        elif not fcs:
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        counts[port][cls] += 1
+        results.append({"t": t, "port": port, "class": cls})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": name,
+                "good": counts[name]["good"],
+                "runt": counts[name]["runt"],
+                "giant": counts[name]["giant"],
+                "alignment": counts[name]["alignment"],
+                "bad_fcs": counts[name]["bad_fcs"],
+            }
+            for name in ports
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -6904,6 +7004,52 @@ def _cmd_config_diff(
     return 0
 
 
+def _cmd_frame_check(
+    config_path,
+    frames_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、FRAMES 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            frames_path, "rb"
+        ) as frames_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            frames_raw = _read_limited(frames_handle, max_data_bytes)
+            if frames_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        frames_doc = parse_json(frames_raw)
+        # 帧数上界在解析后、语义校验前判定；FRAMES 非数组仍按非法输入处理
+        if isinstance(frames_doc, list) and len(frames_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        ports, max_frame = validate_frame_check_config(config)
+        frames = validate_frame_check_frames(frames_doc, ports)
+        result = frame_check(frames, ports, max_frame)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
@@ -6969,6 +7115,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_config_diff(args[1], args[2], *limits)
+    if args[:1] == ["frame-check"]:
+        # frame-check CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_frame_check(args[1], args[2], *limits)
     # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
     # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
     # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/
