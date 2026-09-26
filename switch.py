@@ -127,6 +127,10 @@ class DiffWorkLimit(Exception):
     pass
 
 
+class LinkWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -10984,6 +10988,58 @@ def link_state(events, ports, delay):
     return {"results": results}
 
 
+def link_state_work(events, ports, delay, limit):
+    """link-state 的工作量预演：独立 committed/pending 状态，无副作用。
+
+    W 初值 0；逐事件在完成截止 <= t 的协商前，令 Q 为 pending 数，累计
+    Q+1；再沿用 link_state 规则完成到期项、替换该口状态并计算
+    down/bad/up 目标，目标未变不重置，变为 up 则进入 wait。等于上限
+    合法，首次超过即抛 LinkWorkLimit，不访问后续事件。
+    """
+    caps = {name: (rates, modes) for name, rates, modes in ports}
+    committed = {name: ("down",) for name, _, _ in ports}
+    pending = {}  # name -> (rate, mode, deadline)
+    work = 0
+    for t, port, admin, peer, rates, modes in events:
+        work += len(pending) + 1
+        if work > limit:
+            raise LinkWorkLimit()
+        for name in [
+            name
+            for name, (_, _, deadline) in pending.items()
+            if deadline <= t
+        ]:
+            rate, mode, _ = pending.pop(name)
+            committed[name] = ("up", rate, mode)
+        if not admin or not peer:
+            target = ("down",)
+        else:
+            local_rates, local_modes = caps[port]
+            common_rates = [r for r in local_rates if r in rates]
+            common_modes = [m for m in local_modes if m in modes]
+            if not common_rates or not common_modes:
+                target = ("bad",)
+            else:
+                target = (
+                    "up",
+                    max(common_rates),
+                    "full" if "full" in common_modes else "half",
+                )
+        current = pending.get(port)
+        effective = (
+            ("up", current[0], current[1])
+            if current is not None
+            else committed[port]
+        )
+        if target == effective:
+            pass  # 未变不重置
+        elif target[0] == "up":
+            pending[port] = (target[1], target[2], t + delay)
+        else:
+            pending.pop(port, None)
+            committed[port] = target
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -11815,6 +11871,7 @@ DEFAULT_MAX_RELOAD_WORK = 10000000
 DEFAULT_MAX_RECORD_WORK = 10000000
 DEFAULT_MAX_REPLAY_WORK = 10000000
 DEFAULT_MAX_DIFF_WORK = 10000000
+DEFAULT_MAX_LINK_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -12556,6 +12613,7 @@ def _cmd_link_state(
     max_data_bytes,
     max_items,
     max_output_bytes,
+    max_link_work,
 ):
     try:
         # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
@@ -12582,10 +12640,15 @@ def _cmd_link_state(
             return 5
         ports, delay = validate_link_state_config(config)
         events = validate_link_state_events(events_doc, ports)
+        # 全量语义校验后先以独立状态无副作用预演；超限不正式协商
+        link_state_work(events, ports, delay, max_link_work)
         result = link_state(events, ports, delay)
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except LinkWorkLimit:
+        _fail("link_work_limit")
+        return 5
     payload = _result_bytes(result)
     # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
     if len(payload) > max_output_bytes:
@@ -12768,18 +12831,20 @@ def main(argv):
         return _cmd_frame_check(args[1], args[2], *limits)
     if args[:1] == ["link-state"]:
         # link-state CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
-        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
-        if len(args) not in (3, 5, 7):
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_WORK]]]：可选上限仅
+        #   0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
             _fail("usage")
             return 2
         limits = _parse_limits(
             args[3:],
-            (0, 2, 4),
+            (0, 2, 4, 5),
             (
                 DEFAULT_MAX_CONFIG_BYTES,
                 DEFAULT_MAX_DATA_BYTES,
                 DEFAULT_MAX_ITEMS,
                 DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_LINK_WORK,
             ),
         )
         if limits is None:
