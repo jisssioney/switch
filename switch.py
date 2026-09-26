@@ -132,6 +132,10 @@ class LinkWorkLimit(Exception):
     pass
 
 
+class LinkForwardWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -11513,6 +11517,26 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
     }
 
 
+def link_forward_work(fwd_ports, events, limit):
+    """link-forward 的工作量预演：只计端口数与此前帧数，无副作用。
+
+    P 为端口数、F 为此前帧数，W 初值 P；每事件处理前加 F+2P+1（协商项与
+    帧项均计费），帧事件随后令 F 加 1。累计等于上限合法，首次超过即抛
+    LinkForwardWorkLimit，不访问后续事件。
+    """
+    frames_seen = 0
+    width = 2 * len(fwd_ports) + 1
+    work = len(fwd_ports)  # W 初值 P
+    if work > limit:
+        raise LinkForwardWorkLimit()
+    for item in events:
+        work += frames_seen + width
+        if work > limit:
+            raise LinkForwardWorkLimit()
+        if item[0] == "frame":
+            frames_seen += 1
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -12345,6 +12369,7 @@ DEFAULT_MAX_RECORD_WORK = 10000000
 DEFAULT_MAX_REPLAY_WORK = 10000000
 DEFAULT_MAX_DIFF_WORK = 10000000
 DEFAULT_MAX_LINK_WORK = 10000000
+DEFAULT_MAX_LINK_FORWARD_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -13186,6 +13211,7 @@ def _cmd_link_forward(
     max_data_bytes,
     max_items,
     max_output_bytes,
+    max_link_forward_work,
 ):
     try:
         # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
@@ -13210,17 +13236,21 @@ def _cmd_link_forward(
         if isinstance(events_doc, list) and len(events_doc) > max_items:
             _fail("item_limit")
             return 5
-        # 两文件先全量校验，再正式仿真（状态独立、无部分输出）
+        # 两文件先全量校验，再做工作量预演，最后正式仿真（状态独立、无部分输出）
         fwd_ports, caps, age, max_frame, delay = validate_link_forward_config(
             config
         )
         events = validate_link_forward_events(events_doc, fwd_ports)
+        link_forward_work(fwd_ports, events, max_link_forward_work)
         result = link_forward(
             fwd_ports, caps, age, max_frame, delay, events
         )
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except LinkForwardWorkLimit:
+        _fail("link_forward_work_limit")
+        return 5
     payload = _result_bytes(result)
     # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
     if len(payload) > max_output_bytes:
@@ -13435,19 +13465,20 @@ def main(argv):
         return _cmd_forward_check(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
-        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项，
-        #   资源与错误契约同 forward-check
-        if len(args) not in (3, 5, 7):
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
+        #   可选上限仅 0、2、4、5 项，资源与错误契约同 link-state
+        if len(args) not in (3, 5, 7, 8):
             _fail("usage")
             return 2
         limits = _parse_limits(
             args[3:],
-            (0, 2, 4),
+            (0, 2, 4, 5),
             (
                 DEFAULT_MAX_CONFIG_BYTES,
                 DEFAULT_MAX_DATA_BYTES,
                 DEFAULT_MAX_ITEMS,
                 DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_LINK_FORWARD_WORK,
             ),
         )
         if limits is None:

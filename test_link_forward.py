@@ -601,5 +601,159 @@ class ResourceAndErrorTests(unittest.TestCase):
         self.assertEqual(proc.stdout, b"")
 
 
+class ModeValidationTests(unittest.TestCase):
+    def test_hybrid_accepted_mixed_egress(self):
+        # p1 trunk 只准入带标签帧；p2 hybrid：vlan1 去标签、vlan2 留标签
+        cfg = config([
+            port("p1", mode="trunk", pvid=1, allowed=[1, 2], untagged=[]),
+            port("p2", mode="hybrid", pvid=1, allowed=[1, 2], untagged=[1]),
+        ])
+        events = [
+            link(0, "p1"),
+            link(0, "p2"),
+            frame(10, "p1", "00:00:00:00:00:01", vlan=1),
+            frame(11, "p1", "00:00:00:00:00:01", vlan=2),
+        ]
+        out = run(cfg, events)
+        self.assertEqual(
+            out["results"][2]["ports"], [{"name": "p2", "vlan": None}]
+        )
+        self.assertEqual(
+            out["results"][3]["ports"], [{"name": "p2", "vlan": 2}]
+        )
+
+    def test_unknown_mode_invalid(self):
+        proc, _ = run_cli(config([dict(port("p1"), mode="nope")]), [])
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn(b"invalid_input", proc.stderr)
+
+    def test_hybrid_constraints_same_as_new_forward(self):
+        def assert4(doc):
+            proc, _ = run_cli(doc, [])
+            self.assertEqual(proc.returncode, 4, proc.stderr)
+            self.assertIn(b"invalid_input", proc.stderr)
+
+        # pvid 必须在 allowed 中
+        assert4(config([port("p1", mode="hybrid", pvid=3,
+                             allowed=[1, 2], untagged=[1])]))
+        # untagged 必须是 allowed 子集
+        assert4(config([port("p1", mode="hybrid", pvid=1,
+                             allowed=[1, 2], untagged=[3])]))
+        # allowed 必须严格递增
+        assert4(config([port("p1", mode="hybrid", pvid=1,
+                             allowed=[2, 1], untagged=[1])]))
+
+
+class WorkLimitTests(unittest.TestCase):
+    def _exact_bytes(self, proc):
+        self.assertEqual(proc.returncode, 5, proc.stderr)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(
+            proc.stderr, b'{"error":"link_forward_work_limit"}\n'
+        )
+
+    def test_initial_work_is_port_count(self):
+        # P=3、零事件：W 初值 3，等于上限合法，差 1 即超限
+        cfg = config([port("p1"), port("p2"), port("p3")])
+        proc, _ = run_cli(cfg, [], 1000000, 1000000, 1000000, 1000000, 3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc, _ = run_cli(cfg, [], 1000000, 1000000, 1000000, 1000000, 2)
+        self._exact_bytes(proc)
+
+    def test_all_events_billed_links_only(self):
+        # P=2：W 初值 2；3 个协商项各加 2P+1=5 -> 17
+        cfg = config([port("p1"), port("p2")])
+        events = [link(0, "p1"), link(1, "p1"), link(2, "p2")]
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 17)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 16)
+        self._exact_bytes(proc)
+
+    def test_frame_count_enters_after_frame_events(self):
+        # P=2：协商项恒加 5；帧 i 处理前加 F+5（F 为此前帧数）
+        cfg = config([port("p1"), port("p2")])
+        # [link, frame, frame]：2 + 5 + 5 + 6 = 18
+        events = [
+            link(0, "p1"),
+            frame(10, "p1", "00:00:00:00:00:01"),
+            frame(11, "p1", "00:00:00:00:00:01"),
+        ]
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 18)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 17)
+        self._exact_bytes(proc)
+        # 同为三事件，顺序 [frame, frame, link]：2 + 5 + 6 + 7 = 20
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:01"),
+            link(2, "p1"),
+        ]
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 20)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 19)
+        self._exact_bytes(proc)
+
+    def test_first_exceed_stops_without_output(self):
+        # 第二个事件即超上限：无正式仿真、stdout 全空
+        cfg = config([port("p1"), port("p2")])
+        events = [link(0, "p1"), link(1, "p1"),
+                  frame(2, "p1", "00:00:00:00:00:01")]
+        # 2 + 5 = 7 合法，第 2 项再加 5 -> 12 超限
+        proc, _ = run_cli(cfg, events, 1000000, 1000000, 1000000, 1000000, 11)
+        self._exact_bytes(proc)
+
+    def test_semantic_failure_precedes_work_limit(self):
+        # 语义非法（未知 mode）即使工作量上限极小，仍报 invalid_input/4
+        cfg = config([dict(port("p1"), mode="nope"), port("p2")])
+        proc, _ = run_cli(cfg, [link(0, "p1")], 1000000, 1000000,
+                          1000000, 1000000, 1)
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn(b"invalid_input", proc.stderr)
+
+    def test_work_limit_precedes_output_limit(self):
+        # 工作量与输出字节同时超限：先报工作量
+        events = [link(0, "p1"), link(1, "p2")]
+        proc, _ = run_cli(config(), events, 1000000, 1000000, 1000000, 1, 1)
+        self._exact_bytes(proc)
+
+    def test_fifth_limit_usage_and_long_decimal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "c.json")
+            evt = os.path.join(tmp, "e.json")
+            with open(cfg, "wb") as handle:
+                handle.write(json.dumps(config()).encode("utf-8"))
+            with open(evt, "wb") as handle:
+                handle.write(json.dumps([link(0, "p1")]).encode("utf-8"))
+            for bad in ("0", "01", "-1", "1.0", "x"):
+                proc = subprocess.run(
+                    [sys.executable, SWITCH, "link-forward", cfg, evt,
+                     "1000000", "1000000", "1000000", "1000000", bad],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(proc.returncode, 2, bad)
+                self.assertIn(b"usage", proc.stderr)
+            # 任意长十进制（100 位 9）按数学整数接受
+            proc = subprocess.run(
+                [sys.executable, SWITCH, "link-forward", cfg, evt,
+                 "1000000", "1000000", "1000000", "1000000", "9" * 100],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_default_fifth_limit_runs_unchanged(self):
+        # 省略第五项时契约不变：正常事件序列成功
+        events = [
+            link(0, "p1"),
+            link(0, "p2"),
+            frame(10, "p1", "00:00:00:00:00:01"),
+        ]
+        proc, _ = run_cli(config(), events)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
