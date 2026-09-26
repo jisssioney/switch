@@ -515,6 +515,40 @@ class RecordFailureTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertNotIn(log_name, logs)
 
+    def test_illegal_reload_precedes_work_limit_and_skips_log(self):
+        # 非法重载点的累计工作量恰为 29（初始 1 + 帧 19 + 重载 9）：
+        # 上限 28 时，invalid_input(4) 仍先于 record_work_limit(5)，且不写 LOG
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["security"][0]["limit"] = 0
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            {"t": 1, "config": new},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.json")
+            evt = os.path.join(tmp, "events.json")
+            log = os.path.join(tmp, "out.log")
+            with open(cfg, "wb") as handle:
+                handle.write(json.dumps(config).encode())
+            with open(evt, "wb") as handle:
+                handle.write(json.dumps(events).encode())
+            head = ("100000", "16777216", "1048576", "16777216",
+                    "16777216")
+            for work in ("28", "10000000"):
+                with self.subTest(work=work):
+                    proc = subprocess.run(
+                        [sys.executable, SWITCH, "record", cfg, evt, log,
+                         *head, work],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    self.assertEqual(proc.returncode, 4)
+                    self.assertEqual(proc.stdout, b"")
+                    self.assertEqual(
+                        proc.stderr, b'{"error":"invalid_input"}\n'
+                    )
+                    self.assertFalse(os.path.exists(log))
+
     def test_bad_event_is_invalid(self):
         config = base_config()
         files, log_name = write_inputs(config, [{"t": 0}])
@@ -1070,6 +1104,83 @@ class ReplayWorkLimitTest(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertEqual(out, b"")
                 self.assertEqual(err, b'{"error":"usage"}\n')
+
+
+class ReplayIllegalReloadPrecedenceTest(unittest.TestCase):
+    """replay：非法 reload（动态绑定超新 limit/入新 static）先于工作量判断。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.cfg = os.path.join(d, "config.json")
+        self.evt = os.path.join(d, "events.json")
+        self.log = os.path.join(d, "out.log")
+        # 合法日志：一帧后一次无变化 reload；该重载点累计工作量
+        # 1(初始) + 19(帧) + 9(重载 X1,D1,P5,A1,T0,+1) = 29
+        config = base_config()
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            {"t": 1, "config": copy.deepcopy(config)},
+        ]
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(events).encode())
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        with open(self.log, "rb") as handle:
+            self.log_bytes = handle.read()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rewrite(self, mutate):
+        doc = json.loads(self.log_bytes.decode())
+        mutate(doc)
+        doc["sha256"] = prefix_digest(doc)[0]
+        with open(self.log, "wb") as handle:
+            handle.write(
+                (json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                 + "\n").encode("utf-8")
+            )
+
+    def _replay(self, work):
+        proc = subprocess.run(
+            [sys.executable, SWITCH, "replay", self.log,
+             "100000", "16777216", "16777216", str(work)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def test_exceed_limit_precedes_work_limit(self):
+        self._rewrite(lambda doc: doc["records"][1]["event"]["config"][
+            "security"
+        ][0].__setitem__("limit", 0))
+        with open(self.log, "rb") as handle:
+            tampered = handle.read()  # 失败后磁盘上的 LOG 须保持此内容
+        for work in (28, 10000000):  # 28 使该重载点工作量 29 首次超限
+            with self.subTest(work=work):
+                code, out, err = self._replay(work)
+                self.assertEqual(code, 4)
+                self.assertEqual(out, b"")
+                self.assertEqual(err, b'{"error":"invalid_input"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), tampered)
+
+    def test_new_static_precedes_work_limit(self):
+        def mutate(doc):
+            doc["records"][1]["event"]["config"]["security"][1]["static"] = [
+                {"mac": "00:00:00:00:00:01", "vlan": 1}
+            ]
+
+        self._rewrite(mutate)
+        code, out, err = self._replay(28)
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
 
 
 class CliErrorTest(unittest.TestCase):

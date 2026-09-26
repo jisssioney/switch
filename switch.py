@@ -5511,13 +5511,31 @@ def reload_work(
         elif kind == "service":
             work += X + sum(egress_queues[item[2]]) + 1
         elif kind == "reload":
+            new_security = item[4]
+            new_by_port = {
+                entry["port"]: entry for entry in new_security
+            }
+            # 非法重载（动态绑定超新 limit 或动态 (vlan, mac) 进入新 static）
+            # 先于工作量判断检测，按 invalid_input 退出；与 forward_security
+            # 同一判定，此时预演状态未老化、未采用任何新规则
+            for name, macs in dynamic.items():
+                if len(macs) > new_by_port[name]["limit"]:
+                    raise InvalidInput("dynamic bindings exceed new limit")
+            new_static_keys = {
+                (static["vlan"], static["mac"])
+                for entry in new_security
+                for static in entry["static"]
+            }
+            for key in bound:
+                if key in new_static_keys:
+                    raise InvalidInput("dynamic binding in new static")
             # A/T 为新 ACL 规则数/新静态绑定数
             work += (
                 X
                 + D
                 + P
                 + len(item[3])
-                + sum(len(entry["static"]) for entry in item[4])
+                + sum(len(entry["static"]) for entry in new_security)
                 + 1
             )
         else:  # 帧：S 取入端口排队帧数
@@ -5585,15 +5603,9 @@ def reload_work(
                     new_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
-            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static：整批无效
-            for name, macs in dynamic.items():
-                if len(macs) > new_by_port[name]["limit"]:
-                    raise InvalidInput("dynamic bindings exceed new limit")
-            for key in bound:
-                if key in new_static_owner:
-                    raise InvalidInput("dynamic binding in new static")
-            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
-            # 风暴记录全部保留，新规则自下一事件生效
+            # 非法重载已在工作量判断之前检测；此处仅原子替换 age/acl/
+            # security，FDB、绑定、安全状态、队列、调度、风暴记录全部保留，
+            # 新规则自下一事件生效
             age = new_age
             acl = new_acl
             R = len(new_acl)
@@ -6533,6 +6545,51 @@ def _json_equal(a, b):
     return type(a) is type(b) and a == b
 
 
+def _json_pointer_token(token):
+    """RFC6901 引用令牌转义：先 '~' -> '~0'，再 '/' -> '~1'。"""
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _json_diff(before, after):
+    """键序无关的 JSON 深比较，仅为不同的数组或标量生成差异项。
+
+    对象递归（键序无关），键按 Unicode 码点升序深度优先遍历；数组整体、
+    顺序敏感比较；标量按 JSON 类型与值比较（bool 不与 int 混同）。
+    差异项键序为 path,before,after；path 为 RFC6901 JSON Pointer，
+    前后值递归规范化（对象键按码点升序、数组保序）。
+    """
+    changes = []
+
+    def emit(a, b, path):
+        changes.append(
+            {
+                "path": path,
+                "before": _canonical(a),
+                "after": _canonical(b),
+            }
+        )
+
+    def walk(a, b, path):
+        if isinstance(a, dict) and isinstance(b, dict):
+            if a.keys() != b.keys():  # 键集合不同：本子树整体一项
+                emit(a, b, path)
+                return
+            for key in sorted(a):  # Unicode 码点升序，深度优先
+                walk(
+                    a[key],
+                    b[key],
+                    path + "/" + _json_pointer_token(key),
+                )
+        elif isinstance(a, list) and isinstance(b, list):
+            if not _json_equal(a, b):  # 数组整体比较，顺序敏感
+                emit(a, b, path)
+        elif not _json_equal(a, b):  # 类型不同或标量值不同
+            emit(a, b, path)
+
+    walk(before, after, "")
+    return changes
+
+
 def _validate_log_shape(log):
     """严格校验 LOG 字段、类型、键序；不含语义重放。"""
     if not isinstance(log, dict) or list(log) != list(LOG_KEYS):
@@ -6731,8 +6788,61 @@ def _cmd_replay(
     return 0
 
 
+CONFIG_DIFF_MAX_BYTES = 1024 * 1024
+CONFIG_DIFF_MAX_OUTPUT = 16 * 1024 * 1024
+
+
+def _cmd_config_diff(old_path, new_path):
+    """config-diff OLD NEW：比较两份 port-security 配置。
+
+    先打开两文件，任一失败即停；均可读后按 OLD、NEW 顺序分块读取，
+    各限 1048576 字节（等于上限合法）。两份均按既有 port-security 契约
+    全量解析校验后，做键序无关的规范化深比较。
+    """
+    try:
+        with open(old_path, "rb") as old_handle, open(
+            new_path, "rb"
+        ) as new_handle:
+            old_raw = _read_limited(old_handle, CONFIG_DIFF_MAX_BYTES)
+            if old_raw is None:
+                _fail("input_limit")
+                return 5
+            new_raw = _read_limited(new_handle, CONFIG_DIFF_MAX_BYTES)
+            if new_raw is None:
+                _fail("input_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        old_config = parse_json(old_raw)
+        new_config = parse_json(new_raw)
+        # 两份配置均按 port-security 契约全量语义校验
+        validate_security_config(old_config)
+        validate_security_config(new_config)
+        changes = _json_diff(old_config, new_config)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    # 顶层键序 equal,changes；equal 当且仅当 changes 为空
+    result = {"equal": not changes, "changes": changes}
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）在写出前判定；等于上限合法，超限 stdout 为空
+    if len(payload) > CONFIG_DIFF_MAX_OUTPUT:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def main(argv):
     args = argv[1:]
+    if args[:1] == ["config-diff"]:
+        # config-diff OLD NEW（不接受额外上限参数）
+        if len(args) != 3:
+            _fail("usage")
+            return 2
+        return _cmd_config_diff(args[1], args[2])
     if args[:1] == ["record"]:
         # record CONFIG EVENTS LOG [MAX_EVENTS MAX_LOG_BYTES
         #   [MAX_CONFIG_BYTES MAX_EVENTS_BYTES [MAX_OUTPUT_BYTES
