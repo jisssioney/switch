@@ -11170,6 +11170,332 @@ def link_state_work(events, ports, delay, limit):
             committed[port] = target
 
 
+LINK_FORWARD_CONFIG_KEYS = frozenset({"ports", "age", "max_frame", "delay"})
+# 新式 forward 端口删 up、增 rates/modes
+LINK_FORWARD_PORT_KEYS = frozenset(
+    ("name", "mode", "pvid", "allowed", "untagged", "rates", "modes")
+)
+
+
+def validate_link_forward_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != LINK_FORWARD_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    max_frame = config["max_frame"]
+    if (
+        not _is_int(max_frame)
+        or not FRAME_CHECK_MIN_MAX_FRAME
+        <= max_frame
+        <= FRAME_CHECK_MAX_MAX_FRAME
+    ):
+        raise InvalidInput("bad max_frame")
+    delay = config["delay"]
+    if not _is_int(delay) or delay <= 0:
+        raise InvalidInput("bad delay")
+    ports = config["ports"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    caps = []
+    forward_ports = []
+    for port in ports:
+        if (
+            not isinstance(port, dict)
+            or frozenset(port) != LINK_FORWARD_PORT_KEYS
+        ):
+            raise InvalidInput("bad port")
+        # rates/modes 约束同 link-state；其余键约束同新式 forward 端口
+        caps.append(
+            (
+                _validate_link_state_rates(port["rates"]),
+                _validate_link_state_modes(port["modes"]),
+            )
+        )
+        forward_ports.append(
+            {
+                "name": port["name"],
+                "mode": port["mode"],
+                "pvid": port["pvid"],
+                "allowed": port["allowed"],
+                "untagged": port["untagged"],
+                "up": True,
+            }
+        )
+    checked_ports, age = validate_forward_config_v2(
+        {"ports": forward_ports, "age": config["age"]}
+    )
+    result = []
+    for checked, (rates, modes) in zip(checked_ports, caps):
+        result.append(
+            {
+                "name": checked["name"],
+                "mode": checked["mode"],
+                "pvid": checked["pvid"],
+                "allowed": checked["allowed"],
+                "untagged": checked["untagged"],
+                "rates": rates,
+                "modes": modes,
+            }
+        )
+    return result, age, max_frame, delay
+
+
+def validate_link_forward_events(events, ports):
+    # 项仅为 link-state 协商项或 forward-check 帧项；t 全体非降
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == LINK_STATE_EVENT_KEYS:
+            t = event["t"]
+            port = event["port"]
+            admin = event["admin"]
+            peer = event["peer"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not isinstance(admin, bool) or not isinstance(peer, bool):
+                raise InvalidInput("bad admin/peer")
+            rates = _validate_link_state_rates(event["rates"])
+            modes = _validate_link_state_modes(event["modes"])
+            result.append(("link", t, port, admin, peer, rates, modes))
+        elif keys == FORWARD_CHECK_FRAME_KEYS:
+            t = event["t"]
+            port = event["port"]
+            src = event["src"]
+            dst = event["dst"]
+            vlan = event["vlan"]
+            length = event["length"]
+            fcs = event["fcs"]
+            alignment = event["alignment"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not valid_mac(src):
+                raise InvalidInput("bad src")
+            if dst != BROADCAST_MAC and not valid_mac(dst):
+                raise InvalidInput("bad dst")
+            if vlan is not None and not _valid_vlan_id(vlan):
+                raise InvalidInput("bad vlan")
+            if not _is_int(length) or length < 0:
+                raise InvalidInput("bad length")
+            if not isinstance(fcs, bool):
+                raise InvalidInput("bad fcs")
+            if not isinstance(alignment, bool):
+                raise InvalidInput("bad alignment")
+            result.append(
+                ("frame", t, port, src, dst, vlan, length, fcs, alignment)
+            )
+        else:
+            raise InvalidInput("bad event")
+        prev_t = t
+    return result
+
+
+def link_forward(events, ports, age, max_frame, delay):
+    by_name = {port["name"]: port for port in ports}
+    caps = {port["name"]: (port["rates"], port["modes"]) for port in ports}
+    # 生效状态：("down",)/("bad",)/("up", rate, mode)；全部初始 down
+    committed = {port["name"]: ("down",) for port in ports}
+    pending = {}  # name -> (rate, mode, deadline)；仅 up 目标需协商
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+
+    def is_up(name):
+        # wait（协商中）与 down/bad 一样不学习、不作出口
+        return name not in pending and committed[name][0] == "up"
+
+    for item in events:
+        t = item[1]
+        # 逐项先完成截止 <= t 的协商
+        for name in [
+            name
+            for name, (_, _, deadline) in pending.items()
+            if deadline <= t
+        ]:
+            rate, mode, _ = pending.pop(name)
+            committed[name] = ("up", rate, mode)
+        if item[0] == "link":
+            _, t, port, admin, peer, rates, modes = item
+            was_up = is_up(port)
+            if not admin or not peer:
+                target = ("down",)
+            else:
+                local_rates, local_modes = caps[port]
+                common_rates = [r for r in local_rates if r in rates]
+                common_modes = [m for m in local_modes if m in modes]
+                if not common_rates or not common_modes:
+                    target = ("bad",)
+                else:
+                    target = (
+                        "up",
+                        max(common_rates),
+                        "full" if "full" in common_modes else "half",
+                    )
+            current = pending.get(port)
+            effective = (
+                ("up", current[0], current[1])
+                if current is not None
+                else committed[port]
+            )
+            if target == effective:
+                pass  # 未变不重置
+            elif target[0] == "up":
+                # 目标变化即进入 wait 并于 t+delay 完成
+                pending[port] = (target[1], target[2], t + delay)
+            else:
+                # down/bad 立即生效
+                pending.pop(port, None)
+                committed[port] = target
+            if was_up and not is_up(port):
+                # 离开 up 即清该口 FDB；恢复 up 不恢复表项
+                for key in [
+                    key for key, (name, _) in fdb.items() if name == port
+                ]:
+                    del fdb[key]
+            current = pending.get(port)
+            if current is not None:
+                state, rate, mode = "wait", None, None
+            else:
+                now = committed[port]
+                if now[0] == "up":
+                    state, rate, mode = "up", now[1], now[2]
+                else:
+                    state, rate, mode = now[0], None, None
+            results.append(
+                {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
+            )
+            continue
+        _, t, port_name, src, dst, tag, length, fcs, alignment = item
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif not alignment:
+            cls = "alignment"
+        elif not fcs:
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        port_stats[port_name][cls] += 1
+        if cls != "good":  # 非 good 丢弃且不学习、不转发、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if is_up(port_name):
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target_port = by_name[hit[0]]
+                if is_up(hit[0]) and vlan in target_port["allowed"]:
+                    egress = [hit[0]]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and is_up(port["name"])
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {"t": t, "class": cls, "action": action, "ports": out_ports}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -12836,6 +13162,53 @@ def _cmd_forward_check(
     return 0
 
 
+def _cmd_link_forward(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        ports, age, max_frame, delay = validate_link_forward_config(config)
+        events = validate_link_forward_events(events_doc, ports)
+        # 两文件全量校验通过后方才仿真；失败时 stdout 为空且无部分状态
+        result = link_forward(events, ports, age, max_frame, delay)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
@@ -12845,6 +13218,7 @@ SUBCOMMANDS = frozenset((
     "frame-check",
     "link-state",
     "forward-check",
+    "link-forward",
     "fdb",
     "forward",
     "stp",
@@ -13038,6 +13412,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_forward_check(args[1], args[2], *limits)
+    if args[:1] == ["link-forward"]:
+        # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_link_forward(args[1], args[2], *limits)
     # stp/fdb/forward/forward-stp/stp-check/forward-stp-storm/storm-check/lag/
     # lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/port-security/
     # security-check/reload/reload-rollback 额外允许 5 项
