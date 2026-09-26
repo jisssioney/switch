@@ -751,8 +751,8 @@ class LogLimitTest(unittest.TestCase):
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
 
     def test_limit_arity_per_subcommand(self):
-        # record 可选上限仅 0、2、4、5 个；replay 仅 0、2、3 个
-        for extra in [("1", "2", "3"), ("1", "2", "3", "4", "5", "6")]:
+        # record 可选上限仅 0、2、4、5、6 个；replay 仅 0、2、3 个
+        for extra in [("1", "2", "3"), ("1", "2", "3", "4", "5", "6", "7")]:
             code, _, err = self._run(
                 "record", self.cfg, self.evt, self.log, *extra
             )
@@ -760,10 +760,16 @@ class LogLimitTest(unittest.TestCase):
         for extra in [("1", "2", "3", "4"), ("1", "2", "3", "4", "5")]:
             code, _, err = self._run("replay", self.log, *extra)
             self.assertEqual((code, err), (2, b'{"error":"usage"}\n'), extra)
-        # 合法个数：record 5 个、replay 3 个
+        # 合法个数：record 5、6 个、replay 3 个
         code, out, err = self._run(
             "record", self.cfg, self.evt, self.log,
             "100000", "16777216", "1048576", "16777216", "16777216",
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log,
+            "100000", "16777216", "1048576", "16777216", "16777216",
+            "10000000",
         )
         self.assertEqual((code, out, err), (0, self.record_out, b""))
         code, out, err = self._run(
@@ -851,6 +857,129 @@ class LogLimitTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertEqual(out, b"")
         self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+
+class RecordWorkLimitTest(unittest.TestCase):
+    """record 第 6 项可选上限 MAX_RECORD_WORK：公式同 reload 的 MAX_RELOAD_WORK。"""
+
+    LIMITS_OK = ["100000", "16777216", "1048576", "16777216", "16777216"]
+
+    def events(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["age"] = 50
+        new["security"][0]["limit"] = 5
+        return config, [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": new},
+            frame(3, "p1", "00:00:00:00:00:03"),
+        ]
+
+    def run_record(self, config, events, extra=(), existing_log=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.json")
+            evt = os.path.join(tmp, "events.json")
+            log_path = os.path.join(tmp, "out.log")
+            with open(cfg, "wb") as handle:
+                handle.write(json.dumps(config).encode("utf-8"))
+            with open(evt, "wb") as handle:
+                handle.write(json.dumps(events).encode("utf-8"))
+            if existing_log is not None:
+                with open(log_path, "wb") as handle:
+                    handle.write(existing_log)
+            proc = subprocess.run(
+                [sys.executable, SWITCH, "record", cfg, evt, log_path]
+                + list(extra),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            log = None
+            if os.path.exists(log_path):
+                with open(log_path, "rb") as handle:
+                    log = handle.read()
+        return proc.returncode, proc.stdout, proc.stderr, log
+
+    def test_equal_legal_first_exceed_exit5(self):
+        # 工作量公式同 reload：本场景累计 80（见 test_reload.ReloadWorkLimitTest）
+        config, events = self.events()
+        code, _, err, log = self.run_record(
+            config, events, self.LIMITS_OK + ["80"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, b"")
+        self.assertIsNotNone(log)
+        code, out, err, log = self.run_record(
+            config, events, self.LIMITS_OK + ["79"]
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"record_work_limit"}\n')
+        self.assertIsNone(log)
+
+    def test_unlimited_and_explicit_limit_byte_identical(self):
+        config, events = self.events()
+        code, out, err, log = self.run_record(config, events)
+        self.assertEqual(code, 0)
+        for extra in (
+            self.LIMITS_OK,
+            self.LIMITS_OK + ["10000000"],
+            self.LIMITS_OK + ["9" * 40],  # 长度不限的数学整数
+        ):
+            with self.subTest(extra=extra):
+                code2, out2, err2, log2 = self.run_record(
+                    config, events, extra
+                )
+                self.assertEqual((code2, out2, err2, log2), (0, out, b"", log))
+
+    def test_semantic_error_precedes_work_limit(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["security"][0]["limit"] = 1  # 动态绑定 2 > 新 limit 1
+        events = [
+            frame(0, "p1", "00:00:00:00:00:01"),
+            frame(1, "p1", "00:00:00:00:00:02"),
+            {"t": 2, "config": new},
+        ]
+        code, out, err, log = self.run_record(
+            config, events, self.LIMITS_OK + ["1"]
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+        self.assertIsNone(log)
+
+    def test_work_limit_precedes_log_and_output_limit(self):
+        config, events = self.events()
+        code, out, err, log = self.run_record(
+            config, events,
+            ["100000", "1", "1048576", "16777216", "1", "79"],
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"record_work_limit"}\n')
+        self.assertIsNone(log)
+
+    def test_work_limit_failure_leaves_existing_log_untouched(self):
+        config, events = self.events()
+        code, out, err, log = self.run_record(
+            config, events, self.LIMITS_OK + ["79"],
+            existing_log=b"previous\n",
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"record_work_limit"}\n')
+        self.assertEqual(log, b"previous\n")
+
+    def test_bad_work_limit_token_is_usage(self):
+        config, events = self.events()
+        for bad in ("0", "01", "-1", "1.5", "10x", ""):
+            with self.subTest(bad=bad):
+                code, out, err, _ = self.run_record(
+                    config, events, self.LIMITS_OK + [bad]
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(out, b"")
+                self.assertEqual(err, b'{"error":"usage"}\n')
 
 
 class CliErrorTest(unittest.TestCase):
