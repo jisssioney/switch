@@ -651,5 +651,172 @@ class ConfigDiffWorkLimitTest(unittest.TestCase):
                          b'{"error":"diff_work_limit"}\n')
 
 
+class ConfigDiffThreeLimitTest(unittest.TestCase):
+    def test_defaults_constants(self):
+        self.assertEqual(switch.DEFAULT_MAX_DIFF_WORK, 10000000)
+        self.assertEqual(switch.CONFIG_DIFF_MAX_INPUT_BYTES, 1048576)
+        self.assertEqual(switch.DEFAULT_MAX_OUTPUT_BYTES, 16777216)
+
+    def test_two_extra_args_is_usage(self):
+        old_raw = json.dumps(base_config()).encode()
+        # 上限只允许 0、1、3 项：2 项无论取值均为 usage
+        code, out, err = run_cli(old_raw, old_raw, args=("9", "9"))
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"usage"}\n'))
+        # 3 项形式中任一 token 非法即 usage
+        for token in ("0", "01", "1.5", "-", "x", "", "1 "):
+            code, out, err = run_cli(
+                old_raw, old_raw, args=("9", token, "9")
+            )
+            self.assertEqual((code, out, err),
+                             (2, b"", b'{"error":"usage"}\n'))
+        code, out, err = run_cli(old_raw, old_raw, args=("9", "9", "0"))
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"usage"}\n'))
+        # 单项上限仍为合法用法
+        code, out, err = run_cli(old_raw, old_raw, args=("99999999",))
+        self.assertEqual(code, 0)
+
+    def test_three_limits_success_and_byte_identical(self):
+        old = base_config()
+        new = copy.deepcopy(old)
+        new["age"] = 50
+        old_raw = json.dumps(old, separators=(",", ":")).encode()
+        new_raw = json.dumps(new, separators=(",", ":")).encode()
+        code, default_out, err = run_cli(old_raw, new_raw)
+        self.assertEqual((code, err), (0, b""))
+        code, out, err = run_cli(
+            old_raw, new_raw,
+            args=("99999999", str(max(len(old_raw), len(new_raw))),
+                  str(len(default_out))),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out, default_out)
+
+    def test_three_limit_input_exact_then_over(self):
+        old = base_config()
+        raw = json.dumps(old, separators=(",", ":")).encode()
+        code, out, err = run_cli(
+            raw, raw, args=("99999999", str(len(raw)), "16777216")
+        )
+        self.assertEqual((code, out, err),
+                         (0, b'{"equal":true,"changes":[]}\n', b""))
+        code, out, err = run_cli(
+            raw, raw, args=("99999999", str(len(raw) - 1), "16777216")
+        )
+        self.assertEqual((code, out, err),
+                         (5, b"", b'{"error":"input_limit"}\n'))
+
+    def test_three_limit_output_exact_then_over(self):
+        old = base_config()
+        new = copy.deepcopy(old)
+        new["age"] = 50
+        old_raw = json.dumps(old, separators=(",", ":")).encode()
+        new_raw = json.dumps(new, separators=(",", ":")).encode()
+        _, payload, _ = run_cli(old_raw, new_raw)
+        code, out, err = run_cli(
+            old_raw, new_raw,
+            args=("99999999", str(len(old_raw)), str(len(payload))),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out, payload)
+        code, out, err = run_cli(
+            old_raw, new_raw,
+            args=("99999999", str(len(old_raw)), str(len(payload) - 1)),
+        )
+        self.assertEqual((code, out, err),
+                         (5, b"", b'{"error":"output_limit"}\n'))
+
+    def test_three_limit_precedence_chain(self):
+        new = json.dumps(base_config()).encode()
+        # usage -> file_not_found -> input_limit -> invalid_input
+        #   -> diff_work_limit -> output_limit
+        code, out, err = run_cli(b"{", new, args=("1", "1", "1"))
+        self.assertEqual((code, out, err),
+                         (5, b"", b'{"error":"input_limit"}\n'))
+        code, out, err = run_cli(b"{", new, args=("1", "999999999", "1"))
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"invalid_input"}\n'))
+        old = base_config()
+        changed = copy.deepcopy(old)
+        changed["age"] = 50
+        work = ref_work(old, changed)
+        old_raw = json.dumps(old, separators=(",", ":")).encode()
+        new_raw = json.dumps(changed, separators=(",", ":")).encode()
+        code, out, err = run_cli(
+            old_raw, new_raw,
+            args=(str(work - 1), "999999999", "1"),
+        )
+        self.assertEqual((code, out, err),
+                         (5, b"", b'{"error":"diff_work_limit"}\n'))
+
+    def test_arbitrary_length_limit_tokens(self):
+        raw = json.dumps(base_config()).encode()
+        code, out, err = run_cli(
+            raw, raw, args=("9" * 60, "1" + "0" * 50, "1" + "0" * 50)
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out, b'{"equal":true,"changes":[]}\n')
+
+
+class DiffWorkEarlyStopTest(unittest.TestCase):
+    def _counting_list(self, n):
+        """元素在递归计费被访问时计数的列表。"""
+        visited = []
+
+        class CountingList(list):
+            def __iter__(self):
+                for item in super().__iter__():
+                    visited.append(1)
+                    yield item
+
+        return CountingList([{"k": 1}] * n), visited
+
+    def test_size_charge_stops_at_first_overrun(self):
+        value, visited = self._counting_list(100)
+        # S = 1 + 100*3 = 301；额度仅够 1 + 2 个完整元素 + 第 3 个的开头
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_size_charge(value, 8)
+        self.assertLess(len(visited), 100)
+        self.assertEqual(len(visited), 3)
+
+    def test_size_charge_matches_size_when_within_budget(self):
+        value, visited = self._counting_list(100)
+        self.assertEqual(
+            switch._diff_size_charge(value, 10 ** 9), 10 ** 9 - 301
+        )
+        self.assertEqual(len(visited), 100)
+
+    def test_size_charge_empty_shapes(self):
+        self.assertEqual(switch._diff_size_charge({}, 5), 4)
+        self.assertEqual(switch._diff_size_charge([], 5), 4)
+        self.assertEqual(switch._diff_size_charge(1, 5), 4)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_size_charge({}, 0)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_size_charge([], 0)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_size_charge(1, 0)
+
+    def test_work_single_side_subtree_not_scanned_when_over(self):
+        # 单侧键：超大值子树 S 远超剩余额度；递归计费在中途即抛，
+        # 不遍历完整子树
+        big, visited = self._counting_list(100)
+        old = {"shared": 1, "only_here": big}
+        new = {"shared": 1}
+        # 根对象 1+2=3，shared 标量对 3，留给 only_here 额度极少
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_work(old, new, 8)
+        self.assertLess(len(visited), 100)
+
+    def test_work_non_object_pair_stops_within_arrays(self):
+        old_list, old_seen = self._counting_list(100)
+        new_list, new_seen = self._counting_list(100)
+        with self.assertRaises(switch.DiffWorkLimit):
+            switch._diff_work(old_list, new_list, 6)
+        self.assertLess(len(old_seen), 100)
+        self.assertEqual(new_seen, [])  # OLD 侧先耗尽，NEW 完全不访问
+
+
 if __name__ == "__main__":
     unittest.main()
