@@ -11983,6 +11983,7 @@ EVENT_KIND_BY_KEYS = {
     SERVICE_EVENT_KEYS: "service",
     FRAME_KEYS_ACL: "frame",
     RELOAD_EVENT_KEYS: "reload",
+    ROLLBACK_EVENT_KEYS: "rollback",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -11999,6 +12000,7 @@ def _event_kind(event):
 def _run_reload(config, events, observe, max_work=None):
     """reload/record/replay 共用：校验配置与事件并执行 port-security 仿真。
 
+    事件允许 {t, rollback} 回滚事件（语义同 reload-rollback 子命令）。
     返回 (reload 结果 dict, observer 或 None)。全部校验与非法重载检测先于返回。
     max_work 非 None 时（record），全量语义校验后先按 reload 公式无副作用
     预演；首次超过即抛 ReloadWorkLimit，不正式仿真。
@@ -12019,7 +12021,7 @@ def _run_reload(config, events, observe, max_work=None):
     ) = validate_security_config(config)
     link_ids = {link["id"] for link in links}
     reload_events, final_config = validate_reload_events(
-        events, ports, link_ids, lags, config
+        events, ports, link_ids, lags, config, allow_rollback=True
     )
     if max_work is not None:
         # 与 reload 入口同一公式：独立链路副本与空状态，不改动既有数据
@@ -12064,12 +12066,12 @@ def _build_log_doc(config, events, items):
     if len(events) != len(items):
         raise InvalidInput("bad log")
     records = []
-    version = 0  # version 初值 0，取事件后值；每次 reload（无变化亦算）加 1
+    version = 0  # version 初值 0，取事件后值；每次 reload/rollback（无变化亦算）加 1
     for event, observed in zip(events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
-        if kind == "reload":
+        if kind in ("reload", "rollback"):
             version += 1
         records.append(
             {
@@ -12184,7 +12186,7 @@ def _verify_records(log, events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
-        if kind == "reload":
+        if kind in ("reload", "rollback"):
             version += 1
         if record["t"] != event["t"]:
             raise InvalidInput("bad log t")
