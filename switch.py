@@ -24,6 +24,8 @@ STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
 STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
 STP_EVENT_KEYS = frozenset(("t", "id", "up"))
 STP_TIMED_ROLES = ("root", "designated")
+LOOP_CONFIG_KEYS = frozenset(("bridges", "links", "vlans"))
+LOOP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up", "vlans"))
 FORWARD_STP_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age")
 )
@@ -81,6 +83,10 @@ class InvalidInput(Exception):
 
 
 class StpWorkLimit(Exception):
+    pass
+
+
+class LoopWorkLimit(Exception):
     pass
 
 
@@ -851,6 +857,141 @@ def stp(bridges, links, delay, events, max_work=None):
         if by_id[lid]["up"] != new_up:
             by_id[lid]["up"] = new_up
             cached = None
+        snapshot(t)
+    return {"results": results}
+
+
+def validate_loop_config(config):
+    if not isinstance(config, dict) or frozenset(config) != LOOP_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges = config["bridges"]
+    links = config["links"]
+    vlans = config["vlans"]
+    if (
+        not isinstance(bridges, list)
+        or not bridges
+        or not all(isinstance(name, str) and name for name in bridges)
+        or len(set(bridges)) != len(bridges)
+    ):
+        raise InvalidInput("bad bridges")
+    if (
+        not isinstance(vlans, list)
+        or not vlans
+        or not all(_is_int(vlan) and 1 <= vlan <= 4094 for vlan in vlans)
+        or any(a >= b for a, b in zip(vlans, vlans[1:]))
+    ):
+        raise InvalidInput("bad vlans")
+    if not isinstance(links, list):
+        raise InvalidInput("links must be a list")
+    bridge_set = set(bridges)
+    vlan_set = set(vlans)
+    ids = []
+    endpoints = set()
+    parsed = []
+    for link in links:
+        if not isinstance(link, dict) or frozenset(link) != LOOP_LINK_KEYS:
+            raise InvalidInput("bad link")
+        lid = link["id"]
+        cost = link["cost"]
+        up = link["up"]
+        link_vlans = link["vlans"]
+        if not isinstance(lid, str) or not lid:
+            raise InvalidInput("bad link id")
+        ends = []
+        for end in (link["x"], link["y"]):
+            if (
+                not isinstance(end, list)
+                or len(end) != 2
+                or not isinstance(end[0], str)
+                or end[0] not in bridge_set
+                or not isinstance(end[1], str)
+                or not end[1]
+            ):
+                raise InvalidInput("bad link endpoint")
+            ends.append((end[0], end[1]))
+        if ends[0][0] == ends[1][0]:
+            raise InvalidInput("link endpoints on the same bridge")
+        if ends[0] in endpoints or ends[1] in endpoints:
+            raise InvalidInput("duplicate link endpoint")
+        endpoints.update(ends)
+        if not _is_int(cost) or cost <= 0:
+            raise InvalidInput("bad cost")
+        if not isinstance(up, bool):
+            raise InvalidInput("bad up")
+        if (
+            not isinstance(link_vlans, list)
+            or not link_vlans
+            or not all(
+                _is_int(vlan) and vlan in vlan_set for vlan in link_vlans
+            )
+            or any(a >= b for a, b in zip(link_vlans, link_vlans[1:]))
+        ):
+            raise InvalidInput("bad link vlans")
+        ids.append(lid)
+        parsed.append(
+            {
+                "id": lid,
+                "x": ends[0],
+                "y": ends[1],
+                "cost": cost,
+                "up": up,
+                "vlans": list(link_vlans),
+            }
+        )
+    if len(set(ids)) != len(ids):
+        raise InvalidInput("link ids must be distinct")
+    return bridges, parsed, vlans
+
+
+def loop_detect(bridges, links, vlans, events, max_work=None):
+    """逐 VLAN 以桥为并查集顶点扫描 up 链路，划分 forwarding/blocked。
+
+    每个快照计 V*(L+1)（V、L 为配置 VLAN、链路数），快照数恒为
+    1 + 事件数；语义校验后按总量预判，累计等于上限合法，超限不执行。
+    """
+    by_id = {link["id"]: link for link in links}
+    work = (1 + len(events)) * len(vlans) * (len(links) + 1)
+    if max_work is not None and work > max_work:
+        raise LoopWorkLimit
+    sorted_ids = sorted(by_id)  # id 的 Unicode 码点序
+    results = []
+
+    def snapshot(t):
+        vlan_entries = []
+        for vlan in vlans:
+            parent = {name: name for name in bridges}
+
+            def find(name):
+                while parent[name] != name:
+                    parent[name] = parent[parent[name]]
+                    name = parent[name]
+                return name
+
+            forwarding = []
+            blocked = []
+            for lid in sorted_ids:
+                link = by_id[lid]
+                if not link["up"] or vlan not in link["vlans"]:
+                    continue
+                root_x = find(link["x"][0])
+                root_y = find(link["y"][0])
+                if root_x != root_y:
+                    parent[root_x] = root_y
+                    forwarding.append(lid)
+                else:
+                    blocked.append(lid)
+            vlan_entries.append(
+                {
+                    "vlan": vlan,
+                    "forwarding": forwarding,
+                    "blocked": blocked,
+                }
+            )
+        results.append({"t": t, "vlans": vlan_entries})
+
+    snapshot(0)
+    for t, lid, new_up in events:
+        by_id[lid]["up"] = new_up
         snapshot(t)
     return {"results": results}
 
@@ -12355,6 +12496,7 @@ DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_STP_WORK = 10000000
+DEFAULT_MAX_LOOP_WORK = 10000000
 DEFAULT_MAX_FDB_WORK = 10000000
 DEFAULT_MAX_FORWARD_WORK = 10000000
 DEFAULT_MAX_FORWARD_STP_WORK = 10000000
@@ -13273,6 +13415,7 @@ SUBCOMMANDS = frozenset((
     "fdb",
     "forward",
     "stp",
+    "loop-detect",
     "forward-stp",
     "stp-check",
     "forward-stp-storm",
@@ -13485,16 +13628,18 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_link_forward(args[1], args[2], *limits)
-    # stp/fdb/forward/forward-stp/stp-check/forward-stp-storm/storm-check/lag/
-    # lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/port-security/
-    # security-check/reload/reload-rollback 额外允许 5 项
-    # 上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/
+    # stp/loop-detect/fdb/forward/forward-stp/stp-check/forward-stp-storm/
+    # storm-check/lag/lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/
+    # port-security/security-check/reload/reload-rollback 额外允许 5 项
+    # 上限（末尾分别为 MAX_STP_WORK/MAX_LOOP_WORK/MAX_FDB_WORK/
+    # MAX_FORWARD_WORK/
     # MAX_FORWARD_STP_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/MAX_STORM_WORK/
     # MAX_LAG_WORK/MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_MIRROR_WORK/
     # MAX_ACL_WORK/MAX_ACL_WORK/MAX_QOS_WORK/MAX_QOS_WORK(qos-check)/
     # MAX_SECURITY_WORK/MAX_SECURITY_WORK(security-check)/MAX_RELOAD_WORK）；
     # 其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
+    is_loop_detect = args[:1] == ["loop-detect"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
     is_forward_stp = args[:1] == ["forward-stp"]
@@ -13515,7 +13660,7 @@ def main(argv):
     is_reload_rollback = args[:1] == ["reload-rollback"]
     allowed_counts = (
         (3, 5, 7, 8)
-        if is_stp or is_fdb or is_forward or is_forward_stp
+        if is_stp or is_loop_detect or is_fdb or is_forward or is_forward_stp
         or is_stp_check
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
         or is_mirror or is_mirror_check
@@ -13528,6 +13673,7 @@ def main(argv):
         "fdb",
         "forward",
         "stp",
+        "loop-detect",
         "forward-stp",
         "stp-check",
         "forward-stp-storm",
@@ -13547,7 +13693,7 @@ def main(argv):
     ):
         _fail("usage")
         return 2
-    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK|MAX_STORM_WORK|MAX_LAG_WORK|MAX_MIRROR_WORK|MAX_MIRROR_WORK(mirror-check)|MAX_ACL_WORK|MAX_ACL_WORK(acl-check)|MAX_QOS_WORK|MAX_QOS_WORK(qos-check)|MAX_SECURITY_WORK|MAX_SECURITY_WORK(security-check)|MAX_RELOAD_WORK]]]
+    # MODE CONFIG DATA [MAX_CONFIG_BYTES MAX_DATA_BYTES [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_STP_WORK|MAX_LOOP_WORK|MAX_FDB_WORK|MAX_FORWARD_WORK|MAX_FORWARD_STP_WORK|MAX_STORM_WORK|MAX_LAG_WORK|MAX_MIRROR_WORK|MAX_MIRROR_WORK(mirror-check)|MAX_ACL_WORK|MAX_ACL_WORK(acl-check)|MAX_QOS_WORK|MAX_QOS_WORK(qos-check)|MAX_SECURITY_WORK|MAX_SECURITY_WORK(security-check)|MAX_RELOAD_WORK]]]
     # 上限均须匹配 [1-9][0-9]*，按数学整数比较
     if any(_LIMIT_RE.fullmatch(token) is None for token in args[3:]):
         _fail("usage")
@@ -13568,6 +13714,20 @@ def main(argv):
             max_output_bytes,
             max_stp_work,
         ) = parsed + stp_limits[len(parsed):]
+        max_fdb_work = None
+        max_forward_work = None
+        max_forward_stp_work = None
+    elif is_loop_detect:
+        # loop-detect 沿用 stp 的资源契约，末项上限为 MAX_LOOP_WORK
+        loop_limits = limits + (DEFAULT_MAX_LOOP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_loop_work,
+        ) = parsed + loop_limits[len(parsed):]
+        max_stp_work = None
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
@@ -13835,6 +13995,17 @@ def main(argv):
                 delay,
                 validate_stp_events(data, link_ids),
                 max_stp_work,
+            )
+        elif mode == "loop-detect":
+            bridges, links, vlans = validate_loop_config(config)
+            link_ids = {link["id"] for link in links}
+            # 事件及全量校验沿用 stp；校验后按快照总量预判，超限不执行
+            result = loop_detect(
+                bridges,
+                links,
+                vlans,
+                validate_stp_events(data, link_ids),
+                max_loop_work,
             )
         elif mode == "forward-stp":
             bridges, links, delay, bridge, ports, age = (
@@ -14463,6 +14634,9 @@ def main(argv):
         return 4
     except StpWorkLimit:
         _fail("stp_work_limit")
+        return 5
+    except LoopWorkLimit:
+        _fail("loop_work_limit")
         return 5
     except FdbWorkLimit:
         _fail("fdb_work_limit")
