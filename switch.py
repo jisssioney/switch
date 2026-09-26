@@ -6409,6 +6409,201 @@ def frame_check(frames, ports, max_frame):
     }
 
 
+FORWARD_CHECK_CONFIG_KEYS = frozenset(("ports", "age", "max_frame"))
+FORWARD_CHECK_FRAME_KEYS = frozenset(
+    ("t", "port", "src", "dst", "vlan", "length", "fcs", "alignment")
+)
+
+
+def validate_forward_check_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != FORWARD_CHECK_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    # ports、age 与新式 forward 完全同构；max_frame 另为 1518..9216 的非布尔整数
+    ports, age = validate_forward_config_v2(
+        {"ports": config["ports"], "age": config["age"]}
+    )
+    max_frame = config["max_frame"]
+    if (
+        not _is_int(max_frame)
+        or not FRAME_CHECK_MIN_MAX_FRAME
+        <= max_frame
+        <= FRAME_CHECK_MAX_MAX_FRAME
+    ):
+        raise InvalidInput("bad max_frame")
+    return ports, age, max_frame
+
+
+def validate_forward_check_frames(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for frame in frames:
+        if (
+            not isinstance(frame, dict)
+            or frozenset(frame) != FORWARD_CHECK_FRAME_KEYS
+        ):
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        src = frame["src"]
+        dst = frame["dst"]
+        vlan = frame["vlan"]
+        length = frame["length"]
+        fcs = frame["fcs"]
+        alignment = frame["alignment"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in names:
+            raise InvalidInput("unknown port")
+        if not valid_mac(src):
+            raise InvalidInput("bad src")
+        if dst != BROADCAST_MAC and not valid_mac(dst):
+            raise InvalidInput("bad dst")
+        if vlan is not None and not _valid_vlan_id(vlan):
+            raise InvalidInput("bad vlan")
+        if not _is_int(length) or length < 0:
+            raise InvalidInput("bad length")
+        if not isinstance(fcs, bool):
+            raise InvalidInput("bad fcs")
+        if not isinstance(alignment, bool):
+            raise InvalidInput("bad alignment")
+        result.append((t, port, src, dst, vlan, length, fcs, alignment))
+    return result
+
+
+def forward_check(frames, ports, age, max_frame):
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, src, dst, tag, length, fcs, alignment in frames:
+        # 逐帧先老化 FDB，再做长度与差错分类
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif not alignment:
+            cls = "alignment"
+        elif not fcs:
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        stats = port_stats[port_name]
+        stats["rx"] += 1
+        stats[cls] += 1
+        if cls != "good":
+            # 差错帧一律丢弃：不学习、不转发、不计 VLAN
+            stats["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        ingress = by_name[port_name]
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝帧丢弃且不学习、不计 VLAN
+            stats["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target = by_name[hit[0]]
+                if target["up"] and vlan in target["allowed"]:
+                    egress = [hit[0]]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["up"]
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            stats["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {"t": t, "class": cls, "action": action, "ports": out_ports}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 def _fail(message):
     sys.stderr.buffer.write(
         ('{"error":"%s"}\n' % message).encode("utf-8")
@@ -7050,6 +7245,50 @@ def _cmd_frame_check(
     return 0
 
 
+def _cmd_forward_check(
+    config_path,
+    frames_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 签名、资源上限与错误契约同 frame-check
+        with open(config_path, "rb") as config_handle, open(
+            frames_path, "rb"
+        ) as frames_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            frames_raw = _read_limited(frames_handle, max_data_bytes)
+            if frames_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        frames_doc = parse_json(frames_raw)
+        if isinstance(frames_doc, list) and len(frames_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        ports, age, max_frame = validate_forward_check_config(config)
+        frames = validate_forward_check_frames(frames_doc, ports)
+        result = forward_check(frames, ports, age, max_frame)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def main(argv):
     args = argv[1:]
     if args[:1] == ["record"]:
@@ -7135,6 +7374,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_frame_check(args[1], args[2], *limits)
+    if args[:1] == ["forward-check"]:
+        # forward-check CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_forward_check(args[1], args[2], *limits)
     # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
     # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
     # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/
