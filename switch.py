@@ -6796,12 +6796,36 @@ def _diff_size(value):
     return 1
 
 
+def _diff_charge(value, remaining):
+    """按 S 公式逐节点计费并扣减额度，返回剩余额度（耗尽为 0）。
+
+    标量计 1；数组计 1 后依次计各元素 S；对象先计 1+键数，再依次计各值
+    S。额度随递归传递，等于上限合法；首次超过即抛 DiffWorkLimit 并立即
+    停止，不访问后续数组元素、对象键值或单侧子树的剩余部分。
+    """
+    if remaining <= 0:
+        raise DiffWorkLimit
+    remaining -= 1
+    if isinstance(value, dict):
+        key_cost = len(value)
+        if key_cost > remaining:
+            raise DiffWorkLimit
+        remaining -= key_cost
+        for item in value.values():
+            remaining = _diff_charge(item, remaining)
+    elif isinstance(value, list):
+        for item in value:
+            remaining = _diff_charge(item, remaining)
+    return remaining
+
+
 def _diff_work(old, new, remaining):
     """按工作量公式无副作用预演 D，返回剩余额度（耗尽为 0）。
 
     两值均为对象时计 1+并集键数，共有键递归计 D，单侧键计该侧 S；
-    其余（含数组整体）计 1+S(旧值)+S(新值)。键按 Unicode 码点升序
-    累计；等于上限合法，首次超过即抛 DiffWorkLimit。
+    其余（含数组整体）先计 1，再按 OLD、NEW 顺序各计 S。键按 Unicode
+    码点升序累计；等于上限合法，首次超过即抛 DiffWorkLimit。所有递归
+    均传递剩余额度，确定超限立即停止，不访问后续元素、键值或单侧子树。
     """
     if isinstance(old, dict) and isinstance(new, dict):
         cost = 1 + len(set(old) | set(new))
@@ -6812,28 +6836,41 @@ def _diff_work(old, new, remaining):
             if key in old and key in new:
                 remaining = _diff_work(old[key], new[key], remaining)
             else:
-                cost = _diff_size(old[key] if key in old else new[key])
-                if cost > remaining:
-                    raise DiffWorkLimit
-                remaining -= cost
+                remaining = _diff_charge(
+                    old[key] if key in old else new[key], remaining
+                )
         return remaining
-    cost = 1 + _diff_size(old) + _diff_size(new)
-    if cost > remaining:
+    if remaining <= 0:
         raise DiffWorkLimit
-    return remaining - cost
+    remaining -= 1
+    remaining = _diff_charge(old, remaining)
+    remaining = _diff_charge(new, remaining)
+    return remaining
 
 
-def _cmd_config_diff(old_path, new_path, max_diff_work=DEFAULT_MAX_DIFF_WORK):
+def _cmd_config_diff(
+    old_path,
+    new_path,
+    max_diff_work=DEFAULT_MAX_DIFF_WORK,
+    max_input_bytes=None,
+    max_output_bytes=None,
+):
+    # 缺省值在函数体内读取模块常量，与旧 0/1 项用法逐字节一致
+    if max_input_bytes is None:
+        max_input_bytes = CONFIG_DIFF_MAX_INPUT_BYTES
+    if max_output_bytes is None:
+        max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
     try:
-        # 先打开两文件，任一失败即停；均可读后按 OLD、NEW 顺序分块读
+        # 先打开两文件，任一失败即停；均可读后按 OLD、NEW 顺序分块读。
+        # 原始字节上界各自独立作用于 OLD、NEW，等于上限合法
         with open(old_path, "rb") as old_handle, open(
             new_path, "rb"
         ) as new_handle:
-            old_raw = _read_limited(old_handle, CONFIG_DIFF_MAX_INPUT_BYTES)
+            old_raw = _read_limited(old_handle, max_input_bytes)
             if old_raw is None:
                 _fail("input_limit")
                 return 5
-            new_raw = _read_limited(new_handle, CONFIG_DIFF_MAX_INPUT_BYTES)
+            new_raw = _read_limited(new_handle, max_input_bytes)
             if new_raw is None:
                 _fail("input_limit")
                 return 5
@@ -6859,7 +6896,7 @@ def _cmd_config_diff(old_path, new_path, max_diff_work=DEFAULT_MAX_DIFF_WORK):
     result = {"equal": not changes, "changes": changes}
     payload = _result_bytes(result)
     # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
-    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+    if len(payload) > max_output_bytes:
         _fail("output_limit")
         return 5
     sys.stdout.buffer.write(payload)
@@ -6912,18 +6949,25 @@ def main(argv):
             return 2
         return _cmd_replay(args[1], *limits)
     if args[:1] == ["config-diff"]:
-        # config-diff OLD NEW [MAX_DIFF_WORK]：逐字节仅这两种用法；
+        # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
+        #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 个，逐字节仅此四种用法；
         # 上限须匹配 [1-9][0-9]*，按数学整数比较
-        if len(args) not in (3, 4):
+        if len(args) not in (3, 4, 6):
             _fail("usage")
             return 2
-        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
-            _fail("usage")
-            return 2
-        max_diff_work = (
-            _limit_value(args[3]) if len(args) == 4 else DEFAULT_MAX_DIFF_WORK
+        limits = _parse_limits(
+            args[3:],
+            (0, 1, 3),
+            (
+                DEFAULT_MAX_DIFF_WORK,
+                CONFIG_DIFF_MAX_INPUT_BYTES,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
         )
-        return _cmd_config_diff(args[1], args[2], max_diff_work)
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_config_diff(args[1], args[2], *limits)
     # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
     # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
     # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/
