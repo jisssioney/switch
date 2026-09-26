@@ -11652,6 +11652,9 @@ DEFAULT_MAX_REPLAY_WORK = 10000000
 DEFAULT_MAX_DIFF_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
+# config-import 上限默认值：工作量沿用 config-export，输入/输出均为 1MiB
+DEFAULT_MAX_IMPORT_WORK = DEFAULT_MAX_EXPORT_WORK
+DEFAULT_MAX_IMPORT_OUTPUT_BYTES = 1024 * 1024
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -12267,6 +12270,71 @@ def _cmd_config_export(
     return 0
 
 
+IMPORT_KEYS = ("schema", "config", "sha256")
+IMPORT_SCHEMA = 1
+
+
+def _cmd_config_import(
+    snapshot_path,
+    output_path,
+    max_import_work=DEFAULT_MAX_IMPORT_WORK,
+    max_input_bytes=CONFIG_DIFF_MAX_INPUT_BYTES,
+    max_output_bytes=None,
+):
+    if max_output_bytes is None:
+        # 调用时解析缺省：测试可在导入后补丁 DEFAULT_MAX_IMPORT_OUTPUT_BYTES
+        max_output_bytes = DEFAULT_MAX_IMPORT_OUTPUT_BYTES
+    try:
+        with open(snapshot_path, "rb") as snapshot_handle:
+            # 仅读取一个 SNAPSHOT；分块读取与字节边界沿用 config-export
+            snapshot_raw = _read_limited(snapshot_handle, max_input_bytes)
+            if snapshot_raw is None:
+                _fail("input_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        snapshot = parse_json(snapshot_raw)
+        # 快照键恰为 schema,config,sha256；schema 为 1
+        if not isinstance(snapshot, dict) or frozenset(snapshot) != frozenset(
+            IMPORT_KEYS
+        ):
+            raise InvalidInput("bad snapshot")
+        if not _is_int(snapshot["schema"]) or snapshot["schema"] != (
+            IMPORT_SCHEMA
+        ):
+            raise InvalidInput("bad snapshot schema")
+        config = snapshot["config"]
+        # 按既有 port-security 契约全量解析校验（类型、语义）
+        validate_security_config(config)
+        canonical = _canonical(config)
+        # C：config 规范化后按紧凑 UTF-8 口径编码并加 LF
+        payload = _result_bytes(canonical)
+        # sha256 须为 C 的 SHA-256 小写 64 位十六进制
+        if hashlib.sha256(payload).hexdigest() != snapshot["sha256"]:
+            raise InvalidInput("bad snapshot sha256")
+        # 全部校验后先无副作用预演根值 S；等于上限合法，首次超过即停止，
+        # 不触碰 OUTPUT。S 与遍历次序沿用 config-export 的 _diff_size_charge
+        _diff_size_charge(config, max_import_work)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except DiffWorkLimit:
+        _fail("import_work_limit")
+        return 5
+    # 输出字节上界（C 含末尾 LF）写入前判定；等于上限合法
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    try:
+        _atomic_write(output_path, payload)  # 全部校验通过后才原子替换 OUTPUT
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    return 0  # 成功时 stdout 为空
+
+
 def _cmd_frame_check(
     config_path,
     frames_path,
@@ -12444,6 +12512,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_config_export(args[1], *limits)
+    if args[:1] == ["config-import"]:
+        # config-import SNAPSHOT OUTPUT [MAX_IMPORT_WORK [MAX_INPUT_BYTES
+        #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
+        # [1-9][0-9]*，按数学整数比较；默认 10000000/1048576/1048576
+        if len(args) not in (3, 4, 6):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 1, 3),
+            (
+                DEFAULT_MAX_IMPORT_WORK,
+                CONFIG_DIFF_MAX_INPUT_BYTES,
+                DEFAULT_MAX_IMPORT_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_config_import(args[1], args[2], *limits)
     if args[:1] == ["frame-check"]:
         # frame-check CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
