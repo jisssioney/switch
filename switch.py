@@ -11650,6 +11650,8 @@ DEFAULT_MAX_RELOAD_WORK = 10000000
 DEFAULT_MAX_RECORD_WORK = 10000000
 DEFAULT_MAX_REPLAY_WORK = 10000000
 DEFAULT_MAX_DIFF_WORK = 10000000
+# config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
+DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -12218,6 +12220,53 @@ def _cmd_config_diff(
     return 0
 
 
+def _cmd_config_export(
+    config_path,
+    max_export_work=DEFAULT_MAX_EXPORT_WORK,
+    max_input_bytes=CONFIG_DIFF_MAX_INPUT_BYTES,
+    max_output_bytes=None,
+):
+    if max_output_bytes is None:
+        # 调用时解析缺省：测试可在导入后补丁 DEFAULT_MAX_OUTPUT_BYTES
+        max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
+    try:
+        with open(config_path, "rb") as config_handle:
+            # 仅读取一个 CONFIG；分块读取与字节边界沿用 config-diff
+            config_raw = _read_limited(config_handle, max_input_bytes)
+            if config_raw is None:
+                _fail("input_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        # 按既有 port-security 契约全量解析校验（编码、JSON、语义）
+        validate_security_config(config)
+        # 语义校验后先无副作用预演根值 S；等于上限合法，首次超过即停止，
+        # 不构造导出文档。S 与遍历次序（对象键按 Unicode 码点升序）沿用
+        # config-diff 的 _diff_size_charge
+        _diff_size_charge(config, max_export_work)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except DiffWorkLimit:
+        _fail("export_work_limit")
+        return 5
+    canonical = _canonical(config)
+    # config 单独按紧凑 UTF-8 口径编码并加 LF 后的 SHA-256 小写十六进制
+    config_payload = _result_bytes(canonical)
+    digest = hashlib.sha256(config_payload).hexdigest()
+    result = {"schema": 1, "config": canonical, "sha256": digest}
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_frame_check(
     config_path,
     frames_path,
@@ -12375,6 +12424,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_config_diff(args[1], args[2], *limits)
+    if args[:1] == ["config-export"]:
+        # config-export CONFIG [MAX_EXPORT_WORK [MAX_INPUT_BYTES
+        #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
+        # [1-9][0-9]*，按数学整数比较；三项上限沿用 config-diff
+        if len(args) not in (2, 3, 5):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[2:],
+            (0, 1, 3),
+            (
+                DEFAULT_MAX_EXPORT_WORK,
+                CONFIG_DIFF_MAX_INPUT_BYTES,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_config_export(args[1], *limits)
     if args[:1] == ["frame-check"]:
         # frame-check CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
