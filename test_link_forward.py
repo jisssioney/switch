@@ -486,6 +486,49 @@ class ValidationTests(unittest.TestCase):
         # 重名口非法
         self._assert_exit4(config([port("p1"), port("p1")]), [])
 
+    def test_mode_must_be_access_trunk_hybrid(self):
+        # mode 仅取 access/trunk/hybrid；其余一律 invalid_input/4
+        for mode in ("access", "trunk", "hybrid"):
+            proc, _ = run_cli(config([port("p1", mode=mode)]), [])
+            self.assertEqual(proc.returncode, 0, (mode, proc.stderr))
+        for bad_mode in ("hybrid-access", "promiscuous", "", 1, True, None):
+            bad = port("p1")
+            bad["mode"] = bad_mode
+            self._assert_exit4(config([bad]), [])
+        # hybrid 口的 allowed/untagged/pvid 关系仍按新式 forward 校验：
+        # untagged 必须是 allowed 子集，pvid 必须在 allowed 内
+        self._assert_exit4(
+            config([port("p1", mode="hybrid", pvid=1,
+                         allowed=[1, 2], untagged=[3])]),
+            [],
+        )
+        self._assert_exit4(
+            config([port("p1", mode="hybrid", pvid=3,
+                         allowed=[1, 2], untagged=[])]),
+            [],
+        )
+
+    def test_hybrid_forwarding_contract(self):
+        # hybrid：p1 准入 vlan1/2、untagged vlan1；无标签帧按 pvid=1
+        # 入，泛洪到 p2 时 vlan1 去标签、vlan2 保留
+        cfg = config([
+            port("p1", mode="hybrid", pvid=1, allowed=[1, 2],
+                 untagged=[1]),
+            port("p2", mode="hybrid", pvid=1, allowed=[1, 2],
+                 untagged=[1]),
+        ])
+        events = [
+            link(0, "p1"),
+            link(0, "p2"),
+            frame(10, "p1", "00:00:00:00:00:01"),
+            frame(11, "p1", "00:00:00:00:00:02", vlan=2),
+        ]
+        out = run(cfg, events)
+        self.assertEqual(out["results"][2]["ports"],
+                         [{"name": "p2", "vlan": None}])
+        self.assertEqual(out["results"][3]["ports"],
+                         [{"name": "p2", "vlan": 2}])
+
     def test_events_must_be_list_t_non_decreasing(self):
         cfg = config()
         self._assert_exit4(cfg, {"x": 1})
@@ -566,6 +609,99 @@ class ResourceAndErrorTests(unittest.TestCase):
         self.assertEqual(proc.stdout, b"")
         self.assertIn(b"output_limit", proc.stderr)
 
+    def test_work_limit_exit5_empty_stdout_exact_stderr(self):
+        # P=2：W 初值 2；每事件加 F+5，帧事件后 F+1。
+        # link,link,frame,frame -> 7,12,17,23；上限 22 在第 4 项首超
+        events = [
+            link(0, "p1"),
+            link(0, "p2"),
+            frame(10, "p1", "00:00:00:00:00:01"),
+            frame(11, "p2", "00:00:00:00:00:02"),
+        ]
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000, 22
+        )
+        self.assertEqual(proc.returncode, 5)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr,
+                         b'{"error":"link_forward_work_limit"}\n')
+        # 恰等于累计上限（23）合法
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000, 23
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_work_limit_counts_all_events_and_frames(self):
+        # 3 口：W 初值 3；步长 F+7。序列 link,frame,frame,link
+        # -> 10,17,25,34；上限 33 在第 4 项（协商项）首超
+        cfg = config([port("p1"), port("p2"), port("p3")])
+        events = [
+            link(0, "p1"),
+            frame(10, "p1", "00:00:00:00:00:01"),
+            frame(11, "p1", "00:00:00:00:00:02"),
+            link(12, "p2"),
+        ]
+        proc, _ = run_cli(
+            cfg, events, 1000000, 1000000, 1000000, 1000000, 33
+        )
+        self.assertEqual(proc.returncode, 5)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr,
+                         b'{"error":"link_forward_work_limit"}\n')
+        proc, _ = run_cli(
+            cfg, events, 1000000, 1000000, 1000000, 1000000, 34
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_work_limit_initial_w_offsets_first_event(self):
+        # 无事件不累加也不比较：W=P=2 是初值，limit 再小也无“超过”
+        proc, _ = run_cli(
+            config(), [], 1000000, 1000000, 1000000, 1000000, 1
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 初值 P 计入首事件：P=2 首事件后 W=2+0+5=7，limit 6 首超
+        events = [link(0, "p1")]
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000, 6
+        )
+        self.assertEqual(proc.returncode, 5)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr,
+                         b'{"error":"link_forward_work_limit"}\n')
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000, 7
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_work_limit_default_and_arbitrary_length(self):
+        # 缺省上限 10000000：少量事件不超限
+        proc, _ = run_cli(config(), [link(0, "p1")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 任意长十进制：远大于累计工作量，按数学整数比较（非字符串长度）
+        proc, _ = run_cli(
+            config(), [link(0, "p1")], 1000000, 1000000, 1000000,
+            1000000, "999999999999999999999999999999"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 任意长十进制按数学整数比较；前导 0 串不匹配 [1-9][0-9]*
+        events = [link(0, "p1"), link(0, "p2")]
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000,
+            "0000000000000000000000000012"
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(b"usage", proc.stderr)
+
+    def test_failure_ordering_semantic_before_work(self):
+        # 语义非法（未知口）即使工作量在更早项也先报 invalid_input/4
+        events = [frame(0, "ghost", "00:00:00:00:00:01")]
+        proc, _ = run_cli(
+            config(), events, 1000000, 1000000, 1000000, 1000000, 1
+        )
+        self.assertEqual(proc.returncode, 4)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn(b"invalid_input", proc.stderr)
+
     def test_usage_exit2(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = os.path.join(tmp, "c.json")
@@ -579,6 +715,12 @@ class ResourceAndErrorTests(unittest.TestCase):
                 ["link-forward", cfg, evt, "1"],             # 1 项上限
                 ["link-forward", cfg, evt, "1", "2", "3"],   # 3 项
                 ["link-forward", cfg, evt, "0"],             # 须 [1-9]
+                ["link-forward", cfg, evt, "1", "2", "3",
+                 "4", "5", "6"],                             # 6 项
+                ["link-forward", cfg, evt, "1", "2", "3",
+                 "4", "0"],                                  # 末项 0
+                ["link-forward", cfg, evt, "1", "2", "3",
+                 "4", "1a"],                                 # 末项非法
             ):
                 proc = subprocess.run(
                     [sys.executable, SWITCH, *argv],
@@ -588,6 +730,15 @@ class ResourceAndErrorTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2, argv)
                 self.assertEqual(proc.stdout, b"")
                 self.assertIn(b"usage", proc.stderr)
+            # 5 项上限（含 MAX_LINK_FORWARD_WORK）合法
+            proc = subprocess.run(
+                [sys.executable, SWITCH, "link-forward", cfg, evt,
+                 "1000000", "1000000", "1000000", "1000000", "10000000"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(proc.returncode, 4, proc.stderr)
+            self.assertIn(b"invalid_input", proc.stderr)
 
     def test_no_partial_state_on_validation_failure(self):
         # 末项非法时 stdout 必须为空（全量校验在前）
