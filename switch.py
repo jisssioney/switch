@@ -73,7 +73,7 @@ SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
 RELOAD_EVENT_KEYS = frozenset(("t", "config"))
 ROLLBACK_EVENT_KEYS = frozenset(("t", "rollback"))
-RELOAD_MUTABLE_KEYS = ("age", "acl", "security")
+RELOAD_MUTABLE_KEYS = ("age", "acl", "qos", "security")
 
 
 class InvalidInput(Exception):
@@ -2334,7 +2334,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
     """reload 子命令事件：普通事件沿用 qos，另含 {t, config} 重载事件。
 
     返回 (事件序列, 末态原始配置)；重载事件的 config 须为完整有效配置，
-    且仅 age/acl/security 可与当时配置不同。全部校验先于执行。
+    且仅 age/acl/qos/security 可与当时配置不同。全部校验先于执行。
     allow_rollback 时另含 {t, rollback} 事件（rollback 只能为 true）：
     reload 前压入当前配置，rollback 弹栈恢复，空栈为 invalid_input。
     """
@@ -2436,7 +2436,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _lags,
                 _mirror,
                 new_acl,
-                _qos,
+                new_qos,
                 new_security,
             ) = validate_security_config(new_config)
             for key in current:
@@ -2444,7 +2444,9 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     key not in RELOAD_MUTABLE_KEYS
                     and new_config[key] != current[key]
                 ):
-                    raise InvalidInput("reload may only change age/acl/security")
+                    raise InvalidInput(
+                        "reload may only change age/acl/qos/security"
+                    )
             changes = []
             for key in RELOAD_MUTABLE_KEYS:
                 if new_config[key] != current[key]:
@@ -2459,7 +2461,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 stack.append(current)  # reload 前压入当前配置
             current = new_config
             result.append(
-                ("reload", t, new_age, new_acl, new_security, changes)
+                ("reload", t, new_age, new_acl, new_qos, new_security, changes)
             )
         elif allow_rollback and keys == ROLLBACK_EVENT_KEYS:
             t = event["t"]
@@ -2483,7 +2485,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _lags,
                 _mirror,
                 new_acl,
-                _qos,
+                new_qos,
                 new_security,
             ) = validate_security_config(new_config)
             changes = []
@@ -2498,7 +2500,10 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     )
             current = new_config
             result.append(
-                ("rollback", t, new_age, new_acl, new_security, changes)
+                (
+                    "rollback", t, new_age, new_acl, new_qos, new_security,
+                    changes,
+                )
             )
         else:
             raise InvalidInput("bad event")
@@ -8943,9 +8948,13 @@ def reload_work(
     N=全部出口排队帧数，S=所指端口排队帧数（帧取入端口）：帧计
     X+3P+M+R+D+S+1；链路先应用 up，改变以新 U 计 X+N+B+L+2U+2P+1，
     幂等计 X+1；成员 down 计 X+S+1、up 计 X+1；服务计 X+S+1；重载令
-    A/T 为新 ACL 规则数/新静态绑定数，计 X+D+P+A+T+1，再采用新
-    age/ACL/security。再按既有队列、调度、清队与安全规则处理并更新
-    预演状态。累计等于上限合法，首次超过即抛 ReloadWorkLimit。
+    A/T 为新 ACL 规则数/新静态绑定数，计 X+D+P+A+T+1，qos 变化时另计
+    N+5（N 为变更前排队帧总数），再采用新 age/ACL/qos/security。取新
+    配置后先检查各出口四队列：drop=tail 时总数不得超过新 cap，
+    drop=weighted 时队列 i 不得超过 ceil(cap*weights[i]/sum(weights))，
+    违者整批 invalid_input；qos 变化时各口 WRR 重置为 q=3、
+    rem=weights[3]，否则保留。再按既有队列、调度、清队与安全规则处理
+    并更新预演状态。累计等于上限合法，首次超过即抛 ReloadWorkLimit。
     """
     window = storm["window"]
     limits = storm["limits"]
@@ -8958,6 +8967,7 @@ def reload_work(
     drop_mode = qos["drop"]
     weight_total = sum(weights)
     quotas = [-(-(cap * w) // weight_total) for w in weights]  # 上取整
+    current_qos = qos  # 当前生效 qos（解析形）；重载时与新值比较并替换
     sec_by_port = {entry["port"]: entry for entry in security}
     static_owner = {}  # (vlan, mac) -> 所属物理口
     for entry in security:
@@ -9216,13 +9226,14 @@ def reload_work(
         elif kind == "service":
             work += X + sum(egress_queues[item[2]]) + 1
         elif kind in ("reload", "rollback"):
-            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static 的整批无效
-            # 判定先于工作量累加与超限判断：record/replay 按 invalid_input
-            # 退出 4，且绝不触碰 LOG；rollback 按 reload 分支计费，
-            # A/T 取恢复配置的 ACL 规则数/静态绑定数
-            reload_by_port = {entry["port"]: entry for entry in item[4]}
+            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static 的整批无效；
+            # 取新 qos 后各出口四队列亦须满足新 cap/配额。判定先于工作量
+            # 累加与超限判断：record/replay 按 invalid_input 退出 4，且绝不
+            # 触碰 LOG；rollback 按 reload 分支计费，A/T 取恢复配置的
+            # ACL 规则数/静态绑定数
+            reload_by_port = {entry["port"]: entry for entry in item[5]}
             reload_static_owner = {}
-            for entry in item[4]:
+            for entry in item[5]:
                 for static in entry["static"]:
                     reload_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
@@ -9233,15 +9244,35 @@ def reload_work(
             for key in bound:
                 if key in reload_static_owner:
                     raise InvalidInput("dynamic binding in new static")
-            # A/T 为新 ACL 规则数/新静态绑定数
+            new_qos = item[4]
+            new_cap = new_qos["cap"]
+            if new_qos["drop"] == "tail":
+                for counts in egress_queues.values():
+                    if sum(counts) > new_cap:
+                        raise InvalidInput("queued frames exceed new cap")
+            else:
+                new_weight_total = sum(new_qos["weights"])
+                new_quotas = [
+                    -(-(new_cap * w) // new_weight_total)
+                    for w in new_qos["weights"]
+                ]
+                for counts in egress_queues.values():
+                    if any(counts[q] > new_quotas[q] for q in range(4)):
+                        raise InvalidInput("queued frames exceed new quota")
+            # A/T 为新 ACL 规则数/新静态绑定数；qos 变化另计 N+5，
+            # N 为变更前全部出口排队帧总数
             work += (
                 X
                 + D
                 + P
                 + len(item[3])
-                + sum(len(entry["static"]) for entry in item[4])
+                + sum(len(entry["static"]) for entry in item[5])
                 + 1
             )
+            if new_qos != current_qos:
+                work += (
+                    sum(sum(counts) for counts in egress_queues.values()) + 5
+                )
         else:  # 帧：S 取入端口排队帧数
             work += X + 3 * P + M + R + D + sum(egress_queues[item[2]]) + 1
         if work > limit:
@@ -9299,7 +9330,7 @@ def reload_work(
                     wrr_state[port_name] = [q, rem]
             continue
         if kind in ("reload", "rollback"):
-            _, _, new_age, new_acl, new_security, _ = item
+            _, _, new_age, new_acl, new_qos, new_security, _ = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
             for entry in new_security:
@@ -9307,13 +9338,26 @@ def reload_work(
                     new_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
-            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
-            # 风暴记录全部保留，新规则自下一事件生效
+            # 原子替换 age/acl/qos/security；FDB、绑定、安全状态、队列、
+            # 风暴记录全部保留，新规则自下一事件生效；qos 变化时各口
+            # WRR 重置为 q=3、rem=weights[3]，否则保留
             age = new_age
             acl = new_acl
             R = len(new_acl)
             sec_by_port = new_by_port
             static_owner = new_static_owner
+            if new_qos != current_qos:
+                qos_map = new_qos["map"]
+                cap = new_qos["cap"]
+                sched_mode = new_qos["mode"]
+                weights = new_qos["weights"]
+                drop_mode = new_qos["drop"]
+                weight_total = sum(weights)
+                quotas = [-(-(cap * w) // weight_total) for w in weights]
+                wrr_state = {
+                    port["name"]: [3, weights[3]] for port in ports
+                }
+                current_qos = new_qos
             continue
         _, _, port_name, src, dst, tag, ethertype, priority = item
         if tag is None:
@@ -9423,6 +9467,7 @@ def forward_security(
     drop_mode = qos["drop"]
     weight_total = sum(weights)
     quotas = [-(-(cap * w) // weight_total) for w in weights]  # 上取整
+    current_qos = qos  # 当前生效 qos（解析形）；重载时与新值比较并替换
     sec_by_port = {entry["port"]: entry for entry in security}
     sec_order = [entry["port"] for entry in security]
     static_owner = {}  # (vlan, mac) -> 所属物理口
@@ -9789,7 +9834,7 @@ def forward_security(
                 )
             continue
         if item[0] in ("reload", "rollback"):
-            _, t, new_age, new_acl, new_security, changes = item
+            _, t, new_age, new_acl, new_qos, new_security, changes = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
             for entry in new_security:
@@ -9804,13 +9849,44 @@ def forward_security(
             for key in bound:
                 if key in new_static_owner:
                     raise InvalidInput("dynamic binding in new static")
-            # 原子替换 age/acl/security；FDB、绑定、安全状态、队列、调度、
-            # 风暴记录与计数全部保留，新规则自下一事件生效
+            # 取新 qos 后检查各出口四队列：tail 总数不得超新 cap，
+            # weighted 队列 i 不得超新配额；违者整批无效
+            new_cap = new_qos["cap"]
+            if new_qos["drop"] == "tail":
+                for name in egress_queues:
+                    if sum(len(q) for q in egress_queues[name]) > new_cap:
+                        raise InvalidInput("queued frames exceed new cap")
+            else:
+                new_weight_total = sum(new_qos["weights"])
+                new_quotas = [
+                    -(-(new_cap * w) // new_weight_total)
+                    for w in new_qos["weights"]
+                ]
+                for name in egress_queues:
+                    queues = egress_queues[name]
+                    if any(len(queues[q]) > new_quotas[q] for q in range(4)):
+                        raise InvalidInput("queued frames exceed new quota")
+            # 原子替换 age/acl/qos/security；FDB、绑定、安全状态、队列、
+            # 风暴记录与计数全部保留，新规则自下一事件生效；排队帧保留
+            # 帧号、VLAN 与队列号，不重分类、不丢弃、不改计数；qos 变化时
+            # 各口 WRR 重置为 q=3、rem=weights[3]，否则保留
             age = new_age
             acl = new_acl
             sec_by_port = new_by_port
             sec_order = [entry["port"] for entry in new_security]
             static_owner = new_static_owner
+            if new_qos != current_qos:
+                qos_map = new_qos["map"]
+                cap = new_qos["cap"]
+                sched_mode = new_qos["mode"]
+                weights = new_qos["weights"]
+                drop_mode = new_qos["drop"]
+                weight_total = sum(weights)
+                quotas = [-(-(cap * w) // weight_total) for w in weights]
+                wrr_state = {
+                    port["name"]: [3, weights[3]] for port in ports
+                }
+                current_qos = new_qos
             results.append(
                 {"t": t, "action": item[0], "changes": changes}
             )
