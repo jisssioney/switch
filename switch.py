@@ -23,6 +23,8 @@ PORT_MODES = ("access", "trunk", "hybrid")
 STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
 STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
 STP_EVENT_KEYS = frozenset(("t", "id", "up"))
+LOOP_CONFIG_KEYS = frozenset(("bridges", "links", "vlans"))
+LOOP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up", "vlans"))
 STP_TIMED_ROLES = ("root", "designated")
 FORWARD_STP_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age")
@@ -81,6 +83,10 @@ class InvalidInput(Exception):
 
 
 class StpWorkLimit(Exception):
+    pass
+
+
+class LoopWorkLimit(Exception):
     pass
 
 
@@ -851,6 +857,112 @@ def stp(bridges, links, delay, events, max_work=None):
         if by_id[lid]["up"] != new_up:
             by_id[lid]["up"] = new_up
             cached = None
+        snapshot(t)
+    return {"results": results}
+
+
+def validate_loop_detect_config(config):
+    if not isinstance(config, dict) or frozenset(config) != LOOP_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    vlans = config["vlans"]
+    if (
+        not isinstance(vlans, list)
+        or not vlans
+        or not all(_is_int(v) and 1 <= v <= 4094 for v in vlans)
+        or any(vlans[i] >= vlans[i + 1] for i in range(len(vlans) - 1))
+    ):
+        raise InvalidInput("bad vlans")
+    # 链路项在 stp 契约上增加 vlans：CONFIG.vlans 的严格递增非空子集
+    raw_links = config["links"]
+    if not isinstance(raw_links, list) or any(
+        not isinstance(link, dict) or frozenset(link) != LOOP_LINK_KEYS
+        for link in raw_links
+    ):
+        raise InvalidInput("bad link")
+    stp_config = {
+        "bridges": config["bridges"],
+        "links": [
+            {
+                "id": link["id"],
+                "x": link["x"],
+                "y": link["y"],
+                "cost": link["cost"],
+                "up": link["up"],
+            }
+            for link in raw_links
+        ],
+        "delay": 1,
+    }
+    bridges, links, _delay = validate_stp_config(stp_config)
+    vlan_set = set(vlans)
+    for link, raw_link in zip(links, config["links"]):
+        link_vlans = raw_link["vlans"]
+        if (
+            not isinstance(link_vlans, list)
+            or not link_vlans
+            or not all(_is_int(v) and v in vlan_set for v in link_vlans)
+            or any(
+                link_vlans[i] >= link_vlans[i + 1]
+                for i in range(len(link_vlans) - 1)
+            )
+        ):
+            raise InvalidInput("bad link vlans")
+        link["vlans"] = link_vlans
+    return bridges, links, vlans
+
+
+def loop_detect(links, vlans, events, max_work=None):
+    """逐 VLAN 以桥为并查集顶点做生成树扫描：连接不同分量的 up 链路
+    列入 forwarding 并合并，已连通者列入 blocked。
+
+    每个快照计 V*(L+1)；先以独立链路状态无副作用预演，累计超限即在
+    仿真前报错。t=0 先输出快照，随后每个事件（含幂等事件）应用后输出。
+    """
+    by_id = {link["id"]: link for link in links}
+    V = len(vlans)
+    L = len(links)
+    # 每个快照计 V*(L+1)；快照数为 t=0 加每个事件（含幂等事件）
+    work = (1 + len(events)) * V * (L + 1)
+    if max_work is not None and work > max_work:
+        raise LoopWorkLimit
+
+    ordered_ids = sorted(by_id, key=lambda lid: [ord(char) for char in lid])
+    results = []
+
+    def snapshot(t):
+        entries = []
+        for vlan in vlans:
+            parent = {}
+            for link in links:
+                parent.setdefault(link["x"][0], link["x"][0])
+                parent.setdefault(link["y"][0], link["y"][0])
+
+            def find(name):
+                while parent[name] != name:
+                    parent[name] = parent[parent[name]]
+                    name = parent[name]
+                return name
+
+            forwarding = []
+            blocked = []
+            for lid in ordered_ids:
+                link = by_id[lid]
+                if not link["up"] or vlan not in link["vlans"]:
+                    continue
+                rx, ry = find(link["x"][0]), find(link["y"][0])
+                if rx != ry:
+                    forwarding.append(lid)
+                    parent[rx] = ry
+                else:
+                    blocked.append(lid)
+            entries.append(
+                {"vlan": vlan, "forwarding": forwarding, "blocked": blocked}
+            )
+        results.append({"t": t, "vlans": entries})
+
+    snapshot(0)
+    for t, lid, new_up in events:
+        by_id[lid]["up"] = new_up
         snapshot(t)
     return {"results": results}
 
@@ -12355,6 +12467,7 @@ DEFAULT_MAX_DATA_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 100000
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_STP_WORK = 10000000
+DEFAULT_MAX_LOOP_WORK = 10000000
 DEFAULT_MAX_FDB_WORK = 10000000
 DEFAULT_MAX_FORWARD_WORK = 10000000
 DEFAULT_MAX_FORWARD_STP_WORK = 10000000
@@ -13273,6 +13386,7 @@ SUBCOMMANDS = frozenset((
     "fdb",
     "forward",
     "stp",
+    "loop-detect",
     "forward-stp",
     "stp-check",
     "forward-stp-storm",
@@ -13495,6 +13609,7 @@ def main(argv):
     # MAX_SECURITY_WORK/MAX_SECURITY_WORK(security-check)/MAX_RELOAD_WORK）；
     # 其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
+    is_loop_detect = args[:1] == ["loop-detect"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
     is_forward_stp = args[:1] == ["forward-stp"]
@@ -13515,7 +13630,8 @@ def main(argv):
     is_reload_rollback = args[:1] == ["reload-rollback"]
     allowed_counts = (
         (3, 5, 7, 8)
-        if is_stp or is_fdb or is_forward or is_forward_stp
+        if is_stp or is_loop_detect or is_fdb or is_forward
+        or is_forward_stp
         or is_stp_check
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
         or is_mirror or is_mirror_check
@@ -13528,6 +13644,7 @@ def main(argv):
         "fdb",
         "forward",
         "stp",
+        "loop-detect",
         "forward-stp",
         "stp-check",
         "forward-stp-storm",
@@ -13568,6 +13685,19 @@ def main(argv):
             max_output_bytes,
             max_stp_work,
         ) = parsed + stp_limits[len(parsed):]
+        max_fdb_work = None
+        max_forward_work = None
+        max_forward_stp_work = None
+    elif is_loop_detect:
+        loop_limits = limits + (DEFAULT_MAX_LOOP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_loop_work,
+        ) = parsed + loop_limits[len(parsed):]
+        max_stp_work = None
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
@@ -13836,6 +13966,11 @@ def main(argv):
                 validate_stp_events(data, link_ids),
                 max_stp_work,
             )
+        elif mode == "loop-detect":
+            bridges, links, vlans = validate_loop_detect_config(config)
+            link_ids = {link["id"] for link in links}
+            events = validate_stp_events(data, link_ids)
+            result = loop_detect(links, vlans, events, max_loop_work)
         elif mode == "forward-stp":
             bridges, links, delay, bridge, ports, age = (
                 validate_forward_stp_config(config)
@@ -14463,6 +14598,9 @@ def main(argv):
         return 4
     except StpWorkLimit:
         _fail("stp_work_limit")
+        return 5
+    except LoopWorkLimit:
+        _fail("loop_work_limit")
         return 5
     except FdbWorkLimit:
         _fail("fdb_work_limit")
