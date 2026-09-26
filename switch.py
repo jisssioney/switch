@@ -10819,6 +10819,171 @@ def forward_check(frames, ports, age, max_frame):
     }
 
 
+LINK_STATE_CONFIG_KEYS = frozenset({"ports", "delay"})
+LINK_STATE_PORT_KEYS = frozenset({"name", "rates", "modes"})
+LINK_STATE_EVENT_KEYS = frozenset(
+    {"t", "port", "admin", "peer", "rates", "modes"}
+)
+LINK_STATE_RATES = (10, 100, 1000, 10000)
+LINK_STATE_MODES = ("half", "full")
+
+
+def _validate_link_state_rates(rates):
+    # rates 为 10/100/1000/10000 的非空严格递增子集
+    if not isinstance(rates, list) or not rates:
+        raise InvalidInput("bad rates")
+    if any(
+        not _is_int(rate) or rate not in LINK_STATE_RATES for rate in rates
+    ):
+        raise InvalidInput("bad rates")
+    if any(rates[i] >= rates[i + 1] for i in range(len(rates) - 1)):
+        raise InvalidInput("rates not increasing")
+    return tuple(rates)
+
+
+def _validate_link_state_modes(modes):
+    # modes 为 half/full 的非空子序列（保序、互异、非空）
+    if not isinstance(modes, list) or not modes:
+        raise InvalidInput("bad modes")
+    if any(
+        not isinstance(mode, str) or mode not in LINK_STATE_MODES
+        for mode in modes
+    ):
+        raise InvalidInput("bad modes")
+    if len(set(modes)) != len(modes):
+        raise InvalidInput("bad modes")
+    if list(modes) != sorted(modes, key=LINK_STATE_MODES.index):
+        raise InvalidInput("modes not a subsequence")
+    return tuple(modes)
+
+
+def validate_link_state_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != LINK_STATE_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    delay = config["delay"]
+    if not _is_int(delay) or delay <= 0:
+        raise InvalidInput("bad delay")
+    ports = config["ports"]
+    if not isinstance(ports, list) or not ports:
+        raise InvalidInput("ports must be a non-empty list")
+    names = []
+    result = []
+    for port in ports:
+        if (
+            not isinstance(port, dict)
+            or frozenset(port) != LINK_STATE_PORT_KEYS
+        ):
+            raise InvalidInput("bad port")
+        name = port["name"]
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("bad port name")
+        names.append(name)
+        result.append(
+            (
+                name,
+                _validate_link_state_rates(port["rates"]),
+                _validate_link_state_modes(port["modes"]),
+            )
+        )
+    if len(set(names)) != len(names):
+        raise InvalidInput("ports must be distinct")
+    return result, delay
+
+
+def validate_link_state_events(events, ports):
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    port_set = {name for name, _, _ in ports}
+    result = []
+    prev_t = None
+    for event in events:
+        if (
+            not isinstance(event, dict)
+            or frozenset(event) != LINK_STATE_EVENT_KEYS
+        ):
+            raise InvalidInput("bad event")
+        t = event["t"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        port = event["port"]
+        if not isinstance(port, str) or port not in port_set:
+            raise InvalidInput("unknown port")
+        admin = event["admin"]
+        peer = event["peer"]
+        if not isinstance(admin, bool) or not isinstance(peer, bool):
+            raise InvalidInput("bad admin/peer")
+        rates = _validate_link_state_rates(event["rates"])
+        modes = _validate_link_state_modes(event["modes"])
+        result.append((t, port, admin, peer, rates, modes))
+    return result
+
+
+def link_state(events, ports, delay):
+    caps = {name: (rates, modes) for name, rates, modes in ports}
+    # 生效状态：("down",)/("bad",)/("up", rate, mode)；两状态初始皆 false
+    committed = {name: ("down",) for name, _, _ in ports}
+    pending = {}  # name -> (rate, mode, deadline)；仅 up 目标需协商
+    results = []
+    for t, port, admin, peer, rates, modes in events:
+        # 先完成截止 <= t 的协商
+        for name in [
+            name
+            for name, (_, _, deadline) in pending.items()
+            if deadline <= t
+        ]:
+            rate, mode, _ = pending.pop(name)
+            committed[name] = ("up", rate, mode)
+        # 再替换该口并计算目标
+        if not admin or not peer:
+            target = ("down",)
+        else:
+            local_rates, local_modes = caps[port]
+            common_rates = [r for r in local_rates if r in rates]
+            common_modes = [m for m in local_modes if m in modes]
+            if not common_rates or not common_modes:
+                target = ("bad",)
+            else:
+                target = (
+                    "up",
+                    max(common_rates),
+                    "full" if "full" in common_modes else "half",
+                )
+        current = pending.get(port)
+        effective = (
+            ("up", current[0], current[1])
+            if current is not None
+            else committed[port]
+        )
+        if target == effective:
+            pass  # 未变不重置
+        elif target[0] == "up":
+            # 目标变化即进入 wait 并于 t+delay 完成
+            pending[port] = (target[1], target[2], t + delay)
+        else:
+            # down/bad 立即生效
+            pending.pop(port, None)
+            committed[port] = target
+        current = pending.get(port)
+        if current is not None:
+            state, rate, mode = "wait", None, None
+        else:
+            now = committed[port]
+            if now[0] == "up":
+                state, rate, mode = "up", now[1], now[2]
+            else:
+                state, rate, mode = now[0], None, None
+        results.append(
+            {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
+        )
+    return {"results": results}
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -12384,6 +12549,52 @@ def _cmd_frame_check(
     return 0
 
 
+def _cmd_link_state(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        ports, delay = validate_link_state_config(config)
+        events = validate_link_state_events(events_doc, ports)
+        result = link_state(events, ports, delay)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_forward_check(
     config_path,
     frames_path,
@@ -12555,6 +12766,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_frame_check(args[1], args[2], *limits)
+    if args[:1] == ["link-state"]:
+        # link-state CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_link_state(args[1], args[2], *limits)
     if args[:1] == ["forward-check"]:
         # forward-check CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：可选上限仅 0、2、4 项
