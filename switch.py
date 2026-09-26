@@ -6321,6 +6321,7 @@ DEFAULT_MAX_QOS_WORK = 10000000
 DEFAULT_MAX_SECURITY_WORK = 10000000
 DEFAULT_MAX_RELOAD_WORK = 10000000
 DEFAULT_MAX_RECORD_WORK = 10000000
+DEFAULT_MAX_REPLAY_WORK = 10000000
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
 _READ_CHUNK = 65536
 
@@ -6683,7 +6684,9 @@ def _cmd_record(
     return 0
 
 
-def _cmd_replay(log_path, max_events, max_log_bytes, max_output_bytes):
+def _cmd_replay(
+    log_path, max_events, max_log_bytes, max_output_bytes, max_replay_work
+):
     try:
         with open(log_path, "rb") as handle:
             log_raw = _read_limited(handle, max_log_bytes)
@@ -6705,7 +6708,9 @@ def _cmd_replay(log_path, max_events, max_log_bytes, max_output_bytes):
         if len(log["records"]) > max_events:
             _fail("event_limit")
             return 5
-        result, observer = _run_reload(config, events, True)
+        # 状态语义校验后先按 record 同一公式无副作用预演；首次超限即停止，
+        # 不正式重放，LOG 保持不动
+        result, observer = _run_reload(config, events, True, max_replay_work)
         _verify_records(log, events, observer["items"])
         # 重放重建的 LOG 须与原文件逐字节一致（含 sha256 与 LF）
         rebuilt = _build_log_doc(config, events, observer["items"])
@@ -6719,6 +6724,9 @@ def _cmd_replay(log_path, max_events, max_log_bytes, max_output_bytes):
     except InvalidInput:
         _fail("invalid_input")
         return 4
+    except ReloadWorkLimit:
+        _fail("replay_work_limit")
+        return 5
     sys.stdout.buffer.write(output)
     return 0
 
@@ -6749,14 +6757,20 @@ def main(argv):
             return 2
         return _cmd_record(args[1], args[2], args[3], *limits)
     if args[:1] == ["replay"]:
-        # replay LOG [MAX_EVENTS MAX_LOG_BYTES [MAX_OUTPUT_BYTES]]
-        if len(args) not in (2, 4, 5):
+        # replay LOG [MAX_EVENTS MAX_LOG_BYTES [MAX_OUTPUT_BYTES
+        #   [MAX_REPLAY_WORK]]]
+        if len(args) not in (2, 4, 5, 6):
             _fail("usage")
             return 2
         limits = _parse_limits(
             args[2:],
-            (0, 2, 3),
-            (DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+            (0, 2, 3, 4),
+            (
+                DEFAULT_MAX_EVENTS,
+                DEFAULT_MAX_LOG_BYTES,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_REPLAY_WORK,
+            ),
         )
         if limits is None:
             _fail("usage")
