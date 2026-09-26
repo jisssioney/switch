@@ -27,6 +27,16 @@ STP_TIMED_ROLES = ("root", "designated")
 FORWARD_STP_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age")
 )
+STP_CHECK_CONFIG_KEYS = frozenset(
+    ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
+)
+FRAME_KEYS_STP_CHECK = frozenset(
+    ("t", "port", "src", "dst", "vlan", "length", "fcs", "alignment")
+)
+STP_CHECK_CLASSES = ("good", "runt", "giant", "alignment", "bad_fcs")
+STP_CHECK_MAX_FRAME_MIN = 1518
+STP_CHECK_MAX_FRAME_MAX = 9216
+STP_CHECK_RUNT_LENGTH = 64
 STORM_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm")
 )
@@ -1130,6 +1140,304 @@ def forward_stp_work(bridges, links, ports, events, limit):
             E += 1
         if work > limit:
             raise ForwardStpWorkLimit
+
+
+def validate_stp_check_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != STP_CHECK_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    max_frame = config["max_frame"]
+    if (
+        not _is_int(max_frame)
+        or max_frame < STP_CHECK_MAX_FRAME_MIN
+        or max_frame > STP_CHECK_MAX_FRAME_MAX
+    ):
+        raise InvalidInput("bad max_frame")
+    bridges, links, delay, bridge, ports, age = validate_forward_stp_config(
+        {
+            "bridges": config["bridges"],
+            "links": config["links"],
+            "delay": config["delay"],
+            "bridge": config["bridge"],
+            "ports": config["ports"],
+            "age": config["age"],
+        }
+    )
+    return bridges, links, delay, bridge, ports, age, max_frame
+
+
+def validate_stp_check_events(events, ports, link_ids):
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            t = event["t"]
+            lid = event["id"]
+            up = event["up"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == FRAME_KEYS_STP_CHECK:
+            t = event["t"]
+            port = event["port"]
+            src = event["src"]
+            dst = event["dst"]
+            vlan = event["vlan"]
+            length = event["length"]
+            fcs = event["fcs"]
+            alignment = event["alignment"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not valid_mac(src):
+                raise InvalidInput("bad src")
+            if not valid_dst_mac(dst):
+                raise InvalidInput("bad dst")
+            if vlan is not None and not _valid_vlan_id(vlan):
+                raise InvalidInput("bad vlan")
+            if not _is_int(length) or length < 0:
+                raise InvalidInput("bad length")
+            if not isinstance(fcs, bool):
+                raise InvalidInput("bad fcs")
+            if not isinstance(alignment, bool):
+                raise InvalidInput("bad alignment")
+            result.append(
+                ("frame", t, port, src, dst, vlan, length, fcs, alignment)
+            )
+        else:
+            raise InvalidInput("bad event")
+        prev_t = t
+    return result
+
+
+def forward_stp_check(
+    bridges, links, delay, bridge_name, ports, age, max_frame, events
+):
+    """帧校验与生成树转发联动：转发规则同 forward_stp，帧先分类计数。"""
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    converge(0)
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        if item[0] == "link":
+            _, t, lid, up = item
+            old_forwarding = forwarding_ports(t)
+            by_id[lid]["up"] = up
+            converge(t)
+            for name in old_forwarding - forwarding_ports(t):
+                for key in [k for k, (p, _) in fdb.items() if p == name]:
+                    del fdb[key]
+            continue
+        _, t, port_name, src, dst, tag, length, fcs, alignment = item
+        # 依次分类：runt、giant、alignment、bad_fcs，否则 good
+        if length < STP_CHECK_RUNT_LENGTH:
+            frame_class = "runt"
+        elif length > max_frame:
+            frame_class = "giant"
+        elif not alignment:
+            frame_class = "alignment"
+        elif not fcs:
+            frame_class = "bad_fcs"
+        else:
+            frame_class = "good"
+        port_stats[port_name]["rx"] += 1
+        port_stats[port_name][frame_class] += 1
+        if frame_class != "good":  # 校验失败：不计 VLAN、不学习、不转发
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": frame_class, "action": "drop", "ports": []}
+            )
+            continue
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": "good", "action": "drop", "ports": []}
+            )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        _, state = port_status(port_name, t)
+        egress = []
+        action = "drop"
+        if state == "learning":
+            fdb[(vlan, src)] = [port_name, t]
+        elif state == "forwarding":
+            fdb[(vlan, src)] = [port_name, t]
+            is_group = int(dst[:2], 16) & 1
+            hit = None if is_group else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target = hit[0]
+                target_up, target_state = port_status(target, t)
+                if (
+                    target_up
+                    and target_state == "forwarding"
+                    and vlan in by_name[target]["allowed"]
+                ):
+                    egress = [target]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["name"] != port_name
+                    and port_status(port["name"], t) == (True, "forwarding")
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {"t": t, "class": "good", "action": action, "ports": out_ports}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
 
 
 def validate_forward_stp_storm_config(config):
@@ -7384,16 +7692,17 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_forward_check(args[1], args[2], *limits)
-    # stp/fdb/forward/forward-stp/forward-stp-storm/lag/mirror/acl/qos/
-    # port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
+    # stp/fdb/forward/forward-stp/forward-stp-storm/stp-check/lag/mirror/acl/
+    # qos/port-security/reload 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
     # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_STP_WORK/MAX_STORM_WORK/
-    # MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_ACL_WORK/MAX_QOS_WORK/
-    # MAX_SECURITY_WORK/MAX_RELOAD_WORK）；其余 MODE 仅 0、2、4 项
+    # MAX_FORWARD_STP_WORK/MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_ACL_WORK/
+    # MAX_QOS_WORK/MAX_SECURITY_WORK/MAX_RELOAD_WORK）；其余 MODE 仅 0、2、4 项
     is_stp = args[:1] == ["stp"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
     is_forward_stp = args[:1] == ["forward-stp"]
     is_forward_stp_storm = args[:1] == ["forward-stp-storm"]
+    is_stp_check = args[:1] == ["stp-check"]
     is_lag = args[:1] == ["lag"]
     is_mirror = args[:1] == ["mirror"]
     is_acl = args[:1] == ["acl"]
@@ -7403,8 +7712,8 @@ def main(argv):
     allowed_counts = (
         (3, 5, 7, 8)
         if is_stp or is_fdb or is_forward or is_forward_stp
-        or is_forward_stp_storm or is_lag or is_mirror or is_acl or is_qos
-        or is_security or is_reload
+        or is_forward_stp_storm or is_stp_check or is_lag or is_mirror
+        or is_acl or is_qos or is_security or is_reload
         else (3, 5, 7)
     )
     if len(args) not in allowed_counts or args[0] not in (
@@ -7413,6 +7722,7 @@ def main(argv):
         "stp",
         "forward-stp",
         "forward-stp-storm",
+        "stp-check",
         "lag",
         "mirror",
         "acl",
@@ -7495,6 +7805,19 @@ def main(argv):
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
+    elif is_stp_check:
+        # stp-check 的资源上限沿用 forward-stp
+        stp_check_limits = limits + (DEFAULT_MAX_FORWARD_STP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_forward_stp_work,
+        ) = parsed + stp_check_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
     elif is_lag:
         lag_limits = limits + (DEFAULT_MAX_LAG_WORK,)
         (
@@ -7663,6 +7986,27 @@ def main(argv):
                 ports,
                 age,
                 storm,
+                events,
+            )
+        elif mode == "stp-check":
+            bridges, links, delay, bridge, ports, age, max_frame = (
+                validate_stp_check_config(config)
+            )
+            link_ids = {link["id"] for link in links}
+            events = validate_stp_check_events(data, ports, link_ids)
+            # 全量语义校验后按 forward-stp 原规则无副作用预演；
+            # 超限时不得调用正式仿真
+            forward_stp_work(
+                bridges, links, ports, events, max_forward_stp_work
+            )
+            result = forward_stp_check(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                max_frame,
                 events,
             )
         elif mode == "lag":
