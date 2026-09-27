@@ -12433,6 +12433,83 @@ def forward_stp_check(
     }
 
 
+STP_DECODE_FRAME_KEYS = FRAME_DECODE_FRAME_KEYS  # {"t", "port", "data"}
+
+
+def validate_stp_decode_events(events, ports, link_ids):
+    """stp-decode 事件：原链路项与 t/port/data 原始帧按 t 非降混合。
+
+    链路项沿用 forward-stp；帧子序列复用 forward-decode 全量校验
+    （hex、最短长度、单层 8100、双标签拒绝、MAC 合法性），再在混合序上
+    重放跨类型的 t 非降。
+    """
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    frame_docs = []
+    frame_positions = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_DECODE_FRAME_KEYS:
+            frame_docs.append(event)
+            frame_positions.add(index)
+        elif keys != STP_EVENT_KEYS:
+            raise InvalidInput("bad event")
+    # 帧子序列的外壳（hex、8100、双标签）与 MAC 规则同 forward-decode
+    checked_frames = validate_forward_decode_frames(frame_docs, ports)
+    raw_by_pos = dict(zip(sorted(frame_positions), checked_frames))
+    result = []
+    prev_t = None
+    for index, event in enumerate(events):
+        t = event["t"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:  # 链路与帧混合序上 t 非降
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if index in raw_by_pos:
+            _, port_name, raw = raw_by_pos[index]
+            result.append(("frame", t, port_name, raw))
+        else:
+            lid = event["id"]
+            up = event["up"]
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+    return result
+
+
+def stp_decode(
+    bridges, links, delay, bridge_name, ports, age, max_frame, events
+):
+    # 原始帧按 frame-decode 规则解码为 stp-check 的九元组事件序
+    # （alignment 恒真，分类退化为 runt/giant/bad_fcs/good），链路项原样
+    # 保留；转发、学习与统计随后完全沿用 stp-check
+    raw_frames = [
+        (item[1], item[2], item[3]) for item in events if item[0] == "frame"
+    ]
+    decoded_frames = _decode_raw_frames(raw_frames)
+    decoded = []
+    frame_index = 0
+    for item in events:
+        if item[0] == "link":
+            decoded.append(item)
+        else:
+            t, port_name, src, dst, vlan, length, fcs, alignment = (
+                decoded_frames[frame_index]
+            )
+            frame_index += 1
+            decoded.append(
+                ("frame", t, port_name, src, dst, vlan, length, fcs, alignment)
+            )
+    return forward_stp_check(
+        bridges, links, delay, bridge_name, ports, age, max_frame, decoded
+    )
+
+
 STORM_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm",
      "max_frame")
@@ -14250,6 +14327,65 @@ def _cmd_forward_decode(
     return 0
 
 
+def _cmd_stp_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_forward_stp_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 配置键为 stp-check 七键，前六项同 forward-stp、末项同 forward-decode
+        bridges, links, delay, bridge, ports, age, max_frame = (
+            validate_stp_check_config(config)
+        )
+        link_ids = {link["id"] for link in links}
+        events = validate_stp_decode_events(events_doc, ports, link_ids)
+        # 资源、工作量契约同 forward-stp：全量校验后无副作用预演，
+        # 超限不正式仿真；原始帧与解码帧一一对应，帧数一致
+        forward_stp_work(bridges, links, ports, events, max_forward_stp_work)
+        result = stp_decode(
+            bridges, links, delay, bridge, ports, age, max_frame, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except ForwardStpWorkLimit:
+        _fail("forward_stp_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_forward(
     config_path,
     events_path,
@@ -14317,6 +14453,7 @@ SUBCOMMANDS = frozenset((
     "link-state",
     "forward-check",
     "forward-decode",
+    "stp-decode",
     "link-forward",
     "fdb",
     "forward",
@@ -14575,6 +14712,28 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_forward_decode(args[1], args[2], *limits)
+    if args[:1] == ["stp-decode"]:
+        # stp-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_FORWARD_STP_WORK]]]：
+        #   签名、资源、工作量与错误契约同 forward-stp，可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_FORWARD_STP_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_stp_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
