@@ -11148,6 +11148,104 @@ def frame_check(frames, ports, max_frame):
     }
 
 
+FRAME_DECODE_FRAME_KEYS = frozenset({"t", "port", "data"})
+FRAME_DECODE_DATA_RE = re.compile(r"[0-9a-f]+")
+FRAME_DECODE_MIN_BYTES = 18
+FRAME_DECODE_MIN_TAGGED_BYTES = 22
+FRAME_DECODE_TAG = b"\x81\x00"
+
+
+def validate_frame_decode_frames(frames, ports):
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    port_set = set(ports)
+    result = []
+    prev_t = None
+    for frame in frames:
+        if (
+            not isinstance(frame, dict)
+            or frozenset(frame) != FRAME_DECODE_FRAME_KEYS
+        ):
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        data = frame["data"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in port_set:
+            raise InvalidInput("unknown port")
+        if (
+            not isinstance(data, str)
+            or len(data) % 2 != 0
+            or FRAME_DECODE_DATA_RE.fullmatch(data) is None
+        ):
+            raise InvalidInput("bad data")
+        raw = bytes.fromhex(data)
+        if len(raw) < FRAME_DECODE_MIN_BYTES:
+            raise InvalidInput("frame too short")
+        if raw[12:14] == FRAME_DECODE_TAG:
+            # 单层 802.1Q：总长须容纳标签，且标签后不得再为 8100（双标签）
+            if len(raw) < FRAME_DECODE_MIN_TAGGED_BYTES:
+                raise InvalidInput("tagged frame too short")
+            if raw[16:18] == FRAME_DECODE_TAG:
+                raise InvalidInput("double tag")
+        result.append((t, port, raw))
+    return result
+
+
+def _format_mac(octets):
+    return ":".join("%02x" % byte for byte in octets)
+
+
+def frame_decode(frames, max_frame):
+    results = []
+    for t, port, raw in frames:
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            priority = tci >> 13
+            dei = (tci >> 12) & 1
+            vlan = tci & 0x0FFF
+            ethertype_offset = 16
+        else:
+            priority = None
+            dei = None
+            vlan = None
+            ethertype_offset = 12
+        ethertype = (raw[ethertype_offset] << 8) | raw[ethertype_offset + 1]
+        body = raw[:-4]
+        payload = raw[ethertype_offset + 2 : -4].hex()
+        fcs = raw[-4:].hex()
+        if len(raw) < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif len(raw) > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(4, "little"):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        results.append(
+            {
+                "t": t,
+                "port": port,
+                "class": cls,
+                "dst": dst,
+                "src": src,
+                "vlan": vlan,
+                "priority": priority,
+                "dei": dei,
+                "ethertype": ethertype,
+                "payload": payload,
+                "fcs": fcs,
+            }
+        )
+    return {"results": results}
+
+
 FORWARD_CHECK_CONFIG_KEYS = frozenset({"ports", "age", "max_frame"})
 FORWARD_CHECK_FRAME_KEYS = frozenset(
     {"t", "port", "src", "dst", "vlan", "length", "fcs", "alignment"}
@@ -13835,6 +13933,53 @@ def _cmd_frame_check(
     return 0
 
 
+def _cmd_frame_decode(
+    config_path,
+    frames_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、FRAMES 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            frames_path, "rb"
+        ) as frames_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            frames_raw = _read_limited(frames_handle, max_data_bytes)
+            if frames_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        frames_doc = parse_json(frames_raw)
+        # 帧数上界在解析后、语义校验前判定；FRAMES 非数组仍按非法输入处理
+        if isinstance(frames_doc, list) and len(frames_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 配置契约与 frame-check 一致，复用其全量校验
+        ports, max_frame = validate_frame_check_config(config)
+        frames = validate_frame_decode_frames(frames_doc, ports)
+        result = frame_decode(frames, max_frame)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_state(
     config_path,
     events_path,
@@ -13996,6 +14141,7 @@ SUBCOMMANDS = frozenset((
     "config-export",
     "config-import",
     "frame-check",
+    "frame-decode",
     "link-state",
     "forward-check",
     "link-forward",
@@ -14172,6 +14318,27 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_frame_check(args[1], args[2], *limits)
+    if args[:1] == ["frame-decode"]:
+        # frame-decode CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：参数、资源与错误契约同
+        #   frame-check，可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_frame_decode(args[1], args[2], *limits)
     if args[:1] == ["link-state"]:
         # link-state CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_WORK]]]：可选上限仅
