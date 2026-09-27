@@ -12849,6 +12849,7 @@ EVENT_KIND_BY_KEYS = {
     STP_EVENT_KEYS: "link",
     MEMBER_EVENT_KEYS: "member",
     SERVICE_EVENT_KEYS: "service",
+    FRAME_KEYS_V2: "frame",
     FRAME_KEYS_ACL: "frame",
     QOS_CHECK_FRAME_KEYS: "frame",
     RELOAD_EVENT_KEYS: "reload",
@@ -12870,7 +12871,7 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、security-check 或 port-security。"""
+    link-state、forward-static、security-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -12881,6 +12882,8 @@ def _log_mode(config):
             return "link_forward"
         if keys == LINK_STATE_CONFIG_KEYS:
             return "link_state"
+        if keys == FORWARD_STATIC_CONFIG_KEYS:
+            return "forward_static"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13023,6 +13026,37 @@ def _run_link_state(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_forward_static(config, events, observe, max_work=None):
+    """record/replay forward-static 模式：校验 forward-static 配置与帧并
+    执行仿真。
+
+    语义同 forward-static 子命令；max_work 非 None 时（record/replay）
+    全量语义校验后先按 forward-static 公式（逐帧累计 K+P+1，K 为老化前
+    静态及动态表项数，P 为端口数）无副作用预演，首次超过即抛
+    ForwardWorkLimit，不正式转发。返回 (forward-static 结果 dict,
+    observer 或 None)；每帧恒 applied，version 恒 0，output 为对应
+    results 项。
+    """
+    ports, age, static = validate_forward_static_config(config)
+    frames = validate_frames_v2(events, ports)
+    if max_work is not None:
+        # 与 forward-static 入口同一公式：独立预置静态项的 FDB，无副作用
+        forward_static_work(frames, ports, age, static, max_work)
+    result = forward_static(frames, ports, age, static)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
+    return result, observer
+
+
 def _run_security_check(config, events, observe, max_work=None):
     """record/replay security-check 模式：校验 security-check 配置与事件并
     执行仿真。
@@ -13100,7 +13134,8 @@ def _build_log_doc(config, events, items):
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，security-check 模式仅 applied 链路/成员项加 1
-    # （帧与 service 恒 applied 但不计）
+    # （帧与 service 恒 applied 但不计），forward-static 模式帧恒 applied
+    # 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -13342,6 +13377,10 @@ def _cmd_record(
             result, observer = _run_link_state(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_static":
+            result, observer = _run_forward_static(
+                config, events, True, max_record_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_record_work
@@ -13369,6 +13408,7 @@ def _cmd_record(
         ReloadWorkLimit,
         StpWorkLimit,
         LoopWorkLimit,
+        ForwardWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
@@ -13436,6 +13476,10 @@ def _cmd_replay(
             result, observer = _run_link_state(
                 config, events, True, max_replay_work
             )
+        elif mode == "forward_static":
+            result, observer = _run_forward_static(
+                config, events, True, max_replay_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_replay_work
@@ -13461,6 +13505,7 @@ def _cmd_replay(
         ReloadWorkLimit,
         StpWorkLimit,
         LoopWorkLimit,
+        ForwardWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
