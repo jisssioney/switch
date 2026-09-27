@@ -12433,6 +12433,85 @@ def forward_stp_check(
     }
 
 
+def validate_stp_decode_events(events, ports, link_ids):
+    # 链路项与 forward-stp 一致；帧项为 t/port/data 原始帧，hex、单层
+    # 8100、双标签拒绝与 MAC 契约同 forward-decode，全量校验
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            t = event["t"]
+            lid = event["id"]
+            up = event["up"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == FRAME_DECODE_FRAME_KEYS:
+            t = event["t"]
+            port = event["port"]
+            data = event["data"]
+            if not _is_int(t) or t < 0:
+                raise InvalidInput("bad t")
+            if prev_t is not None and t < prev_t:
+                raise InvalidInput("t not monotonic")
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if (
+                not isinstance(data, str)
+                or len(data) % 2 != 0
+                or FRAME_DECODE_DATA_RE.fullmatch(data) is None
+            ):
+                raise InvalidInput("bad data")
+            raw = bytes.fromhex(data)
+            if len(raw) < FRAME_DECODE_MIN_BYTES:
+                raise InvalidInput("frame too short")
+            if raw[12:14] == FRAME_DECODE_TAG:
+                # 单层 802.1Q：总长须容纳标签，且标签后不得再为 8100（双标签）
+                if len(raw) < FRAME_DECODE_MIN_TAGGED_BYTES:
+                    raise InvalidInput("tagged frame too short")
+                if raw[16:18] == FRAME_DECODE_TAG:
+                    raise InvalidInput("double tag")
+            dst = raw[0:6]
+            src = raw[6:12]
+            if not any(dst):  # 目的 MAC 全零非法
+                raise InvalidInput("bad dst")
+            if not any(src) or src[0] & 1:  # 源 MAC 须为非零单播
+                raise InvalidInput("bad src")
+            result.append(("frame", t, port, raw))
+        else:
+            raise InvalidInput("bad event")
+        prev_t = t
+    return result
+
+
+def stp_decode(bridges, links, delay, bridge_name, ports, age, max_frame,
+               events):
+    # 帧项按 forward-decode 规则解码为 forward_stp_check 的九元组帧项
+    # （alignment 恒真，分类退化为 runt/giant/bad_fcs/good，alignment
+    # 计数恒 0），链路项原样；仿真与输出契约完全沿用 forward_stp_check
+    raw_frames = [item[1:] for item in events if item[0] == "frame"]
+    decoded_frames = iter(_decode_raw_frames(raw_frames))
+    decoded = [
+        item if item[0] == "link" else ("frame",) + next(decoded_frames)
+        for item in events
+    ]
+    return forward_stp_check(
+        bridges, links, delay, bridge_name, ports, age, max_frame, decoded
+    )
+
+
 STORM_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm",
      "max_frame")
@@ -14325,6 +14404,7 @@ SUBCOMMANDS = frozenset((
     "loop-detect",
     "forward-stp",
     "stp-check",
+    "stp-decode",
     "forward-stp-storm",
     "storm-check",
     "lag",
@@ -14597,12 +14677,14 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_link_forward(args[1], args[2], *limits)
-    # stp/fdb/forward/forward-static/forward-stp/stp-check/forward-stp-storm/
-    # storm-check/lag/lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/
-    # port-security/security-check/reload/reload-rollback 额外允许 5 项
+    # stp/fdb/forward/forward-static/forward-stp/stp-check/stp-decode/
+    # forward-stp-storm/storm-check/lag/lag-check/mirror/mirror-check/acl/
+    # acl-check/qos/qos-check/port-security/security-check/reload/
+    # reload-rollback 额外允许 5 项
     # 上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/
     # MAX_FORWARD_WORK(forward-static)/MAX_FORWARD_STP_WORK/
-    # MAX_FORWARD_STP_WORK(stp-check)/MAX_STORM_WORK/MAX_STORM_WORK/
+    # MAX_FORWARD_STP_WORK(stp-check)/MAX_FORWARD_STP_WORK(stp-decode)/
+    # MAX_STORM_WORK/MAX_STORM_WORK/
     # MAX_LAG_WORK/MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_MIRROR_WORK/
     # MAX_ACL_WORK/MAX_ACL_WORK/MAX_QOS_WORK/MAX_QOS_WORK(qos-check)/
     # MAX_SECURITY_WORK/MAX_SECURITY_WORK(security-check)/MAX_RELOAD_WORK）；
@@ -14614,6 +14696,7 @@ def main(argv):
     is_forward_static = args[:1] == ["forward-static"]
     is_forward_stp = args[:1] == ["forward-stp"]
     is_stp_check = args[:1] == ["stp-check"]
+    is_stp_decode = args[:1] == ["stp-decode"]
     is_forward_stp_storm = args[:1] == ["forward-stp-storm"]
     is_storm_check = args[:1] == ["storm-check"]
     is_lag = args[:1] == ["lag"]
@@ -14634,6 +14717,7 @@ def main(argv):
         or is_forward_static
         or is_forward_stp
         or is_stp_check
+        or is_stp_decode
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
         or is_mirror or is_mirror_check
         or is_acl or is_acl_check or is_qos or is_qos_check
@@ -14649,6 +14733,7 @@ def main(argv):
         "loop-detect",
         "forward-stp",
         "stp-check",
+        "stp-decode",
         "forward-stp-storm",
         "storm-check",
         "lag",
@@ -14762,6 +14847,19 @@ def main(argv):
             max_output_bytes,
             max_forward_stp_work,
         ) = parsed + stp_check_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
+    elif is_stp_decode:
+        # stp-decode 沿用 forward-stp 的资源上限与工作量预演
+        stp_decode_limits = limits + (DEFAULT_MAX_FORWARD_STP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_forward_stp_work,
+        ) = parsed + stp_decode_limits[len(parsed):]
         max_stp_work = None
         max_fdb_work = None
         max_forward_work = None
@@ -15016,6 +15114,26 @@ def main(argv):
                 bridges, links, ports, events, max_forward_stp_work
             )
             result = forward_stp_check(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                max_frame,
+                events,
+            )
+        elif mode == "stp-decode":
+            bridges, links, delay, bridge, ports, age, max_frame = (
+                validate_stp_check_config(config)
+            )
+            link_ids = {link["id"] for link in links}
+            events = validate_stp_decode_events(data, ports, link_ids)
+            # 全量语义校验后按 forward-stp 原规则无副作用预演；超限不正式仿真
+            forward_stp_work(
+                bridges, links, ports, events, max_forward_stp_work
+            )
+            result = stp_decode(
                 bridges,
                 links,
                 delay,
