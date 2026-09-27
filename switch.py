@@ -12855,6 +12855,7 @@ EVENT_KIND_BY_KEYS = {
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
     LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
+    FRAME_KEYS_V2: "frame",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -12870,7 +12871,7 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、security-check 或 port-security。"""
+    link-state、security-check、forward-static 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -12883,6 +12884,8 @@ def _log_mode(config):
             return "link_state"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
+        if keys == FORWARD_STATIC_CONFIG_KEYS:
+            return "forward_static"
     return "security"
 
 
@@ -13087,6 +13090,31 @@ def _run_security_check(config, events, observe, max_work=None):
         check_events,
         observer=observer,
     )
+    return result, observer
+
+
+def _run_forward_static(config, events, observe, max_work=None):
+    """record/replay forward-static 模式：校验 forward-static 配置与帧并转发。
+
+    语义同 forward-static 子命令；max_work 非 None 时全量语义校验后先按
+    forward-static 公式（逐帧累计 K+P+1，K 为老化前静态及动态表项数，
+    P 为端口数）无副作用预演，首次超过即抛 ForwardWorkLimit，不正式
+    转发。forward_static 签名不变，observer 项由结果重建：每帧
+    applied=True、output 为对应 results 项。返回 (forward-static 结果
+    dict, observer 或 None)。
+    """
+    ports, age, static = validate_forward_static_config(config)
+    frames = validate_frames_v2(events, ports)
+    if max_work is not None:
+        # 与 forward-static 入口同一公式：独立预置静态项的 FDB，无副作用
+        forward_static_work(frames, ports, age, static, max_work)
+    observer = {} if observe else None
+    result = forward_static(frames, ports, age, static)
+    if observer is not None:  # record：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {"kind": "frame", "t": frame[0], "applied": True, "output": item}
+            for frame, item in zip(frames, result["results"])
+        ]
     return result, observer
 
 
@@ -13346,6 +13374,10 @@ def _cmd_record(
             result, observer = _run_security_check(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_static":
+            result, observer = _run_forward_static(
+                config, events, True, max_record_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_record_work
@@ -13372,6 +13404,7 @@ def _cmd_record(
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
+        ForwardWorkLimit,
     ):
         _fail("record_work_limit")
         return 5
@@ -13440,6 +13473,10 @@ def _cmd_replay(
             result, observer = _run_security_check(
                 config, events, True, max_replay_work
             )
+        elif mode == "forward_static":
+            result, observer = _run_forward_static(
+                config, events, True, max_replay_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_replay_work
@@ -13464,6 +13501,7 @@ def _cmd_replay(
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
+        ForwardWorkLimit,
     ):
         _fail("replay_work_limit")
         return 5
