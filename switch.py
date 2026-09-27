@@ -10239,7 +10239,7 @@ def forward_security(
 
 def forward_security_check(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
-    acl, qos, security, max_frame, events
+    acl, qos, security, max_frame, events, observer=None
 ):
     window = storm["window"]
     limits = storm["limits"]
@@ -10266,6 +10266,8 @@ def forward_security_check(
     bound = {}  # (vlan, mac) -> 动态绑定的物理口（不老化、状态变化不清除）
     dynamic = {entry["port"]: set() for entry in security}  # 口 -> 动态绑定集
     violations = {entry["port"]: 0 for entry in security}
+    if observer is not None:  # record：逐事件记录 applied 与新增输出
+        observer["items"] = []
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
     lag_by_name = {lag["name"]: lag for lag in lags}
@@ -10542,7 +10544,8 @@ def forward_security_check(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            link_changed = by_id[lid]["up"] != up
+            if link_changed:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
@@ -10550,12 +10553,23 @@ def forward_security_check(
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
                     clear_queue(name)  # 离开 forwarding：清队
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": link_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "member":
             _, t, member, up = item
+            member_changed = member_up[member] != up
             member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
             if not up:  # 成员下线即非 forwarding：清队
                 clear_queue(member)
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "member", "t": t, "applied": member_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "service":
             _, t, port_name, count = item
@@ -10612,6 +10626,11 @@ def forward_security_check(
                 {"t": t, "port": port_name, "frames": frames,
                  "mirrors": mirrors}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "service", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         _, t, port_name, src, dst, tag, ethertype, priority, length, fcs, alignment = item
         fid = frame_seq
@@ -10638,6 +10657,11 @@ def forward_security_check(
                 {"t": t, "class": cls, "action": "drop", "ports": [],
                  "dropped": [], "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         if tag is None:
             vlan = by_name[port_name]["pvid"]
@@ -10654,6 +10678,11 @@ def forward_security_check(
                 {"t": t, "class": cls, "action": "drop", "ports": [],
                  "dropped": [], "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
         acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
@@ -10670,6 +10699,11 @@ def forward_security_check(
                 {"t": t, "class": cls, "action": "drop", "ports": [],
                  "dropped": [], "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         ingress_lag = lag_of.get(port_name)
         if ingress_lag is not None:
@@ -10691,6 +10725,11 @@ def forward_security_check(
                 {"t": t, "class": cls, "action": "drop", "ports": [],
                  "dropped": [], "mirrors": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # 入端口命中 sources 则复制；remark 后副本携带新 VLAN（镜像不入队）
         ingress_copy = None
@@ -10773,6 +10812,11 @@ def forward_security_check(
              "dropped": dropped,
              "mirrors": [ingress_copy] if ingress_copy is not None else []}
         )
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True,
+                 "output": results[-1]}
+            )
     return {
         "results": results,
         "ports": [
@@ -12615,6 +12659,7 @@ EVENT_KIND_BY_KEYS = {
     MEMBER_EVENT_KEYS: "member",
     SERVICE_EVENT_KEYS: "service",
     FRAME_KEYS_ACL: "frame",
+    QOS_CHECK_FRAME_KEYS: "frame",
     RELOAD_EVENT_KEYS: "reload",
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
@@ -12634,7 +12679,7 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state 或 port-security。"""
+    link-state、security-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -12645,6 +12690,8 @@ def _log_mode(config):
             return "link_forward"
         if keys == LINK_STATE_CONFIG_KEYS:
             return "link_state"
+        if keys == SECURITY_CHECK_CONFIG_KEYS:
+            return "security_check"
     return "security"
 
 
@@ -12785,6 +12832,73 @@ def _run_link_state(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_security_check(config, events, observe, max_work=None):
+    """record/replay security-check 模式：校验 security-check 配置与事件并
+    执行仿真。
+
+    语义同 security-check 子命令；max_work 非 None 时（record）全量语义
+    校验后先按 security-check 公式无副作用预演，首次超过即抛
+    SecurityWorkLimit，不正式仿真。返回 (security-check 结果 dict,
+    observer 或 None)。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        security,
+        max_frame,
+    ) = validate_security_check_config(config)
+    link_ids = {link["id"] for link in links}
+    check_events = validate_security_check_events(
+        events, ports, link_ids, lags
+    )
+    if max_work is not None:
+        # 与 security-check 入口同一公式：独立链路副本与空状态，无副作用
+        security_check_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            qos,
+            security,
+            max_frame,
+            check_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = forward_security_check(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        security,
+        max_frame,
+        check_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
@@ -12794,7 +12908,8 @@ def _build_log_doc(config, events, items):
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1
+    # 仅 applied 项加 1，security-check 模式仅 applied 链路/成员项加 1
+    # （帧与 service 恒 applied 但不计）
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -12808,6 +12923,9 @@ def _build_log_doc(config, events, items):
                 version += 1
         elif mode == "link_state":
             if observed["applied"]:
+                version += 1
+        elif mode == "security_check":
+            if kind in ("link", "member") and observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
             version += 1
@@ -12934,6 +13052,9 @@ def _verify_records(log, events, items):
         elif mode == "link_state":
             if observed["applied"]:
                 version += 1
+        elif mode == "security_check":
+            if kind in ("link", "member") and observed["applied"]:
+                version += 1
         elif kind in ("reload", "rollback"):
             version += 1
         if record["t"] != event["t"]:
@@ -13030,6 +13151,10 @@ def _cmd_record(
             result, observer = _run_link_state(
                 config, events, True, max_record_work
             )
+        elif mode == "security_check":
+            result, observer = _run_security_check(
+                config, events, True, max_record_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_record_work
@@ -13055,6 +13180,7 @@ def _cmd_record(
         LoopWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
+        SecurityWorkLimit,
     ):
         _fail("record_work_limit")
         return 5
@@ -13108,6 +13234,10 @@ def _cmd_replay(
             result, observer = _run_link_state(
                 config, events, True, max_replay_work
             )
+        elif mode == "security_check":
+            result, observer = _run_security_check(
+                config, events, True, max_replay_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_replay_work
@@ -13131,6 +13261,7 @@ def _cmd_replay(
         LoopWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
+        SecurityWorkLimit,
     ):
         _fail("replay_work_limit")
         return 5
