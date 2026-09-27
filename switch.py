@@ -13128,7 +13128,8 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、forward-static、security-check 或 port-security。"""
+    link-state、forward-static、forward-decode、stp-decode、security-check
+    或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13143,6 +13144,8 @@ def _log_mode(config):
             return "forward_static"
         if keys == FORWARD_CHECK_CONFIG_KEYS:
             return "forward_decode"
+        if keys == STP_CHECK_CONFIG_KEYS:
+            return "stp_decode"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13349,6 +13352,57 @@ def _run_forward_decode(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_stp_decode(config, events, observe, max_work=None):
+    """record/replay stp-decode 模式：校验 stp-decode 配置与混合事件并执行。
+
+    语义同 stp-decode 子命令（CONFIG、EVENTS 校验与转发行为完全沿用）；
+    max_work 非 None 时（record/replay）全量语义校验后先按 forward-stp
+    公式（forward_stp_work；坏帧、准入拒绝、幂等链路均计费）无副作用
+    预演，首次超过即抛 ForwardStpWorkLimit，不正式仿真。返回 (stp-decode
+    结果 dict, observer 或 None)。帧项恒 applied、output 为对应 results
+    项（键序 t,class,action,ports）；链路项仅 up 实际改变才 applied、
+    output 恒 None。
+    """
+    bridges, links, delay, bridge, ports, age, max_frame = (
+        validate_stp_check_config(config)
+    )
+    link_ids = {link["id"] for link in links}
+    checked = validate_stp_decode_events(events, ports, link_ids)
+    if max_work is not None:
+        # 与 stp-decode 入口同一公式：仅跟踪 up 链路数与帧数，无副作用
+        forward_stp_work(bridges, links, ports, checked, max_work)
+    result = stp_decode(
+        bridges, links, delay, bridge, ports, age, max_frame, checked
+    )
+    observer = {} if observe else None
+    if observer is not None:
+        # results 仅逐帧产生且与帧事件同序；链路项不产生结果（output=None）
+        frame_outputs = iter(result["results"])
+        sim_up = {link["id"]: link["up"] for link in links}
+        items = []
+        for item in checked:
+            if item[0] == "link":
+                _, t, lid, up = item
+                applied = sim_up[lid] != up  # up 实际改变才 applied
+                if applied:
+                    sim_up[lid] = up
+                items.append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
+            else:
+                items.append(
+                    {
+                        "kind": "frame",
+                        "t": item[1],
+                        "applied": True,
+                        "output": next(frame_outputs),
+                    }
+                )
+        observer["items"] = items
+    return result, observer
+
+
 def _run_security_check(config, events, observe, max_work=None):
     """record/replay security-check 模式：校验 security-check 配置与事件并
     执行仿真。
@@ -13424,10 +13478,11 @@ def _build_log_doc(config, events, items):
     records = []
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
-    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1，security-check 模式仅 applied 链路/成员项加 1
-    # （帧与 service 恒 applied 但不计），forward-static 模式帧恒 applied
-    # 且 version 恒 0
+    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），stp-decode
+    # 模式同样仅 applied 链路项加 1（帧项恒 applied、output 为对应结果
+    # 但不计），链路状态模式仅 applied 项加 1，security-check 模式仅
+    # applied 链路/成员项加 1（帧与 service 恒 applied 但不计），
+    # forward-static 模式帧恒 applied 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -13436,7 +13491,7 @@ def _build_log_doc(config, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode == "link_forward":
+        elif mode in ("link_forward", "stp_decode"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -13564,7 +13619,7 @@ def _verify_records(log, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode == "link_forward":
+        elif mode in ("link_forward", "stp_decode"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -13677,6 +13732,10 @@ def _cmd_record(
             result, observer = _run_forward_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "stp_decode":
+            result, observer = _run_stp_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_record_work
@@ -13705,6 +13764,7 @@ def _cmd_record(
         StpWorkLimit,
         LoopWorkLimit,
         ForwardWorkLimit,
+        ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
@@ -13780,6 +13840,10 @@ def _cmd_replay(
             result, observer = _run_forward_decode(
                 config, events, True, max_replay_work
             )
+        elif mode == "stp_decode":
+            result, observer = _run_stp_decode(
+                config, events, True, max_replay_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_replay_work
@@ -13806,6 +13870,7 @@ def _cmd_replay(
         StpWorkLimit,
         LoopWorkLimit,
         ForwardWorkLimit,
+        ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
