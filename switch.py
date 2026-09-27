@@ -11183,7 +11183,9 @@ def validate_link_state_events(events, ports):
     return result
 
 
-def link_state(events, ports, delay):
+def link_state(events, ports, delay, observer=None):
+    if observer is not None:  # record：逐事件记录 applied 与对应 results 项
+        observer["items"] = []
     caps = {name: (rates, modes) for name, rates, modes in ports}
     # 生效状态：("down",)/("bad",)/("up", rate, mode)；两状态初始皆 false
     committed = {name: ("down",) for name, _, _ in ports}
@@ -11220,14 +11222,16 @@ def link_state(events, ports, delay):
             else committed[port]
         )
         if target == effective:
-            pass  # 未变不重置
+            applied = False  # 未变不重置
         elif target[0] == "up":
             # 目标变化即进入 wait 并于 t+delay 完成
             pending[port] = (target[1], target[2], t + delay)
+            applied = True
         else:
             # down/bad 立即生效
             pending.pop(port, None)
             committed[port] = target
+            applied = True
         current = pending.get(port)
         if current is not None:
             state, rate, mode = "wait", None, None
@@ -11240,6 +11244,11 @@ def link_state(events, ports, delay):
         results.append(
             {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
         )
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "link", "t": t, "applied": applied,
+                 "output": results[-1]}
+            )
     return {"results": results}
 
 
@@ -12598,11 +12607,13 @@ def _event_kind(event):
 
 
 def _log_mode(config):
-    """record/replay 按 config 形状选模式：loop-detect、link-forward 或 port-security。"""
+    """record/replay 按 config 形状选模式：loop-detect、link-state、link-forward 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == LOOP_CONFIG_KEYS:
             return "loop"
+        if keys == LINK_STATE_CONFIG_KEYS:
+            return "link_state"
         if keys == LINK_FORWARD_CONFIG_KEYS:
             return "link_forward"
     return "security"
@@ -12710,6 +12721,24 @@ def _run_link_forward(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_link_state(config, events, observe, max_work=None):
+    """record/replay 链路状态协商模式：校验 link-state 配置与事件并执行仿真。
+
+    语义同 link-state 子命令；max_work 非 None 时全量语义校验后先按
+    link-state 公式（每事件处理到期项前以 pending 数 Q 累计 Q+1）无副作用
+    预演，首次超过即抛 LinkWorkLimit，不正式仿真。返回 (link-state 结果
+    dict, observer 或 None)。
+    """
+    ports, delay = validate_link_state_config(config)
+    ls_events = validate_link_state_events(events, ports)
+    if max_work is not None:
+        # 与 link-state 入口同一公式：独立 committed/pending 状态，无副作用
+        link_state_work(ls_events, ports, delay, max_work)
+    observer = {} if observe else None
+    result = link_state(ls_events, ports, delay, observer=observer)
+    return result, observer
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
@@ -12718,7 +12747,8 @@ def _build_log_doc(config, events, items):
     records = []
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，环路模式链路 up 实际改变（applied）才加 1，链路协商
-    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计）
+    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态协商
+    # 模式仅 applied（目标相对处理前改变）加 1
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -12729,6 +12759,9 @@ def _build_log_doc(config, events, items):
                 version += 1
         elif mode == "link_forward":
             if kind == "link" and observed["applied"]:
+                version += 1
+        elif mode == "link_state":
+            if observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
             version += 1
@@ -12852,6 +12885,9 @@ def _verify_records(log, events, items):
         elif mode == "link_forward":
             if kind == "link" and observed["applied"]:
                 version += 1
+        elif mode == "link_state":
+            if observed["applied"]:
+                version += 1
         elif kind in ("reload", "rollback"):
             version += 1
         if record["t"] != event["t"]:
@@ -12936,6 +12972,10 @@ def _cmd_record(
             result, observer = _run_loop_detect(
                 config, events, True, max_record_work
             )
+        elif mode == "link_state":
+            result, observer = _run_link_state(
+                config, events, True, max_record_work
+            )
         elif mode == "link_forward":
             result, observer = _run_link_forward(
                 config, events, True, max_record_work
@@ -12959,7 +12999,8 @@ def _cmd_record(
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit):
+    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit,
+            LinkWorkLimit):
         _fail("record_work_limit")
         return 5
     except OSError:
@@ -13000,6 +13041,10 @@ def _cmd_replay(
             result, observer = _run_loop_detect(
                 config, events, True, max_replay_work
             )
+        elif mode == "link_state":
+            result, observer = _run_link_state(
+                config, events, True, max_replay_work
+            )
         elif mode == "link_forward":
             result, observer = _run_link_forward(
                 config, events, True, max_replay_work
@@ -13021,7 +13066,8 @@ def _cmd_replay(
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit):
+    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit,
+            LinkWorkLimit):
         _fail("replay_work_limit")
         return 5
     sys.stdout.buffer.write(output)
