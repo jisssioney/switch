@@ -11464,6 +11464,57 @@ def forward_decode(frames, ports, age, max_frame):
     return forward_check(checked, ports, age, max_frame)
 
 
+def forward_decode_work(frames, ports, age, max_frame, limit):
+    """forward-decode record/replay 的工作量预演：独立 FDB，无副作用。
+
+    逐帧累计 K+P+1，K 为本帧老化前动态 FDB 项数（无静态项），P 为端口
+    数；坏帧（runt/giant/bad_fcs）与准入拒绝帧同样计费。学习规则与
+    forward_check 一致：仅 good、未拒绝且入端口 up 时学习。累计等于
+    上限合法，首次超过即抛 ForwardWorkLimit。
+    """
+    by_name = {port["name"]: port for port in ports}
+    width = len(ports) + 1
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    work = 0
+    for t, port_name, raw in frames:
+        work += len(fdb) + width
+        if work > limit:
+            raise ForwardWorkLimit
+        for key in [
+            k for k, (_, seen) in fdb.items() if t - seen >= age
+        ]:
+            del fdb[key]
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tag = ((raw[14] << 8) | raw[15]) & 0x0FFF
+        else:
+            tag = None
+        length = len(raw)
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (zlib.crc32(raw[:-4]) & 0xFFFFFFFF).to_bytes(
+            4, "little"
+        ):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        if cls != "good":  # 非 good 不学习
+            continue
+        ingress = by_name[port_name]
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if not rejected and ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+
+
 LINK_STATE_CONFIG_KEYS = frozenset({"ports", "delay"})
 LINK_STATE_PORT_KEYS = frozenset({"name", "rates", "modes"})
 LINK_STATE_EVENT_KEYS = frozenset(
@@ -12989,6 +13040,7 @@ EVENT_KIND_BY_KEYS = {
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
     LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
+    FRAME_DECODE_FRAME_KEYS: "frame",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -13004,7 +13056,8 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、forward-static、security-check 或 port-security。"""
+    link-state、forward-static、forward-decode、security-check 或
+    port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13017,6 +13070,8 @@ def _log_mode(config):
             return "link_state"
         if keys == FORWARD_STATIC_CONFIG_KEYS:
             return "forward_static"
+        if keys == FORWARD_CHECK_CONFIG_KEYS:
+            return "forward_decode"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13190,6 +13245,37 @@ def _run_forward_static(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_forward_decode(config, events, observe, max_work=None):
+    """record/replay forward-decode 模式：校验 forward-decode 配置与原始
+    帧并执行仿真。
+
+    语义同 forward-decode 子命令；max_work 非 None 时（record/replay）
+    全量语义校验后先按 forward-decode 公式（逐帧累计 K+P+1，K 为老化前
+    动态 FDB 项数，P 为端口数；坏帧与准入拒绝帧同样计费）无副作用预演，
+    首次超过即抛 ForwardWorkLimit，不正式转发。返回 (forward-decode
+    结果 dict, observer 或 None)；每帧恒 applied，version 恒 0，
+    output 为对应 results 项。
+    """
+    ports, age, max_frame = validate_forward_check_config(config)
+    frames = validate_forward_decode_frames(events, ports)
+    if max_work is not None:
+        # 与 forward-decode 语义同一公式：独立空 FDB，无副作用
+        forward_decode_work(frames, ports, age, max_frame, max_work)
+    result = forward_decode(frames, ports, age, max_frame)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
+    return result, observer
+
+
 def _run_security_check(config, events, observe, max_work=None):
     """record/replay security-check 模式：校验 security-check 配置与事件并
     执行仿真。
@@ -13267,8 +13353,8 @@ def _build_log_doc(config, events, items):
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，security-check 模式仅 applied 链路/成员项加 1
-    # （帧与 service 恒 applied 但不计），forward-static 模式帧恒 applied
-    # 且 version 恒 0
+    # （帧与 service 恒 applied 但不计），forward-static 与 forward-decode
+    # 模式帧恒 applied 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -13514,6 +13600,10 @@ def _cmd_record(
             result, observer = _run_forward_static(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_decode":
+            result, observer = _run_forward_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_record_work
@@ -13611,6 +13701,10 @@ def _cmd_replay(
             )
         elif mode == "forward_static":
             result, observer = _run_forward_static(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward_decode":
+            result, observer = _run_forward_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "security_check":
