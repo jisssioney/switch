@@ -13192,7 +13192,12 @@ def _cmd_record(
 
 
 def _cmd_replay(
-    log_path, max_events, max_log_bytes, max_output_bytes, max_replay_work
+    log_path,
+    max_events,
+    max_log_bytes,
+    max_output_bytes,
+    max_replay_work,
+    expected_sha256=None,
 ):
     try:
         with open(log_path, "rb") as handle:
@@ -13208,6 +13213,12 @@ def _cmd_replay(
         log = parse_json(log_raw)  # 全量校验先于重放
         _validate_log_shape(log)
         if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        # 外部承诺先于事件数与一切语义重放：EXPECTED 须是调用方从成功
+        # record 产物顶层 sha256 独立保存的值，绝不取自待重放 LOG。仅改
+        # 帧并重算 LOG 内摘要的等价重写虽能通过内部自洽校验，仍因外部
+        # 承诺不符在此失败（stdout 空、LOG 不动）
+        if expected_sha256 is not None and expected_sha256 != log["sha256"]:
             raise InvalidInput("bad log sha256")
         config = log["config"]
         events = [record["event"] for record in log["records"]]
@@ -13807,11 +13818,31 @@ def main(argv):
     if args[:1] == ["replay"]:
         # replay LOG [MAX_EVENTS MAX_LOG_BYTES [MAX_OUTPUT_BYTES
         #   [MAX_REPLAY_WORK]]]
-        if len(args) not in (2, 4, 5, 6):
-            _fail("usage")
-            return 2
+        # 或带外部承诺形式：
+        # replay LOG --expect-sha256 EXPECTED [MAX_EVENTS MAX_LOG_BYTES
+        #   [MAX_OUTPUT_BYTES [MAX_REPLAY_WORK]]]
+        # EXPECTED 须为调用方从成功 record 产物顶层 sha256 独立保存的
+        # 64 位小写十六进制，不得取自待重放 LOG；选项、数量或格式非法
+        # 按 usage 退出 2。
+        expected = None
+        if len(args) >= 3 and args[2] == "--expect-sha256":
+            # flag 后必须紧跟 EXPECTED，其后仅可跟 0、2、3、4 个上限
+            if len(args) not in (4, 6, 7, 8):
+                _fail("usage")
+                return 2
+            expected = args[3]
+            if _HEX64_RE.fullmatch(expected) is None:
+                _fail("usage")
+                return 2
+            limit_tokens = args[4:]
+        else:
+            # 旧形式逐字节保留：上限数量仅 0、2、3、4 个
+            if len(args) not in (2, 4, 5, 6):
+                _fail("usage")
+                return 2
+            limit_tokens = args[2:]
         limits = _parse_limits(
-            args[2:],
+            limit_tokens,
             (0, 2, 3, 4),
             (
                 DEFAULT_MAX_EVENTS,
@@ -13823,7 +13854,7 @@ def main(argv):
         if limits is None:
             _fail("usage")
             return 2
-        return _cmd_replay(args[1], *limits)
+        return _cmd_replay(args[1], *limits, expected_sha256=expected)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
