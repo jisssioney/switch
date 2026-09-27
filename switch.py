@@ -11422,7 +11422,11 @@ def validate_link_forward_events(events, fwd_ports):
     return result
 
 
-def link_forward(fwd_ports, caps, age, max_frame, delay, events):
+def link_forward(
+    fwd_ports, caps, age, max_frame, delay, events, observer=None
+):
+    if observer is not None:  # record：逐事件记录 applied 与对应 results 项
+        observer["items"] = []
     by_name = {port["name"]: port for port in fwd_ports}
     # 协商状态：("down",)/("bad",)/("up", rate, mode)；初始皆 down
     committed = {name: ("down",) for name in by_name}
@@ -11484,14 +11488,16 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
             else committed[port]
         )
         if target == effective:
-            pass  # 未变不重置
+            applied = False  # 未变不重置
         elif target[0] == "up":
             # 目标变化即进入 wait 并于 t+delay 完成
             pending[port] = (target[1], target[2], t + delay)
+            applied = True
         else:
             # down/bad 立即生效
             pending.pop(port, None)
             committed[port] = target
+            applied = True
         current = pending.get(port)
         if current is not None:
             state, rate, mode = "wait", None, None
@@ -11511,6 +11517,7 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
         results.append(
             {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
         )
+        return applied
 
     def is_up(name):
         # 有效 up：无未完成协商且 committed 为 up（wait 期间不转发）
@@ -11522,7 +11529,12 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
         settle(t)
         if item[0] == "link":
             _, t, port, admin, peer, rates, modes = item
-            apply_link(t, port, admin, peer, rates, modes)
+            applied = apply_link(t, port, admin, peer, rates, modes)
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": results[-1]}
+                )
             continue
         (
             _,
@@ -11555,6 +11567,11 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
             results.append(
                 {"t": t, "class": cls, "action": "drop", "ports": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         if tag is None:
             vlan = ingress["pvid"]
@@ -11569,6 +11586,11 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
             results.append(
                 {"t": t, "class": cls, "action": "drop", "ports": []}
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         vlan_stats[vlan]["rx"] += 1
         egress = []
@@ -11610,6 +11632,11 @@ def link_forward(fwd_ports, caps, age, max_frame, delay, events):
         results.append(
             {"t": t, "class": cls, "action": action, "ports": out_ports}
         )
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True,
+                 "output": results[-1]}
+            )
     return {
         "results": results,
         "ports": [
@@ -12555,6 +12582,8 @@ EVENT_KIND_BY_KEYS = {
     FRAME_KEYS_ACL: "frame",
     RELOAD_EVENT_KEYS: "reload",
     ROLLBACK_EVENT_KEYS: "rollback",
+    LINK_FORWARD_LINK_EVENT_KEYS: "link",
+    LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -12569,9 +12598,13 @@ def _event_kind(event):
 
 
 def _log_mode(config):
-    """record/replay 按 config 形状选模式：loop-detect 或 port-security。"""
-    if isinstance(config, dict) and frozenset(config) == LOOP_CONFIG_KEYS:
-        return "loop"
+    """record/replay 按 config 形状选模式：loop-detect、link-forward 或 port-security。"""
+    if isinstance(config, dict):
+        keys = frozenset(config)
+        if keys == LOOP_CONFIG_KEYS:
+            return "loop"
+        if keys == LINK_FORWARD_CONFIG_KEYS:
+            return "link_forward"
     return "security"
 
 
@@ -12656,21 +12689,46 @@ def _run_reload(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_link_forward(config, events, observe, max_work=None):
+    """record/replay 链路协商模式：校验 link-forward 配置与事件并执行仿真。
+
+    语义同 link-forward 子命令；max_work 非 None 时全量语义校验后先按
+    link-forward 公式无副作用预演，首次超过即抛 LinkForwardWorkLimit，
+    不正式仿真。返回 (link-forward 结果 dict, observer 或 None)。
+    """
+    fwd_ports, caps, age, max_frame, delay = validate_link_forward_config(
+        config
+    )
+    lf_events = validate_link_forward_events(events, fwd_ports)
+    if max_work is not None:
+        # 与 link-forward 入口同一公式：只计端口数与此前帧数，无副作用
+        link_forward_work(fwd_ports, lf_events, max_work)
+    observer = {} if observe else None
+    result = link_forward(
+        fwd_ports, caps, age, max_frame, delay, lf_events, observer=observer
+    )
+    return result, observer
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
         raise InvalidInput("bad log")
-    loop_mode = _log_mode(config) == "loop"
+    mode = _log_mode(config)
     records = []
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
-    # 亦算）加 1，环路模式链路 up 实际改变（applied）才加 1
+    # 亦算）加 1，环路模式链路 up 实际改变（applied）才加 1，链路协商
+    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计）
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
-        if loop_mode:
+        if mode == "loop":
             if observed["applied"]:
+                version += 1
+        elif mode == "link_forward":
+            if kind == "link" and observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
             version += 1
@@ -12782,14 +12840,17 @@ def _verify_records(log, events, items):
     records = log["records"]
     if len(records) != len(items):
         raise InvalidInput("bad log records")
-    loop_mode = _log_mode(log["config"]) == "loop"
+    mode = _log_mode(log["config"])
     version = 0
     for event, observed, record in zip(events, items, records):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
-        if loop_mode:
+        if mode == "loop":
             if observed["applied"]:
+                version += 1
+        elif mode == "link_forward":
+            if kind == "link" and observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
             version += 1
@@ -12870,8 +12931,13 @@ def _cmd_record(
         # 工作量预演在语义校验后、正式仿真与 LOG 构造前，超限绝不触碰 LOG
         config = parse_json(config_raw)
         events = events_preview
-        if _log_mode(config) == "loop":
+        mode = _log_mode(config)
+        if mode == "loop":
             result, observer = _run_loop_detect(
+                config, events, True, max_record_work
+            )
+        elif mode == "link_forward":
+            result, observer = _run_link_forward(
                 config, events, True, max_record_work
             )
         else:
@@ -12893,7 +12959,7 @@ def _cmd_record(
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    except (ReloadWorkLimit, LoopWorkLimit):
+    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit):
         _fail("record_work_limit")
         return 5
     except OSError:
@@ -12929,8 +12995,13 @@ def _cmd_replay(
             return 5
         # 状态语义校验后先按 record 同一公式无副作用预演；首次超限即停止，
         # 不正式重放，LOG 保持不动
-        if _log_mode(config) == "loop":
+        mode = _log_mode(config)
+        if mode == "loop":
             result, observer = _run_loop_detect(
+                config, events, True, max_replay_work
+            )
+        elif mode == "link_forward":
+            result, observer = _run_link_forward(
                 config, events, True, max_replay_work
             )
         else:
@@ -12950,7 +13021,7 @@ def _cmd_replay(
     except InvalidInput:
         _fail("invalid_input")
         return 4
-    except (ReloadWorkLimit, LoopWorkLimit):
+    except (ReloadWorkLimit, LoopWorkLimit, LinkForwardWorkLimit):
         _fail("replay_work_limit")
         return 5
     sys.stdout.buffer.write(output)

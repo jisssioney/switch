@@ -1130,6 +1130,185 @@ class ReplayWorkLimitTest(unittest.TestCase):
                 self.assertEqual(err, b'{"error":"usage"}\n')
 
 
+def lf_config():
+    return {
+        "delay": 5,
+        "max_frame": 1518,
+        "age": 100,
+        "ports": [
+            {"name": "p1", "mode": "access", "pvid": 10, "allowed": [10],
+             "untagged": [10], "rates": [100, 1000], "modes": ["full"]},
+            {"name": "p2", "mode": "access", "pvid": 10, "allowed": [10],
+             "untagged": [10], "rates": [100, 1000],
+             "modes": ["half", "full"]},
+        ],
+    }
+
+
+def lf_events():
+    return [
+        {"t": 0, "port": "p1", "admin": True, "peer": True,
+         "rates": [1000], "modes": ["full"]},
+        # 目标未变：不重置协商、不计 applied、不增 version
+        {"t": 1, "port": "p1", "admin": True, "peer": True,
+         "rates": [1000], "modes": ["full"]},
+        {"t": 2, "port": "p2", "admin": True, "peer": True,
+         "rates": [100], "modes": ["half", "full"]},
+        {"t": 6, "port": "p1", "src": "00:00:00:00:00:01",
+         "dst": "ff:ff:ff:ff:ff:ff", "vlan": None, "length": 64,
+         "fcs": True, "alignment": True},
+        {"t": 8, "port": "p2", "src": "00:00:00:00:00:02",
+         "dst": "ff:ff:ff:ff:ff:ff", "vlan": None, "length": 64,
+         "fcs": True, "alignment": True},
+        {"t": 9, "port": "p1", "admin": False, "peer": True,
+         "rates": [1000], "modes": ["full"]},
+    ]
+
+
+def link_forward_stdout(config, events):
+    files, _ = write_inputs(config, events)
+    code, out, err, _ = run_cli(
+        ["link-forward", "config.json", "events.json"], files
+    )
+    assert code == 0, (code, err.decode())
+    return out
+
+
+class RecordLinkForwardTest(unittest.TestCase):
+    """record/replay 支持 link-forward 配置形状：协商 applied 与 version。"""
+
+    # 工作量：P=2、W 初值 2、每项加 F+2P+1；t0/1/2 链路项各 +5，t6 帧 +5、
+    # t8 帧 +6、t9 链路项 +7；累计 35
+    TOTAL = 35
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.cfg = os.path.join(d, "config.json")
+        self.evt = os.path.join(d, "events.json")
+        self.log = os.path.join(d, "out.log")
+        self.config = lf_config()
+        self.events = lf_events()
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(self.config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(self.events).encode())
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.record_out = rec.stdout
+        with open(self.log, "rb") as handle:
+            self.log_bytes = handle.read()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args):
+        proc = subprocess.run(
+            [sys.executable, SWITCH, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _replay(self, work, head=("100000", "16777216", "16777216")):
+        return self._run("replay", self.log, *head, str(work))
+
+    def test_record_matches_link_forward_and_replay_matches_record(self):
+        # record stdout 与直接执行 link-forward 入口逐字节一致
+        self.assertEqual(
+            self.record_out,
+            link_forward_stdout(self.config, self.events),
+        )
+        # replay stdout 与 record 逐字节一致，且不改 LOG
+        code, out, err = self._replay("10000000")
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_log_shape_and_canonical_order(self):
+        doc = json.loads(self.log_bytes.decode())
+        self.assertEqual(list(doc), LOG_KEYS)
+        self.assertEqual(doc["schema"], 1)
+        self.assertTrue(self.log_bytes.endswith(b"}" + b"\n"))
+        self.assertFalse(self.log_bytes.endswith(b"\n\n"))
+        self.assertEqual(
+            doc["config"], json.loads(json.dumps(self.config))
+        )
+        self.assertTrue(canonical_key_order(doc["config"]))
+        self.assertEqual(len(doc["records"]), len(self.events))
+        for item in doc["records"]:
+            self.assertEqual(list(item), RECORD_KEYS)
+            self.assertTrue(canonical_key_order(item["event"]))
+        self.assertEqual(doc["sha256"], prefix_digest(doc)[0])
+
+    def test_applied_version_and_output_semantics(self):
+        doc = json.loads(self.log_bytes.decode())
+        records = doc["records"]
+        # 帧恒 applied；链路项仅目标变化（按“目标未变不重置”规则改变
+        # 协商状态）才 applied：t=1 目标未变，其余链路项均变化
+        self.assertEqual(
+            [item["applied"] for item in records],
+            [True, False, True, True, True, True],
+        )
+        # version 初值 0，仅 applied 链路项递增并记录事件后值
+        self.assertEqual(
+            [item["version"] for item in records], [1, 1, 2, 2, 2, 3]
+        )
+        # output 为对应 results 项（事件与结果一一对应）
+        direct = json.loads(
+            link_forward_stdout(self.config, self.events).decode()
+        )
+        self.assertEqual(
+            [item["output"] for item in records], direct["results"]
+        )
+
+    def test_record_work_limit_boundary(self):
+        head = ("100000", "16777216", "1048576", "16777216", "16777216")
+        # 等于上限合法且输出、LOG 逐字节一致
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, *head, str(self.TOTAL)
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+        # 首次超过即报 record_work_limit，绝不触碰 LOG
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, *head,
+            str(self.TOTAL - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"record_work_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_replay_work_limit_boundary(self):
+        code, out, err = self._replay(self.TOTAL)
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        code, out, err = self._replay(self.TOTAL - 1)
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"replay_work_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_replay_tampered_applied_invalid(self):
+        doc = json.loads(self.log_bytes.decode())
+        doc["records"][0]["applied"] = False
+        doc["sha256"] = prefix_digest(doc)[0]  # 形状与摘要合法、语义不符
+        with open(self.log, "wb") as handle:
+            handle.write(
+                (json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                 + "\n").encode("utf-8")
+            )
+        code, out, err = self._replay("10000000")
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+
 class CliErrorTest(unittest.TestCase):
     def test_record_usage(self):
         code, out, err, _ = run_cli(["record", "a", "b"])
