@@ -11429,6 +11429,41 @@ def forward_check(frames, ports, age, max_frame):
     }
 
 
+def validate_forward_decode_frames(frames, ports):
+    # 帧外壳契约（t/port/data、单层 8100、双标签拒绝）与 frame-decode
+    # 一致，复用其全量校验；ports 为新式端口字典，取其名字集合
+    checked = validate_frame_decode_frames(
+        frames, [port["name"] for port in ports]
+    )
+    for _, _, raw in checked:
+        dst = raw[0:6]
+        src = raw[6:12]
+        if not any(dst):  # 目的 MAC 全零非法
+            raise InvalidInput("bad dst")
+        if not any(src) or src[0] & 1:  # 源 MAC 须为非零单播
+            raise InvalidInput("bad src")
+    return checked
+
+
+def forward_decode(frames, ports, age, max_frame):
+    # 按 frame-decode 规则解析原始帧，再接入新式 forward（forward_check）：
+    # 无对齐概念，alignment 恒真，分类退化为 runt/giant/bad_fcs/good
+    checked = []
+    for t, port, raw in frames:
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            vlan = tci & 0x0FFF
+        else:
+            vlan = None
+        fcs = raw[-4:] == (zlib.crc32(raw[:-4]) & 0xFFFFFFFF).to_bytes(
+            4, "little"
+        )
+        checked.append((t, port, src, dst, vlan, len(raw), fcs, True))
+    return forward_check(checked, ports, age, max_frame)
+
+
 LINK_STATE_CONFIG_KEYS = frozenset({"ports", "delay"})
 LINK_STATE_PORT_KEYS = frozenset({"name", "rates", "modes"})
 LINK_STATE_EVENT_KEYS = frozenset(
@@ -14078,6 +14113,53 @@ def _cmd_forward_check(
     return 0
 
 
+def _cmd_forward_decode(
+    config_path,
+    frames_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、FRAMES 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            frames_path, "rb"
+        ) as frames_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            frames_raw = _read_limited(frames_handle, max_data_bytes)
+            if frames_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        frames_doc = parse_json(frames_raw)
+        # 帧数上界在解析后、语义校验前判定；FRAMES 非数组仍按非法输入处理
+        if isinstance(frames_doc, list) and len(frames_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 配置契约与 forward-check 一致，复用其全量校验
+        ports, age, max_frame = validate_forward_check_config(config)
+        frames = validate_forward_decode_frames(frames_doc, ports)
+        result = forward_decode(frames, ports, age, max_frame)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_forward(
     config_path,
     events_path,
@@ -14144,6 +14226,7 @@ SUBCOMMANDS = frozenset((
     "frame-decode",
     "link-state",
     "forward-check",
+    "forward-decode",
     "link-forward",
     "fdb",
     "forward",
@@ -14381,6 +14464,27 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_forward_check(args[1], args[2], *limits)
+    if args[:1] == ["forward-decode"]:
+        # forward-decode CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：参数、资源与错误契约同
+        #   forward-check，可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_forward_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
