@@ -1309,6 +1309,159 @@ class RecordLinkForwardTest(unittest.TestCase):
         self.assertEqual(err, b'{"error":"invalid_input"}\n')
 
 
+class RecordStpTest(unittest.TestCase):
+    """record/replay 支持 stp 配置形状：up 实际改变才 applied/version 递增。"""
+
+    # B=3、L=3；初始 U=3：B+L+2U=12。事件改变两次：
+    # t=2 断开后 U=2 再加 B+L+4=10（累计 22）；t=4 恢复后 U=3 再加 12（34）。
+    # t=1、t=3 为幂等事件，不加工作量。TOTAL=34。
+    TOTAL = 34
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.cfg = os.path.join(d, "config.json")
+        self.evt = os.path.join(d, "events.json")
+        self.log = os.path.join(d, "out.log")
+        self.config = {
+            "bridges": ["b1", "b2", "b3"],
+            "links": [
+                {"id": "L1", "x": ["b1", "p1"], "y": ["b2", "p1"],
+                 "cost": 1, "up": True},
+                {"id": "L2", "x": ["b2", "p2"], "y": ["b3", "p1"],
+                 "cost": 1, "up": True},
+                {"id": "L3", "x": ["b3", "p2"], "y": ["b1", "p2"],
+                 "cost": 1, "up": True},
+            ],
+            "delay": 2,
+        }
+        self.events = [
+            {"t": 1, "id": "L1", "up": True},   # 初始即 up：幂等
+            {"t": 2, "id": "L1", "up": False},  # 实际改变
+            {"t": 3, "id": "L1", "up": False},  # 幂等
+            {"t": 4, "id": "L1", "up": True},   # 实际改变
+        ]
+        with open(self.cfg, "wb") as handle:
+            handle.write(json.dumps(self.config).encode())
+        with open(self.evt, "wb") as handle:
+            handle.write(json.dumps(self.events).encode())
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt, self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.record_out = rec.stdout
+        with open(self.log, "rb") as handle:
+            self.log_bytes = handle.read()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *args):
+        proc = subprocess.run(
+            [sys.executable, SWITCH, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _replay(self, work, head=("100000", "16777216", "16777216")):
+        return self._run("replay", self.log, *head, str(work))
+
+    def test_record_matches_stp_and_replay_matches_record(self):
+        # record stdout 与直接执行 stp 入口逐字节一致
+        files, _ = write_inputs(self.config, self.events)
+        code, stp_out, err, _ = run_cli(
+            ["stp", "config.json", "events.json"], files
+        )
+        self.assertEqual(code, 0, err.decode())
+        self.assertEqual(self.record_out, stp_out)
+        # replay stdout 与 record 逐字节一致，且不改 LOG
+        code, out, err = self._replay("10000000")
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_log_shape_and_canonical_order(self):
+        doc = json.loads(self.log_bytes.decode())
+        self.assertEqual(list(doc), LOG_KEYS)
+        self.assertEqual(doc["schema"], 1)
+        self.assertTrue(self.log_bytes.endswith(b"}" + b"\n"))
+        self.assertFalse(self.log_bytes.endswith(b"\n\n"))
+        self.assertEqual(doc["config"], json.loads(json.dumps(self.config)))
+        self.assertTrue(canonical_key_order(doc["config"]))
+        self.assertEqual(len(doc["records"]), len(self.events))
+        for item in doc["records"]:
+            self.assertEqual(list(item), RECORD_KEYS)
+            self.assertTrue(canonical_key_order(item["event"]))
+        self.assertEqual(doc["sha256"], prefix_digest(doc)[0])
+
+    def test_applied_version_and_output_semantics(self):
+        doc = json.loads(self.log_bytes.decode())
+        records = doc["records"]
+        # 仅 up 实际改变才 applied
+        self.assertEqual(
+            [item["applied"] for item in records],
+            [False, True, False, True],
+        )
+        # version 从 0 起、仅 applied 项递增并记录事件后值
+        self.assertEqual(
+            [item["version"] for item in records], [0, 1, 1, 2]
+        )
+        # output 为事件后完整快照（键序 t,bridges）；初始 t=0 快照不写记录
+        direct = json.loads(self.record_out.decode())
+        self.assertEqual(len(direct["results"]), len(self.events) + 1)
+        self.assertEqual(direct["results"][0]["t"], 0)
+        self.assertEqual(
+            [item["output"] for item in records], direct["results"][1:]
+        )
+        for item in records:
+            self.assertEqual(list(item["output"]), ["t", "bridges"])
+
+    def test_record_work_limit_boundary(self):
+        head = ("100000", "16777216", "1048576", "16777216", "16777216")
+        # 等于上限合法且输出、LOG 逐字节一致
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, *head, str(self.TOTAL)
+        )
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+        # 首次超过即报 record_work_limit，绝不触碰 LOG
+        os.unlink(self.log)
+        code, out, err = self._run(
+            "record", self.cfg, self.evt, self.log, *head,
+            str(self.TOTAL - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"record_work_limit"}\n')
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_replay_work_limit_boundary(self):
+        code, out, err = self._replay(self.TOTAL)
+        self.assertEqual((code, out, err), (0, self.record_out, b""))
+        code, out, err = self._replay(self.TOTAL - 1)
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"replay_work_limit"}\n')
+        with open(self.log, "rb") as handle:
+            self.assertEqual(handle.read(), self.log_bytes)
+
+    def test_replay_tampered_applied_invalid(self):
+        doc = json.loads(self.log_bytes.decode())
+        doc["records"][1]["applied"] = False
+        doc["sha256"] = prefix_digest(doc)[0]  # 形状与摘要合法、语义不符
+        with open(self.log, "wb") as handle:
+            handle.write(
+                (json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+                 + "\n").encode("utf-8")
+            )
+        code, out, err = self._replay("10000000")
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"invalid_input"}\n')
+
+
 class CliErrorTest(unittest.TestCase):
     def test_record_usage(self):
         code, out, err, _ = run_cli(["record", "a", "b"])
