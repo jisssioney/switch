@@ -1509,6 +1509,21 @@ def validate_forward_stp_storm_config(config):
 def forward_stp_storm(
     bridges, links, delay, bridge_name, ports, age, storm, events
 ):
+    """forward-stp-storm 公共入口：精确签名不变，无 observer 形参。
+
+    record/replay 所需的逐事件观察逻辑封装在内部 _forward_stp_storm_run
+    中。
+    """
+    return _forward_stp_storm_run(
+        bridges, links, delay, bridge_name, ports, age, storm, events,
+        observer=None,
+    )
+
+
+def _forward_stp_storm_run(
+    bridges, links, delay, bridge_name, ports, age, storm, events,
+    observer=None,
+):
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
@@ -1533,6 +1548,8 @@ def forward_stp_storm(
     last_learn = {}  # (vlan, src) -> 最后学习端口
     blocked = {}  # (入端口, vlan) -> 封锁截止时刻
     results = []
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
 
     previous = {}  # (bridge, port) -> 上一轮角色
     since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
@@ -1642,13 +1659,19 @@ def forward_stp_storm(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            applied = by_id[lid]["up"] != up  # up 实际改变才 applied
+            if applied:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
                 for name in old_forwarding - forwarding_ports(t):
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
+            if observer is not None:  # 链路项：output 恒 None
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
             continue
         _, t, port_name, src, dst, tag = item
         port_stats[port_name]["rx"] += 1
@@ -1663,7 +1686,13 @@ def forward_stp_storm(
             )
         if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
             port_stats[port_name]["drop"] += 1
-            results.append({"t": t, "action": "drop", "ports": []})
+            entry = {"t": t, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:  # 准入拒绝也逐帧记录
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
             continue
         vlan_stats[vlan]["rx"] += 1
         _, state = port_status(port_name, t)
@@ -1707,7 +1736,12 @@ def forward_stp_storm(
         if not egress:
             port_stats[port_name]["drop"] += 1
             vlan_stats[vlan]["drop"] += 1
-        results.append({"t": t, "action": action, "ports": out_ports})
+        entry = {"t": t, "action": action, "ports": out_ports}
+        results.append(entry)
+        if observer is not None:  # 帧项恒 applied，output 为对应结果项
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
     return {
         "results": results,
         "ports": [
@@ -13343,9 +13377,9 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、forward-static、forward-decode、stp-decode、acl-check、
-    qos、qos-check、security-check、mirror-check、lag-check、storm-check
-    或 port-security。"""
+    link-state、forward-static、forward-decode、stp-decode、forward-stp-storm、
+    acl-check、qos、qos-check、security-check、mirror-check、lag-check、
+    storm-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13362,6 +13396,8 @@ def _log_mode(config):
             return "forward_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
             return "stp_decode"
+        if keys == STORM_CONFIG_KEYS:
+            return "forward_stp_storm"
         if keys == ACL_CHECK_CONFIG_KEYS:
             return "acl_check"
         if keys == QOS_CONFIG_KEYS:
@@ -13602,6 +13638,50 @@ def _run_stp_decode(config, events, observe, max_work=None):
     observer = {} if observe else None
     result = stp_decode(
         bridges, links, delay, bridge, ports, age, max_frame, stp_events,
+        observer=observer,
+    )
+    return result, observer
+
+
+def _run_forward_stp_storm(config, events, observe, max_work=None):
+    """record/replay forward-stp-storm 模式：校验 forward-stp-storm 配置与
+    事件并执行仿真。
+
+    输入、全量校验与执行语义完全沿用 forward-stp-storm 入口；max_work 非
+    None 时（record/replay）全量语义校验后先按既有 storm 公式（拒绝、
+    风暴/迁移抑制帧及幂等链路均计费）无副作用预演，首次超过即抛
+    StormWorkLimit，不正式仿真。返回 (forward-stp-storm 结果 dict,
+    observer 或 None)；帧项恒 applied 且 output 为对应 t,action,ports
+    结果项，链路项仅 up 实际改变时 applied，output 恒 None。
+    """
+    bridges, links, delay, bridge, ports, age, storm = (
+        validate_forward_stp_storm_config(config)
+    )
+    link_ids = {link["id"] for link in links}
+    stp_events = validate_forward_stp_events(events, ports, link_ids)
+    if max_work is not None:
+        # 与 forward-stp-storm 入口同一公式：独立链路副本与空状态，无副作用
+        forward_stp_storm_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            stp_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = _forward_stp_storm_run(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        stp_events,
         observer=observer,
     )
     return result, observer
@@ -14033,9 +14113,9 @@ def _build_log_doc(config, events, items):
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，qos/security-check/qos-check/acl-check/
     # mirror-check/lag-check/storm-check 模式仅 applied 链路/成员项加 1
-    # （帧与 service 恒 applied 但不计），stp-decode 模式仅 applied 链路项
-    # 加 1（帧项恒 applied 但不计），forward-static 模式帧恒 applied 且
-    # version 恒 0
+    # （帧与 service 恒 applied 但不计），stp-decode/forward-stp-storm
+    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），forward-static
+    # 模式帧恒 applied 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -14044,7 +14124,7 @@ def _build_log_doc(config, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode in ("link_forward", "stp_decode"):
+        elif mode in ("link_forward", "stp_decode", "forward_stp_storm"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -14175,7 +14255,7 @@ def _verify_records(log, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode in ("link_forward", "stp_decode"):
+        elif mode in ("link_forward", "stp_decode", "forward_stp_storm"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -14293,6 +14373,10 @@ def _cmd_record(
             )
         elif mode == "stp_decode":
             result, observer = _run_stp_decode(
+                config, events, True, max_record_work
+            )
+        elif mode == "forward_stp_storm":
+            result, observer = _run_forward_stp_storm(
                 config, events, True, max_record_work
             )
         elif mode == "security_check":
@@ -14430,6 +14514,10 @@ def _cmd_replay(
             )
         elif mode == "stp_decode":
             result, observer = _run_stp_decode(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward_stp_storm":
+            result, observer = _run_forward_stp_storm(
                 config, events, True, max_replay_work
             )
         elif mode == "security_check":
