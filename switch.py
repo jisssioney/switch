@@ -19,6 +19,8 @@ PORT_KEYS = frozenset(("name", "vlan", "up"))
 FRAME_KEYS = frozenset(("t", "port", "src", "dst"))
 PORT_KEYS_V2 = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
 FRAME_KEYS_V2 = frozenset(("t", "port", "src", "dst", "vlan"))
+FORWARD_STATIC_CONFIG_KEYS = frozenset(("ports", "age", "static"))
+STATIC_ENTRY_KEYS = frozenset(("vlan", "mac", "port"))
 PORT_MODES = ("access", "trunk", "hybrid")
 STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
 STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
@@ -625,6 +627,212 @@ def forward_work_v2(frames, ports, age, limit):
                 ingress["mode"] == "access" or vlan not in ingress["allowed"]
             )
         if not rejected and ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+
+
+def validate_forward_static_config(config):
+    if not isinstance(config, dict) or frozenset(config) != (
+        FORWARD_STATIC_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    ports, age = validate_forward_config_v2(
+        {"ports": config["ports"], "age": config["age"]}
+    )
+    static = config["static"]
+    if not isinstance(static, list):
+        raise InvalidInput("static must be a list")
+    names = {port["name"]: port for port in ports}
+    pairs = set()
+    for entry in static:
+        if not isinstance(entry, dict) or frozenset(entry) != STATIC_ENTRY_KEYS:
+            raise InvalidInput("bad static entry")
+        vlan = entry["vlan"]
+        mac = entry["mac"]
+        port_name = entry["port"]
+        if not _valid_vlan_id(vlan):
+            raise InvalidInput("bad static vlan")
+        if not valid_mac(mac):
+            raise InvalidInput("bad static mac")
+        if port_name not in names:
+            raise InvalidInput("unknown static port")
+        if vlan not in names[port_name]["allowed"]:
+            raise InvalidInput("static vlan not allowed on port")
+        if (vlan, mac) in pairs:
+            raise InvalidInput("static entries must be distinct")
+        pairs.add((vlan, mac))
+    return ports, age, static
+
+
+def forward_static(frames, ports, age, static):
+    by_name = {port["name"]: port for port in ports}
+    # 静态项预置 FDB：不老化、不刷新、不迁移；动态项同 forward_v2
+    static_map = {
+        (entry["vlan"], entry["mac"]): entry["port"] for entry in static
+    }
+    fdb = {}  # (vlan, mac) -> [port, seen]，仅动态项
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, src, dst, tag in frames:
+        # 逐帧仅老化动态项，静态项永不参与
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append({"t": t, "action": "drop", "ports": []})
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        static_hit = (vlan, src) in static_map
+        if ingress["up"]:
+            if static_hit:
+                if static_map[(vlan, src)] != port_name:
+                    # 静态源项端口不同：丢弃且不学习，后续转发判定不进行
+                    port_stats[port_name]["drop"] += 1
+                    vlan_stats[vlan]["drop"] += 1
+                    results.append(
+                        {"t": t, "action": "drop", "ports": []}
+                    )
+                    continue
+                # 同口继续但不改表（不刷新静态项）
+            else:
+                # 其他源照旧动态学习，且不得覆盖静态项（键集与静态项互斥）
+                fdb[(vlan, src)] = [port_name, t]
+            hit = (
+                None
+                if dst == BROADCAST_MAC
+                else (
+                    [static_map[(vlan, dst)], None]
+                    if (vlan, dst) in static_map
+                    else fdb.get((vlan, dst))
+                )
+            )
+            if hit is not None and hit[0] != port_name:
+                target = by_name[hit[0]]
+                if target["up"] and vlan in target["allowed"]:
+                    egress = [hit[0]]
+                    action = "unicast"
+                # 静态目的出口不可用（down 或 VLAN 不允许）则丢弃而非泛洪；
+                # 动态命中出口不可用同样维持 forward_v2 原判定（不泛洪）
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["up"]
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append({"t": t, "action": action, "ports": out_ports})
+    entries = []
+    for vlan, mac in sorted(
+        set(static_map) | set(fdb), key=lambda key: (key[0], key[1])
+    ):
+        if (vlan, mac) in static_map:
+            entries.append(
+                {
+                    "vlan": vlan,
+                    "mac": mac,
+                    "port": static_map[(vlan, mac)],
+                    "source": "static",
+                    "seen": None,
+                }
+            )
+        else:
+            port_name, seen = fdb[(vlan, mac)]
+            entries.append(
+                {
+                    "vlan": vlan,
+                    "mac": mac,
+                    "port": port_name,
+                    "source": "dynamic",
+                    "seen": seen,
+                }
+            )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "fdb": entries,
+    }
+
+
+def forward_static_work(frames, ports, age, static, limit):
+    """forward-static 的工作量预演：独立空 FDB（预置静态项），无副作用。
+
+    计费规则同 forward_work_v2：逐帧以该帧老化前表项数 K 计 K+P+1，
+    K 含全部表项（静态与动态）；仅动态源项可学习、刷新或迁移，静态项
+    不老化、不刷新、不迁移。累计等于上限合法，首次超过即抛 ForwardWorkLimit。
+    """
+    by_name = {port["name"]: port for port in ports}
+    width = len(ports) + 1
+    static_map = {(entry["vlan"], entry["mac"]): entry["port"] for entry in static}
+    fdb = {}  # (vlan, mac) -> [port, seen]，仅动态项
+    work = 0
+    for t, port_name, src, dst, tag in frames:
+        work += len(static_map) + len(fdb) + width
+        if work > limit:
+            raise ForwardWorkLimit
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if (
+            not rejected
+            and ingress["up"]
+            and (vlan, src) not in static_map
+        ):
             fdb[(vlan, src)] = [port_name, t]
 
 
@@ -13765,6 +13973,7 @@ SUBCOMMANDS = frozenset((
     "link-forward",
     "fdb",
     "forward",
+    "forward-static",
     "stp",
     "loop-detect",
     "forward-stp",
@@ -14012,6 +14221,7 @@ def main(argv):
     is_loop_detect = args[:1] == ["loop-detect"]
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
+    is_forward_static = args[:1] == ["forward-static"]
     is_forward_stp = args[:1] == ["forward-stp"]
     is_stp_check = args[:1] == ["stp-check"]
     is_forward_stp_storm = args[:1] == ["forward-stp-storm"]
@@ -14031,6 +14241,7 @@ def main(argv):
     allowed_counts = (
         (3, 5, 7, 8)
         if is_stp or is_loop_detect or is_fdb or is_forward
+        or is_forward_static
         or is_forward_stp
         or is_stp_check
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
@@ -14043,6 +14254,7 @@ def main(argv):
     if len(args) not in allowed_counts or args[0] not in (
         "fdb",
         "forward",
+        "forward-static",
         "stp",
         "loop-detect",
         "forward-stp",
@@ -14122,6 +14334,19 @@ def main(argv):
             max_output_bytes,
             max_forward_work,
         ) = parsed + forward_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_stp_work = None
+    elif is_forward_static:
+        # forward-static 沿用 forward 的资源上限与工作量预演
+        forward_static_limits = limits + (DEFAULT_MAX_FORWARD_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_forward_work,
+        ) = parsed + forward_static_limits[len(parsed):]
         max_stp_work = None
         max_fdb_work = None
         max_forward_stp_work = None
@@ -14980,6 +15205,15 @@ def main(argv):
                 max_reload_work,
             )
             result["config"] = _canonical(final_config)
+        elif mode == "forward-static":
+            ports, age, static = validate_forward_static_config(config)
+            frames = validate_frames_v2(data, ports)
+            # 帧全量校验后用独立空 FDB（预置静态项）无副作用预演；
+            # 超限时不得正式转发
+            forward_static_work(
+                frames, ports, age, static, max_forward_work
+            )
+            result = forward_static(frames, ports, age, static)
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
