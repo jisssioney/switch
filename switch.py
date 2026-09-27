@@ -12223,8 +12223,14 @@ def validate_stp_check_events(events, ports, link_ids):
 
 
 def forward_stp_check(
-    bridges, links, delay, bridge_name, ports, age, max_frame, events
+    bridges, links, delay, bridge_name, ports, age, max_frame, events,
+    observer=None,
 ):
+    """observer 非 None 时（record/replay）逐事件记录 applied 与输出：
+
+    链路项仅 up 实际改变时 applied，output 恒 None；帧项恒 applied，
+    output 为对应 results 项（键序 t,class,action,ports）。
+    """
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
     port_link = {}  # 本桥桥链路口名 -> link
@@ -12251,6 +12257,8 @@ def forward_stp_check(
         for vlan in port["allowed"]:
             vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
     results = []
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
 
     previous = {}  # (bridge, port) -> 上一轮角色
     since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
@@ -12318,12 +12326,18 @@ def forward_stp_check(
             del fdb[key]
         if item[0] == "link":
             _, t, lid, up = item
+            applied = by_id[lid]["up"] != up  # up 实际改变才 applied
             old_forwarding = forwarding_ports(t)
             by_id[lid]["up"] = up
             converge(t)
             for name in old_forwarding - forwarding_ports(t):
                 for key in [k for k, (p, _) in fdb.items() if p == name]:
                     del fdb[key]
+            if observer is not None:  # 链路项：output 恒 None
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
             continue
         _, t, port_name, src, dst, tag, length, fcs, alignment = item
         port_stats[port_name]["rx"] += 1
@@ -12340,9 +12354,13 @@ def forward_stp_check(
         port_stats[port_name][cls] += 1
         if cls != "good":  # 非 good 丢弃且不学习、不转发、不计 VLAN
             port_stats[port_name]["drop"] += 1
-            results.append(
-                {"t": t, "class": cls, "action": "drop", "ports": []}
-            )
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:  # 帧项恒 applied，output 为对应结果
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
             continue
         if tag is None:
             vlan = by_name[port_name]["pvid"]
@@ -12355,9 +12373,13 @@ def forward_stp_check(
             )
         if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
             port_stats[port_name]["drop"] += 1
-            results.append(
-                {"t": t, "class": cls, "action": "drop", "ports": []}
-            )
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:  # 准入拒绝也逐帧记录
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
             continue
         vlan_stats[vlan]["rx"] += 1
         _, state = port_status(port_name, t)
@@ -12402,9 +12424,12 @@ def forward_stp_check(
         if not egress:
             port_stats[port_name]["drop"] += 1
             vlan_stats[vlan]["drop"] += 1
-        results.append(
-            {"t": t, "class": cls, "action": action, "ports": out_ports}
-        )
+        entry = {"t": t, "class": cls, "action": action, "ports": out_ports}
+        results.append(entry)
+        if observer is not None:  # 帧项恒 applied，output 为对应结果项
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
     return {
         "results": results,
         "ports": [
@@ -12483,11 +12508,13 @@ def validate_stp_decode_events(events, ports, link_ids):
 
 
 def stp_decode(
-    bridges, links, delay, bridge_name, ports, age, max_frame, events
+    bridges, links, delay, bridge_name, ports, age, max_frame, events,
+    observer=None,
 ):
     # 原始帧按 frame-decode 规则解码为 stp-check 的九元组事件序
     # （alignment 恒真，分类退化为 runt/giant/bad_fcs/good），链路项原样
-    # 保留；转发、学习与统计随后完全沿用 stp-check
+    # 保留；转发、学习与统计随后完全沿用 stp-check。observer 透传，由
+    # stp-check 主体逐事件记录（record/replay）。
     raw_frames = [
         (item[1], item[2], item[3]) for item in events if item[0] == "frame"
     ]
@@ -12506,7 +12533,8 @@ def stp_decode(
                 ("frame", t, port_name, src, dst, vlan, length, fcs, alignment)
             )
     return forward_stp_check(
-        bridges, links, delay, bridge_name, ports, age, max_frame, decoded
+        bridges, links, delay, bridge_name, ports, age, max_frame, decoded,
+        observer=observer,
     )
 
 
@@ -13128,7 +13156,8 @@ def _event_kind(event):
 
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
-    link-state、forward-static、security-check 或 port-security。"""
+    link-state、forward-static、forward-decode、stp-decode、security-check
+    或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13143,6 +13172,8 @@ def _log_mode(config):
             return "forward_static"
         if keys == FORWARD_CHECK_CONFIG_KEYS:
             return "forward_decode"
+        if keys == STP_CHECK_CONFIG_KEYS:
+            return "stp_decode"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13349,6 +13380,33 @@ def _run_forward_decode(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_stp_decode(config, events, observe, max_work=None):
+    """record/replay stp-decode 模式：校验 stp-decode（stp-check 七键）
+    配置与混合事件并执行仿真。
+
+    输入、全量校验与执行语义完全沿用 stp-decode 入口；max_work 非 None
+    时（record/replay）全量语义校验后先按 forward-stp 公式无副作用预演
+    （坏帧、准入拒绝、幂等链路均计费），首次超过即抛 ForwardStpWorkLimit，
+    不正式仿真。返回 (stp-decode 结果 dict, observer 或 None)；帧项恒
+    applied 且 output 为对应 t,class,action,ports 结果项，链路项仅 up
+    实际改变时 applied，output 恒 None。
+    """
+    bridges, links, delay, bridge, ports, age, max_frame = (
+        validate_stp_check_config(config)
+    )
+    link_ids = {link["id"] for link in links}
+    stp_events = validate_stp_decode_events(events, ports, link_ids)
+    if max_work is not None:
+        # 与 stp-decode 入口同一 forward-stp 公式：只跟踪 up 链路数与帧数
+        forward_stp_work(bridges, links, ports, stp_events, max_work)
+    observer = {} if observe else None
+    result = stp_decode(
+        bridges, links, delay, bridge, ports, age, max_frame, stp_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _run_security_check(config, events, observe, max_work=None):
     """record/replay security-check 模式：校验 security-check 配置与事件并
     执行仿真。
@@ -13426,7 +13484,8 @@ def _build_log_doc(config, events, items):
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，security-check 模式仅 applied 链路/成员项加 1
-    # （帧与 service 恒 applied 但不计），forward-static 模式帧恒 applied
+    # （帧与 service 恒 applied 但不计），stp-decode 模式仅 applied 链路
+    # 项加 1（帧项恒 applied 但不计），forward-static 模式帧恒 applied
     # 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
@@ -13436,7 +13495,7 @@ def _build_log_doc(config, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode == "link_forward":
+        elif mode in ("link_forward", "stp_decode"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -13564,7 +13623,7 @@ def _verify_records(log, events, items):
         if mode in ("stp", "loop"):
             if observed["applied"]:
                 version += 1
-        elif mode == "link_forward":
+        elif mode in ("link_forward", "stp_decode"):
             if kind == "link" and observed["applied"]:
                 version += 1
         elif mode == "link_state":
@@ -13677,6 +13736,10 @@ def _cmd_record(
             result, observer = _run_forward_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "stp_decode":
+            result, observer = _run_stp_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_record_work
@@ -13705,6 +13768,7 @@ def _cmd_record(
         StpWorkLimit,
         LoopWorkLimit,
         ForwardWorkLimit,
+        ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
@@ -13780,6 +13844,10 @@ def _cmd_replay(
             result, observer = _run_forward_decode(
                 config, events, True, max_replay_work
             )
+        elif mode == "stp_decode":
+            result, observer = _run_stp_decode(
+                config, events, True, max_replay_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_replay_work
@@ -13806,6 +13874,7 @@ def _cmd_replay(
         StpWorkLimit,
         LoopWorkLimit,
         ForwardWorkLimit,
+        ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
