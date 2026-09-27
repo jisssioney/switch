@@ -11429,6 +11429,45 @@ def forward_check(frames, ports, age, max_frame):
     }
 
 
+def forward_check_work(frames, ports, age, max_frame, limit):
+    """forward-check/forward-decode 的工作量预演：独立空 FDB，无副作用。
+
+    P 为配置端口数；逐帧先老化动态项，以老化前动态 FDB 表项数 K 计
+    K+P+1（坏帧、VLAN 准入拒绝、down 口均计费），等于上限合法；随后
+    仅 good（非 runt/giant/alignment/bad_fcs）且通过 VLAN 准入且入端口
+    up 时学习、刷新或迁移源 MAC。首次超过即抛 ForwardWorkLimit。
+    """
+    by_name = {port["name"]: port for port in ports}
+    width = len(ports) + 1
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    work = 0
+    for t, port_name, src, dst, tag, length, fcs, alignment in frames:
+        work += len(fdb) + width
+        if work > limit:
+            raise ForwardWorkLimit
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        # 坏帧（含 forward-decode 恒真的 alignment）不计 VLAN、不学习
+        if (
+            length < FRAME_CHECK_RUNT_LENGTH
+            or length > max_frame
+            or not alignment
+            or not fcs
+        ):
+            continue
+        ingress = by_name[port_name]
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if not rejected and ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+
+
 def validate_forward_decode_frames(frames, ports):
     # 帧外壳契约（t/port/data、单层 8100、双标签拒绝）与 frame-decode
     # 一致，复用其全量校验；ports 为新式端口字典，取其名字集合
@@ -11445,9 +11484,11 @@ def validate_forward_decode_frames(frames, ports):
     return checked
 
 
-def forward_decode(frames, ports, age, max_frame):
-    # 按 frame-decode 规则解析原始帧，再接入新式 forward（forward_check）：
-    # 无对齐概念，alignment 恒真，分类退化为 runt/giant/bad_fcs/good
+def _decode_raw_frames(frames):
+    """按 frame-decode 规则解析原始帧为 forward_check 的八元组帧序。
+
+    无对齐概念，alignment 恒真，分类退化为 runt/giant/bad_fcs/good。
+    """
     checked = []
     for t, port, raw in frames:
         dst = _format_mac(raw[0:6])
@@ -11461,7 +11502,12 @@ def forward_decode(frames, ports, age, max_frame):
             4, "little"
         )
         checked.append((t, port, src, dst, vlan, len(raw), fcs, True))
-    return forward_check(checked, ports, age, max_frame)
+    return checked
+
+
+def forward_decode(frames, ports, age, max_frame):
+    # 按 frame-decode 规则解析原始帧，再接入新式 forward（forward_check）
+    return forward_check(_decode_raw_frames(frames), ports, age, max_frame)
 
 
 LINK_STATE_CONFIG_KEYS = frozenset({"ports", "delay"})
@@ -12989,6 +13035,7 @@ EVENT_KIND_BY_KEYS = {
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
     LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
+    FRAME_DECODE_FRAME_KEYS: "frame",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -13017,6 +13064,8 @@ def _log_mode(config):
             return "link_state"
         if keys == FORWARD_STATIC_CONFIG_KEYS:
             return "forward_static"
+        if keys == FORWARD_CHECK_CONFIG_KEYS:
+            return "forward_decode"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13176,6 +13225,39 @@ def _run_forward_static(config, events, observe, max_work=None):
         # 与 forward-static 入口同一公式：独立预置静态项的 FDB，无副作用
         forward_static_work(frames, ports, age, static, max_work)
     result = forward_static(frames, ports, age, static)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
+    return result, observer
+
+
+def _run_forward_decode(config, events, observe, max_work=None):
+    """record/replay forward-decode 模式：校验 forward-decode 配置与原始帧
+    并执行仿真。
+
+    语义同 forward-decode 子命令（CONFIG、FRAMES 校验与转发行为完全沿用）；
+    max_work 非 None 时（record/replay）全量语义校验后先按逐帧 K+P+1
+    （K 为本帧老化前动态 FDB 项数，P 为端口数；坏帧与准入拒绝也计费）
+    无副作用预演，首次超过即抛 ForwardWorkLimit，不正式转发。返回
+    (forward-decode 结果 dict, observer 或 None)；每帧恒 applied，version
+    恒 0，output 为对应 results 项（键序 t,class,action,ports）。
+    """
+    ports, age, max_frame = validate_forward_check_config(config)
+    frames = validate_forward_decode_frames(events, ports)
+    if max_work is not None:
+        # 与 forward-decode 转发同形的独立空 FDB 副本，无副作用
+        forward_check_work(
+            _decode_raw_frames(frames), ports, age, max_frame, max_work
+        )
+    result = forward_decode(frames, ports, age, max_frame)
     observer = {} if observe else None
     if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
         observer["items"] = [
@@ -13514,6 +13596,10 @@ def _cmd_record(
             result, observer = _run_forward_static(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_decode":
+            result, observer = _run_forward_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "security_check":
             result, observer = _run_security_check(
                 config, events, True, max_record_work
@@ -13611,6 +13697,10 @@ def _cmd_replay(
             )
         elif mode == "forward_static":
             result, observer = _run_forward_static(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward_decode":
+            result, observer = _run_forward_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "security_check":
