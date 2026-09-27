@@ -6257,8 +6257,10 @@ def acl_check_work(
 
 def forward_acl_check(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
-    acl, max_frame, events
+    acl, max_frame, events, observer=None
 ):
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
@@ -6480,17 +6482,29 @@ def forward_acl_check(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            link_changed = by_id[lid]["up"] != up
+            if link_changed:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
                 for name in old_forwarding - forwarding_ports(t):
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": link_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "member":
             _, t, member, up = item
+            member_changed = member_up[member] != up
             member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "member", "t": t, "applied": member_changed,
+                     "output": None}
+                )
             continue
         _, t, port_name, src, dst, tag, ethertype, priority, length, fcs, alignment = item
         # 帧先令入端口 rx 与对应 class 计数加一
@@ -6519,6 +6533,11 @@ def forward_acl_check(
                     "mirrors": [],
                 }
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         if tag is None:
             vlan = by_name[port_name]["pvid"]
@@ -6540,6 +6559,11 @@ def forward_acl_check(
                     "mirrors": [],
                 }
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
         acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
@@ -6561,6 +6585,11 @@ def forward_acl_check(
                     "mirrors": [],
                 }
             )
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         # 入端口命中 sources 则复制；remark 后副本携带新 VLAN
         ingress_copy = None
@@ -6662,6 +6691,11 @@ def forward_acl_check(
                 "mirrors": mirrors,
             }
         )
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True,
+                 "output": results[-1]}
+            )
     return {
         "results": results,
         "ports": [
@@ -13175,6 +13209,7 @@ EVENT_KIND_BY_KEYS = {
     FRAME_KEYS_V2: "frame",
     FRAME_KEYS_ACL: "frame",
     QOS_CHECK_FRAME_KEYS: "frame",
+    ACL_CHECK_FRAME_KEYS: "frame",
     RELOAD_EVENT_KEYS: "reload",
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
@@ -13196,7 +13231,7 @@ def _event_kind(event):
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
     link-state、forward-static、forward-decode、stp-decode、qos-check、
-    security-check 或 port-security。"""
+    acl-check、security-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13215,6 +13250,8 @@ def _log_mode(config):
             return "stp_decode"
         if keys == QOS_CHECK_CONFIG_KEYS:
             return "qos_check"
+        if keys == ACL_CHECK_CONFIG_KEYS:
+            return "acl_check"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
     return "security"
@@ -13578,6 +13615,66 @@ def _run_qos_check(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_acl_check(config, events, observe, max_work=None):
+    """record/replay acl-check 模式：校验 acl-check 配置与事件并执行仿真。
+
+    语义同 acl-check 子命令；max_work 非 None 时（record/replay）全量
+    语义校验后先按 acl-check 公式（与 acl 同口径）无副作用预演，坏帧、
+    准入拒绝与幂等事件均计费，首次超过即抛 AclWorkLimit，不正式仿真。
+    返回 (acl-check 结果 dict, observer 或 None)；帧项恒 applied 且
+    output 为对应 results 项，链路/成员项仅状态实际改变时 applied，
+    output 恒 None。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        max_frame,
+    ) = validate_acl_check_config(config)
+    link_ids = {link["id"] for link in links}
+    check_events = validate_acl_check_events(events, ports, link_ids, lags)
+    if max_work is not None:
+        # 与 acl-check 入口同一公式：独立链路副本与空状态，无副作用
+        acl_check_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            max_frame,
+            check_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = forward_acl_check(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        max_frame,
+        check_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
@@ -13587,8 +13684,8 @@ def _build_log_doc(config, events, items):
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1，security-check/qos-check 模式仅 applied 链路/
-    # 成员项加 1（帧与 service 恒 applied 但不计），stp-decode 模式仅
+    # 仅 applied 项加 1，security-check/qos-check/acl-check 模式仅
+    # applied 链路/成员项加 1（帧与 service 恒 applied 但不计），stp-decode 模式仅
     # applied 链路项加 1（帧项恒 applied 但不计），forward-static 模式
     # 帧恒 applied 且 version 恒 0
     version = 0
@@ -13605,7 +13702,7 @@ def _build_log_doc(config, events, items):
         elif mode == "link_state":
             if observed["applied"]:
                 version += 1
-        elif mode in ("security_check", "qos_check"):
+        elif mode in ("security_check", "qos_check", "acl_check"):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
@@ -13733,7 +13830,7 @@ def _verify_records(log, events, items):
         elif mode == "link_state":
             if observed["applied"]:
                 version += 1
-        elif mode in ("security_check", "qos_check"):
+        elif mode in ("security_check", "qos_check", "acl_check"):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
         elif kind in ("reload", "rollback"):
@@ -13852,6 +13949,10 @@ def _cmd_record(
             result, observer = _run_qos_check(
                 config, events, True, max_record_work
             )
+        elif mode == "acl_check":
+            result, observer = _run_acl_check(
+                config, events, True, max_record_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_record_work
@@ -13881,6 +13982,7 @@ def _cmd_record(
         LinkWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
+        AclWorkLimit,
     ):
         _fail("record_work_limit")
         return 5
@@ -13965,6 +14067,10 @@ def _cmd_replay(
             result, observer = _run_qos_check(
                 config, events, True, max_replay_work
             )
+        elif mode == "acl_check":
+            result, observer = _run_acl_check(
+                config, events, True, max_replay_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_replay_work
@@ -13992,6 +14098,7 @@ def _cmd_replay(
         LinkWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
+        AclWorkLimit,
     ):
         _fail("replay_work_limit")
         return 5
