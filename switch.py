@@ -13192,7 +13192,12 @@ def _cmd_record(
 
 
 def _cmd_replay(
-    log_path, max_events, max_log_bytes, max_output_bytes, max_replay_work
+    log_path,
+    max_events,
+    max_log_bytes,
+    max_output_bytes,
+    max_replay_work,
+    expect_sha256=None,
 ):
     try:
         with open(log_path, "rb") as handle:
@@ -13209,6 +13214,10 @@ def _cmd_replay(
         _validate_log_shape(log)
         if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
             raise InvalidInput("bad log sha256")
+        # 外部承诺（--expect-sha256）在 LOG 内摘要校验后、事件数与语义
+        # 判定前比较；不等即 invalid_input，LOG 保持不动
+        if expect_sha256 is not None and log["sha256"] != expect_sha256:
+            raise InvalidInput("log sha256 mismatch")
         config = log["config"]
         events = [record["event"] for record in log["records"]]
         # records 上界在解析校验后、重放前判定
@@ -13807,11 +13816,22 @@ def main(argv):
     if args[:1] == ["replay"]:
         # replay LOG [MAX_EVENTS MAX_LOG_BYTES [MAX_OUTPUT_BYTES
         #   [MAX_REPLAY_WORK]]]
-        if len(args) not in (2, 4, 5, 6):
+        # 或 replay LOG --expect-sha256 EXPECTED [MAX_EVENTS MAX_LOG_BYTES
+        #   [MAX_OUTPUT_BYTES [MAX_REPLAY_WORK]]]；EXPECTED 须为 64 位
+        # 小写十六进制，由调用方从成功 record 产物独立保存
+        if len(args) < 2:
             _fail("usage")
             return 2
+        tokens = args[2:]
+        expect_sha256 = None
+        if tokens[:1] == ["--expect-sha256"]:
+            if len(tokens) < 2 or _HEX64_RE.fullmatch(tokens[1]) is None:
+                _fail("usage")
+                return 2
+            expect_sha256 = tokens[1]
+            tokens = tokens[2:]
         limits = _parse_limits(
-            args[2:],
+            tokens,
             (0, 2, 3, 4),
             (
                 DEFAULT_MAX_EVENTS,
@@ -13823,7 +13843,7 @@ def main(argv):
         if limits is None:
             _fail("usage")
             return 2
-        return _cmd_replay(args[1], *limits)
+        return _cmd_replay(args[1], *limits, expect_sha256=expect_sha256)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
