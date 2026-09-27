@@ -11429,6 +11429,202 @@ def forward_check(frames, ports, age, max_frame):
     }
 
 
+FORWARD_DECODE_FRAME_KEYS = FRAME_DECODE_FRAME_KEYS
+
+
+def validate_forward_decode_frames(frames, ports):
+    """forward-decode 帧校验：键恰为 t,port,data，约束同 frame-decode 的
+    data，并额外拒绝双 8100 标签、源 MAC 非零单播规则不符、目的 MAC 全零。
+
+    与 frame-decode 一致：hex 偶数位小写、至少 18 字节、单标签至少 22 字节。
+    """
+    if not isinstance(frames, list):
+        raise InvalidInput("frames must be a list")
+    port_set = {port["name"] for port in ports}
+    result = []
+    prev_t = None
+    for frame in frames:
+        if (
+            not isinstance(frame, dict)
+            or frozenset(frame) != FORWARD_DECODE_FRAME_KEYS
+        ):
+            raise InvalidInput("bad frame")
+        t = frame["t"]
+        port = frame["port"]
+        data = frame["data"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if not isinstance(port, str) or port not in port_set:
+            raise InvalidInput("unknown port")
+        if (
+            not isinstance(data, str)
+            or len(data) % 2 != 0
+            or FRAME_DECODE_DATA_RE.fullmatch(data) is None
+        ):
+            raise InvalidInput("bad data")
+        raw = bytes.fromhex(data)
+        if len(raw) < FRAME_DECODE_MIN_BYTES:
+            raise InvalidInput("frame too short")
+        if raw[12:14] == FRAME_DECODE_TAG:
+            # 单层 802.1Q：总长须容纳标签，且标签后不得再为 8100（双标签）
+            if len(raw) < FRAME_DECODE_MIN_TAGGED_BYTES:
+                raise InvalidInput("tagged frame too short")
+            if raw[16:18] == FRAME_DECODE_TAG:
+                raise InvalidInput("double tag")
+        dst = raw[0:6]
+        src = raw[6:12]
+        if not any(dst):  # 目的 MAC 全零
+            raise InvalidInput("bad dst")
+        if src[0] & 1 or not any(src):  # 源 MAC 须为非零单播
+            raise InvalidInput("bad src")
+        result.append((t, port, raw))
+    return result
+
+
+def forward_decode(frames, ports, age, max_frame):
+    """原始以太帧接入新式 forward。
+
+    按 frame-decode 规则解析单层 8100 标签、目的/源 MAC、优先级、DEI、
+    以太类型及小端 CRC32；分类依次为 runt、giant、bad_fcs、good。good
+    从 VLAN 准入起沿用 forward_check/forward_v2 的老化、学习、单播与
+    泛洪、出站标签和统计；其余类只计入端口 rx、对应分类和 drop，不计
+    VLAN 且不学习。
+    """
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    for t, port_name, raw in frames:
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        src = _format_mac(raw[6:12])
+        dst_octets = raw[0:6]
+        dst = _format_mac(dst_octets)
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            tag = tci & 0x0FFF
+        else:
+            tag = None
+        if len(raw) < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif len(raw) > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (
+            zlib.crc32(raw[:-4]) & 0xFFFFFFFF
+        ).to_bytes(4, "little"):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        port_stats[port_name][cls] += 1
+        if cls != "good":  # 非 good 丢弃且不学习、不转发、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        if ingress["up"]:
+            fdb[(vlan, src)] = [port_name, t]
+            # 广播及组播（目的首字节最低位为 1）一律视为未知目的泛洪，
+            # 不查 FDB
+            group = dst_octets[0] & 1
+            hit = None if group else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target = by_name[hit[0]]
+                if target["up"] and vlan in target["allowed"]:
+                    egress = [hit[0]]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in ports
+                    if vlan in port["allowed"]
+                    and port["up"]
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {"t": t, "class": cls, "action": action, "ports": out_ports}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
+
+
 LINK_STATE_CONFIG_KEYS = frozenset({"ports", "delay"})
 LINK_STATE_PORT_KEYS = frozenset({"name", "rates", "modes"})
 LINK_STATE_EVENT_KEYS = frozenset(
@@ -14078,6 +14274,54 @@ def _cmd_forward_check(
     return 0
 
 
+def _cmd_forward_decode(
+    config_path,
+    frames_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、FRAMES 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            frames_path, "rb"
+        ) as frames_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            frames_raw = _read_limited(frames_handle, max_data_bytes)
+            if frames_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        frames_doc = parse_json(frames_raw)
+        # 帧数上界在解析后、语义校验前判定；FRAMES 非数组仍按非法输入处理
+        if isinstance(frames_doc, list) and len(frames_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 配置契约与 forward-check 一致，复用其全量校验
+        ports, age, max_frame = validate_forward_check_config(config)
+        # 两文件先全量校验，再正式仿真（无部分状态）
+        frames = validate_forward_decode_frames(frames_doc, ports)
+        result = forward_decode(frames, ports, age, max_frame)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_forward(
     config_path,
     events_path,
@@ -14144,6 +14388,7 @@ SUBCOMMANDS = frozenset((
     "frame-decode",
     "link-state",
     "forward-check",
+    "forward-decode",
     "link-forward",
     "fdb",
     "forward",
@@ -14381,6 +14626,27 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_forward_check(args[1], args[2], *limits)
+    if args[:1] == ["forward-decode"]:
+        # forward-decode CONFIG FRAMES [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES]]：参数、资源与错误契约同
+        #   forward-check，可选上限仅 0、2、4 项
+        if len(args) not in (3, 5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_forward_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
