@@ -780,6 +780,12 @@ def stp_converge(bridges, links):
 
 
 def stp(bridges, links, delay, events, max_work=None):
+    return _stp_observed(bridges, links, delay, events, max_work, None)
+
+
+def _stp_observed(bridges, links, delay, events, max_work, observer):
+    """stp 内部封装；observer 非 None 时（record/replay）逐事件记录
+    applied 与事件后完整快照（初始 t=0 快照不记录）。"""
     by_id = {link["id"]: link for link in links}
     B = len(bridges)
     L = len(links)
@@ -804,6 +810,8 @@ def stp(bridges, links, delay, events, max_work=None):
     if max_work is not None and work > max_work:
         raise StpWorkLimit
 
+    if observer is not None:  # record：逐事件记录 applied 与事件后快照
+        observer["items"] = []
     previous = {}  # (bridge, port) -> 上一轮角色
     since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
     results = []
@@ -854,10 +862,16 @@ def stp(bridges, links, delay, events, max_work=None):
 
     snapshot(0)
     for t, lid, new_up in events:
-        if by_id[lid]["up"] != new_up:
+        changed = by_id[lid]["up"] != new_up
+        if changed:
             by_id[lid]["up"] = new_up
             cached = None
         snapshot(t)
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "link", "t": t, "applied": changed,
+                 "output": results[-1]}
+            )
     return {"results": results}
 
 
@@ -11183,7 +11197,15 @@ def validate_link_state_events(events, ports):
     return result
 
 
-def link_state(events, ports, delay, observer=None):
+def link_state(events, ports, delay):
+    """链路状态库函数：精确签名 (events, ports, delay)，返回
+    {"results": [...]}；record/replay 的观察逻辑在内部封装中。"""
+    return _link_state_observed(events, ports, delay, None)
+
+
+def _link_state_observed(events, ports, delay, observer):
+    """link_state 内部封装；observer 非 None 时（record/replay）逐事件
+    记录 applied 与对应 results 项。"""
     if observer is not None:  # record：逐事件记录 applied 与对应 results 项
         observer["items"] = []
     caps = {name: (rates, modes) for name, rates, modes in ports}
@@ -12607,7 +12629,8 @@ def _event_kind(event):
 
 
 def _log_mode(config):
-    """record/replay 按 config 形状选模式：loop-detect、link-forward、link-state 或 port-security。"""
+    """record/replay 按 config 形状选模式：loop-detect、link-forward、
+    link-state、stp 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == LOOP_CONFIG_KEYS:
@@ -12616,6 +12639,8 @@ def _log_mode(config):
             return "link_forward"
         if keys == LINK_STATE_CONFIG_KEYS:
             return "link_state"
+        if keys == STP_CONFIG_KEYS:
+            return "stp"
     return "security"
 
 
@@ -12735,7 +12760,25 @@ def _run_link_state(config, events, observe, max_work=None):
         # 累计 Q+1，无副作用
         link_state_work(ls_events, ports, delay, max_work)
     observer = {} if observe else None
-    result = link_state(ls_events, ports, delay, observer=observer)
+    result = _link_state_observed(ls_events, ports, delay, observer)
+    return result, observer
+
+
+def _run_stp(config, events, observe, max_work=None):
+    """record/replay STP 模式：校验 stp 配置与事件并执行仿真。
+
+    语义同 stp 子命令；工作量（初值 B+L+2U，每次实际改变后按新 U 再加
+    该式，幂等不加）在 _stp_observed 内、正式仿真前无副作用预演，等于
+    上限合法，超限抛 StpWorkLimit。返回 (stp 结果 dict, observer 或
+    None)；初始 t=0 快照不进 records。
+    """
+    bridges, links, delay = validate_stp_config(config)
+    link_ids = {link["id"] for link in links}
+    stp_events = validate_stp_events(events, link_ids)
+    observer = {} if observe else None
+    result = _stp_observed(
+        bridges, links, delay, stp_events, max_work, observer
+    )
     return result, observer
 
 
@@ -12748,13 +12791,13 @@ def _build_log_doc(config, events, items):
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1
+    # 仅 applied 项加 1，STP 模式链路 up 实际改变（applied）才加 1
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
-        if mode == "loop":
+        if mode in ("loop", "stp"):
             if observed["applied"]:
                 version += 1
         elif mode == "link_forward":
@@ -12879,7 +12922,7 @@ def _verify_records(log, events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
-        if mode == "loop":
+        if mode in ("loop", "stp"):
             if observed["applied"]:
                 version += 1
         elif mode == "link_forward":
@@ -12980,6 +13023,10 @@ def _cmd_record(
             result, observer = _run_link_state(
                 config, events, True, max_record_work
             )
+        elif mode == "stp":
+            result, observer = _run_stp(
+                config, events, True, max_record_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_record_work
@@ -13004,6 +13051,7 @@ def _cmd_record(
         LoopWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
+        StpWorkLimit,
     ):
         _fail("record_work_limit")
         return 5
@@ -13053,6 +13101,10 @@ def _cmd_replay(
             result, observer = _run_link_state(
                 config, events, True, max_replay_work
             )
+        elif mode == "stp":
+            result, observer = _run_stp(
+                config, events, True, max_replay_work
+            )
         else:
             result, observer = _run_reload(
                 config, events, True, max_replay_work
@@ -13075,6 +13127,7 @@ def _cmd_replay(
         LoopWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
+        StpWorkLimit,
     ):
         _fail("replay_work_limit")
         return 5
