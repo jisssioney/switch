@@ -15728,6 +15728,107 @@ def _cmd_log_query(
     return 0
 
 
+FDB_DIGEST_KEYS = ("schema", "source_sha256", "offset", "fdb")
+
+
+def _fdb_prefix_bytes(doc):
+    """log-fdb 末项摘要文本：前四键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in FDB_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _fdb_bytes(doc):
+    """log-fdb stdout 载荷：五键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in FDB_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_fdb(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-page：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验）。输入/输出上限固定各 16777216 字节，分块读取与字节边界沿用
+    # log-page，等于上限合法
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            # * 表示 records 长度：offset 取记录数，即重演全部记录
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受 fdb 配置形状，其他模式一律
+        # invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "fdb":
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空 FDB 重演完全沿用 replay 的 fdb 路径：逐项
+        # 核对 t/version/applied/output，重建 LOG 须与原文件逐字节一致
+        result, observer = _run_fdb(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条记录求 FDB：独立空映射、无副作用。先逐事件以
+        # 老化前表项数 K 计 K+1（等于上限合法，首次超过即抛
+        # FdbWorkLimit），再正式重演；offset=0 为空表，表项按 vlan 数值、
+        # mac 字典序，项键序 vlan,mac,port,seen（均沿用 simulate）
+        ports, age = validate_config(config)
+        fdb_events = validate_events(events, ports)
+        prefix_events = fdb_events[:offset]
+        fdb_work(prefix_events, age, max_work)
+        fdb_entries = simulate(prefix_events, age)["fdb"]
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "fdb": fdb_entries,
+        }
+        doc["sha256"] = hashlib.sha256(_fdb_prefix_bytes(doc)).hexdigest()
+        payload = _fdb_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except FdbWorkLimit:
+        _fail("fdb_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_log_diff(
     left_path,
     right_path,
@@ -16489,6 +16590,7 @@ SUBCOMMANDS = frozenset((
     "log-counters",
     "log-page",
     "log-query",
+    "log-fdb",
     "log-diff",
     "config-diff",
     "config-export",
@@ -16681,6 +16783,25 @@ def main(argv):
             args[1], args[2], args[3], args[4], args[5], args[6], args[7],
             *limits
         )
+    if args[:1] == ["log-fdb"]:
+        # log-fdb LOG CURSOR [MAX_WORK]：CURSOR 沿用 log-page（* 或
+        # <sha256>:<offset>），MAX_WORK 为不限长正十进制，默认 10000000；
+        # 个数或格式非法按 usage 退出 2（在打开文件前判定）。输入/输出
+        # 各限 16777216 字节（固定默认值）
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_FDB_WORK
+        )
+        return _cmd_log_fdb(args[1], args[2], max_work)
     if args[:1] == ["log-diff"]:
         # log-diff LEFT RIGHT [MAX_LOG_BYTES MAX_OUTPUT_BYTES MAX_DIFF_WORK]：
         # 三上限可省略或全给（0 或 3 个），格式沿用 config-diff（均须匹配
