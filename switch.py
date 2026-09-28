@@ -13517,6 +13517,7 @@ EVENT_KIND_BY_KEYS = {
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
     LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
     FRAME_DECODE_FRAME_KEYS: "frame",
+    FORWARD_CHECK_FRAME_KEYS: "frame",
 }
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -13532,13 +13533,17 @@ def _event_kind(event):
 
 def _log_mode(config, events=None):
     """record/replay 按 config 形状选模式：fdb、forward、stp、loop-detect、
-    link-forward、link-state、forward-static、forward-stp、forward-decode、
+    link-forward、link-state、forward-static、forward-stp、forward-check/
+    forward-decode（共享 ports,age,max_frame 三键配置，按帧形状区分）、
     stp-check/stp-decode（共享七键配置，按事件帧形状区分）、
     forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
     security-check、mirror-check、lag-check、storm-check 或 port-security。
 
-    events 非 None 时用于区分 stp-check 与 stp-decode：非链路帧含 src
-    （九键）按 stp-check，含 data（t/port/data 原始帧）按 stp-decode；
+    events 非 None 时用于区分共享配置形状的两种模式：三键配置的非空帧
+    数组含 src（八键）按 forward-check，含 data（t/port/data 原始帧）按
+    forward-decode；两种帧形状混用报 InvalidInput；空数组沿用既有
+    forward-decode 路由（既有日志字节不变）。stp 七键配置的非链路帧含
+    src（九键）按 stp-check，含 data（t/port/data 原始帧）按 stp-decode；
     两种帧形状混用报 InvalidInput；仅链路项或空事件沿用既有 stp-decode
     路由（既有日志字节不变）。
     """
@@ -13573,7 +13578,24 @@ def _log_mode(config, events=None):
         if keys == FORWARD_STP_CONFIG_KEYS:
             return "forward_stp"
         if keys == FORWARD_CHECK_CONFIG_KEYS:
-            return "forward_decode"
+            # forward-check 与 forward-decode 共享三键配置：非空帧数组含
+            # src（八键）按 forward-check，含 data 按 forward-decode，两种
+            # 帧形状混用即非法输入；空数组沿用既有 forward-decode 路由
+            saw_src = False
+            saw_data = False
+            for event in events if isinstance(events, list) else ():
+                if not isinstance(event, dict):
+                    raise InvalidInput("bad log event")
+                ekeys = frozenset(event)
+                if ekeys == FORWARD_CHECK_FRAME_KEYS:
+                    saw_src = True
+                elif ekeys == FRAME_DECODE_FRAME_KEYS:
+                    saw_data = True
+                else:
+                    raise InvalidInput("bad log event")
+            if saw_src and saw_data:
+                raise InvalidInput("bad log event")
+            return "forward_check" if saw_src else "forward_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
             # stp-check 与 stp-decode 共享七键配置：非链路帧含 src 按
             # stp-check，含 data 按 stp-decode，两种帧形状混用即非法输入
@@ -13889,6 +13911,38 @@ def _run_forward_decode(config, events, observe, max_work=None):
             _decode_raw_frames(frames), ports, age, max_frame, max_work
         )
     result = forward_decode(frames, ports, age, max_frame)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
+    return result, observer
+
+
+def _run_forward_check(config, events, observe, max_work=None):
+    """record/replay forward-check 模式：校验 forward-check 配置与八元组帧
+    并执行仿真。
+
+    语义同 forward-check 子命令（CONFIG、FRAMES 校验与转发行为完全沿用）；
+    max_work 非 None 时（record/replay）全量语义校验后先按逐帧 K+P+1
+    （K 为本帧老化前动态 FDB 项数，P 为端口数；坏帧、VLAN 准入拒绝与
+    down 口也计费）无副作用预演，首次超过即抛 ForwardWorkLimit，不正式
+    转发。返回 (forward-check 结果 dict, observer 或 None)；每帧恒
+    applied，version 恒 0，output 为对应 results 项（键序
+    t,class,action,ports）。
+    """
+    ports, age, max_frame = validate_forward_check_config(config)
+    frames = validate_forward_check_frames(events, ports)
+    if max_work is not None:
+        # 与 forward-check 转发同形的独立空 FDB 副本，无副作用
+        forward_check_work(frames, ports, age, max_frame, max_work)
+    result = forward_check(frames, ports, age, max_frame)
     observer = {} if observe else None
     if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
         observer["items"] = [
@@ -14869,6 +14923,10 @@ def _cmd_record(
             result, observer = _run_forward_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_check":
+            result, observer = _run_forward_check(
+                config, events, True, max_record_work
+            )
         elif mode == "stp_decode":
             result, observer = _run_stp_decode(
                 config, events, True, max_record_work
@@ -15037,6 +15095,10 @@ def _cmd_replay(
             )
         elif mode == "forward_decode":
             result, observer = _run_forward_decode(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward_check":
+            result, observer = _run_forward_check(
                 config, events, True, max_replay_work
             )
         elif mode == "stp_decode":
