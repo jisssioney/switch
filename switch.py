@@ -15788,6 +15788,116 @@ def _cmd_config_diff(
     return 0
 
 
+def _cmd_log_diff(
+    left_path,
+    right_path,
+    max_log_bytes=DEFAULT_MAX_LOG_BYTES,
+    max_output_bytes=None,
+    max_diff_work=DEFAULT_MAX_DIFF_WORK,
+):
+    if max_output_bytes is None:
+        # 调用时解析缺省：测试可在导入后补丁 DEFAULT_MAX_OUTPUT_BYTES
+        max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 LEFT、RIGHT 顺序分块读
+        with open(left_path, "rb") as left_handle, open(
+            right_path, "rb"
+        ) as right_handle:
+            # 读取与字节边界沿用 log-query：分块至多 65536 字节，输入上限
+            # 按原始字节计，等于上限合法；两侧各受首项 MAX_LOG_BYTES 限制
+            left_raw = _read_limited(left_handle, max_log_bytes)
+            if left_raw is None:
+                _fail("log_limit")
+                return 5
+            right_raw = _read_limited(right_handle, max_log_bytes)
+            if right_raw is None:
+                _fail("log_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        # 两份均仅静态校验（与 log-query 同一套）：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256；不校验配置
+        # 语义、不重演事件
+        left_log = parse_json(left_raw)
+        right_log = parse_json(right_raw)
+        _validate_log_shape(left_log)
+        _validate_log_shape(right_log)
+        if hashlib.sha256(
+            _log_prefix_bytes(left_log)
+        ).hexdigest() != left_log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        if hashlib.sha256(
+            _log_prefix_bytes(right_log)
+        ).hexdigest() != right_log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        left_config = _canonical(left_log["config"])
+        right_config = _canonical(right_log["config"])
+        left_records = left_log["records"]
+        right_records = right_log["records"]
+        # 无副作用预演工作量（S/D 沿用 config-diff）：先计根配置 D；仅配置
+        # 相等才逐项累加共同前缀记录对 D，长度差另加 1。首次超过即停，
+        # 等于上限合法；配置不同则不访问任何记录
+        remaining = _diff_work(left_config, right_config, max_diff_work)
+        if _json_equal(left_config, right_config):
+            common = min(len(left_records), len(right_records))
+            for i in range(common):
+                remaining = _diff_work(
+                    left_records[i], right_records[i], remaining
+                )
+            if len(left_records) != len(right_records):
+                if remaining < 1:
+                    raise DiffWorkLimit
+                remaining -= 1
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except DiffWorkLimit:
+        _fail("diff_work_limit")
+        return 5
+    # 确定性首个语义分歧：按 JSON 类型和值比较，对象忽略键序、数组保序。
+    # 先比 config，相等后逐项比 records，首个不同即停；共同前缀后的长度
+    # 差亦不同（at 为公共长度，缺侧 null）
+    at = None
+    left_value = None
+    right_value = None
+    if not _json_equal(left_config, right_config):
+        at = "config"
+        left_value = left_config
+        right_value = right_config
+    else:
+        common = min(len(left_records), len(right_records))
+        index = 0
+        while index < common and _json_equal(
+            left_records[index], right_records[index]
+        ):
+            index += 1
+        if index < common:
+            at = index
+            left_value = _canonical(left_records[index])
+            right_value = _canonical(right_records[index])
+        elif len(left_records) != len(right_records):
+            at = common
+            if len(left_records) > common:
+                left_value = _canonical(left_records[common])
+            else:
+                right_value = _canonical(right_records[common])
+    result = {
+        "equal": at is None,
+        "at": at,
+        "left": left_value,
+        "right": right_value,
+    }
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_config_export(
     config_path,
     max_export_work=DEFAULT_MAX_EXPORT_WORK,
@@ -16262,6 +16372,7 @@ SUBCOMMANDS = frozenset((
     "log-summary",
     "log-page",
     "log-query",
+    "log-diff",
     "config-diff",
     "config-export",
     "config-import",
@@ -16433,6 +16544,26 @@ def main(argv):
             args[1], args[2], args[3], args[4], args[5], args[6], args[7],
             *limits
         )
+    if args[:1] == ["log-diff"]:
+        # log-diff LEFT RIGHT [MAX_LOG_BYTES MAX_OUTPUT_BYTES MAX_DIFF_WORK]：
+        # 三项上限可省略或全给（0 或 3 个），均须匹配 [1-9][0-9]*，默认
+        # 16 MiB、16 MiB、10000000，格式沿用 config-diff
+        if len(args) not in (3, 6):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 3),
+            (
+                DEFAULT_MAX_LOG_BYTES,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_DIFF_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_diff(args[1], args[2], *limits)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
