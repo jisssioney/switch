@@ -13445,6 +13445,8 @@ DEFAULT_MAX_REPLAY_WORK = 10000000
 DEFAULT_MAX_DIFF_WORK = 10000000
 DEFAULT_MAX_LINK_WORK = 10000000
 DEFAULT_MAX_LINK_FORWARD_WORK = 10000000
+# log-counters 末项工作量上限：逐帧 K+P+1 重演核对，默认 10000000
+DEFAULT_MAX_STATS_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -15369,6 +15371,109 @@ def _cmd_log_summary(log_path, max_log_bytes, max_output_bytes):
     return 0
 
 
+COUNTERS_DIGEST_KEYS = ("schema", "source_sha256", "ports", "vlans")
+
+
+def _counters_prefix_bytes(doc):
+    """log-counters 末项摘要文本：前四键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in COUNTERS_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _counters_bytes(doc):
+    """log-counters stdout 载荷：五键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in COUNTERS_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_counters(
+    log_path, max_log_bytes, max_output_bytes, max_stats_work
+):
+    try:
+        with open(log_path, "rb") as handle:
+            # 读取与字节边界完全沿用 log-summary：分块至多 65536 字节，
+            # 输入上限按原始字节计，等于上限合法
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部 sha256 核对完全沿用 replay；仅接受 forward 旧
+        # （access）/新（802.1Q）配置，其他模式一律按非法输入
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "forward":
+            raise InvalidInput("unsupported log mode")
+        # 按 replay 合同从空 FDB 核对重演：_run_forward 先全量语义校验，
+        # 再以独立空 FDB 逐帧累计 K+P+1（K 为本帧老化前动态 FDB 项数，
+        # P 为配置端口数；拒绝帧与 down 口帧也计）无副作用预演，等于
+        # 上限合法、首次超过抛 ForwardWorkLimit；随后正式转发并逐项
+        # 核对 t/version/event/applied/output，重放 LOG 须逐字节一致
+        result, observer = _run_forward(config, events, True, max_stats_work)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # ports 按配置序，项键序 name,rx,tx,drop；vlans 按数值升序，
+        # 项键序 vlan,rx,tx,drop；计数均为整数
+        ports = [
+            {
+                "name": item["name"],
+                "rx": item["rx"],
+                "tx": item["tx"],
+                "drop": item["drop"],
+            }
+            for item in result["ports"]
+        ]
+        vlans = [
+            {
+                "vlan": item["vlan"],
+                "rx": item["rx"],
+                "tx": item["tx"],
+                "drop": item["drop"],
+            }
+            for item in result["vlans"]
+        ]
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": log["sha256"],
+            "ports": ports,
+            "vlans": vlans,
+        }
+        doc["sha256"] = hashlib.sha256(
+            _counters_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _counters_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except ForwardWorkLimit:
+        # 在 invalid_input 之后、output_limit 之前判定
+        _fail("stats_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在重演核对与工作量上限之后、写出前判定；
+    # 等于上限合法，失败 stdout 为空且不改 LOG
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 PAGE_DIGEST_KEYS = ("schema", "source_sha256", "records", "next")
 # log-page 的 CURSOR：* 或 <sha256>:<offset>，sha256 为 64 位小写十六进制，
 # offset 为 0 或无前导零正整数（任意长度）
@@ -16387,6 +16492,7 @@ SUBCOMMANDS = frozenset((
     "replay",
     "log-filter",
     "log-summary",
+    "log-counters",
     "log-page",
     "log-query",
     "log-diff",
@@ -16524,6 +16630,26 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_log_summary(args[1], *limits)
+    if args[:1] == ["log-counters"]:
+        # log-counters LOG [MAX_LOG_BYTES MAX_OUTPUT_BYTES MAX_STATS_WORK]：
+        # 三上限可省略或全给（0 或 3 个），均须匹配 [1-9][0-9]*；前两项
+        # 沿用 log-summary（默认 16 MiB），末项默认 10000000
+        if len(args) not in (2, 5):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[2:],
+            (0, 3),
+            (
+                DEFAULT_MAX_LOG_BYTES,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_STATS_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_counters(args[1], *limits)
     if args[:1] == ["log-page"]:
         # log-page LOG CURSOR COUNT [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
         # 两上限成对可选（0 或 2 个），均须匹配 [1-9][0-9]*，默认 16 MiB；
