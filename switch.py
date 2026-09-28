@@ -15468,6 +15468,167 @@ def _cmd_log_page(
     return 0
 
 
+QUERY_DIGEST_KEYS = ("schema", "source_sha256", "query", "records", "next")
+QUERY_QUERY_KEYS = ("start", "end", "kind", "applied")
+# log-query 的 KIND：*（任意）或 learn/frame/link/member/service/reload/
+# rollback（与 log-summary 同口径，仅取静态事件键形，不重演推导）
+_QUERY_KINDS = frozenset(
+    ("learn", "frame", "link", "member", "service", "reload", "rollback")
+)
+
+
+def _query_prefix_bytes(doc):
+    """log-query 末项摘要文本：前五键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in QUERY_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _query_bytes(doc):
+    """log-query stdout 载荷：六键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in QUERY_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_query(
+    log_path, start_token, end_token, kind_token, applied_token,
+    cursor_token, count_token, max_log_bytes, max_output_bytes,
+):
+    # START/END 为 * 或任意长度非负整数（按数学整数比较）；均非 * 时
+    # START≤END；APPLIED 取 */true/false；KIND 取 * 或已知七类；
+    # CURSOR/COUNT 完全沿用 log-page；格式非法按 usage 退出 2（打开文件前）
+    if _FILTER_BOUND_RE.fullmatch(start_token) is None:
+        _fail("usage")
+        return 2
+    if _FILTER_BOUND_RE.fullmatch(end_token) is None:
+        _fail("usage")
+        return 2
+    if kind_token != "*" and kind_token not in _QUERY_KINDS:
+        _fail("usage")
+        return 2
+    if applied_token not in ("*", "true", "false"):
+        _fail("usage")
+        return 2
+    if _PAGE_CURSOR_RE.fullmatch(cursor_token) is None:
+        _fail("usage")
+        return 2
+    if _LIMIT_RE.fullmatch(count_token) is None:
+        _fail("usage")
+        return 2
+    start = None if start_token == "*" else _limit_value(start_token)
+    end = None if end_token == "*" else _limit_value(end_token)
+    if start is not None and end is not None and start > end:
+        _fail("usage")
+        return 2
+    want_applied = None if applied_token == "*" else (applied_token == "true")
+    want_kind = None if kind_token == "*" else kind_token
+    count = _limit_value(count_token)
+    try:
+        with open(log_path, "rb") as handle:
+            # 读取与字节边界完全沿用 log-filter：分块至多 65536 字节，
+            # 输入上限按原始字节计，等于上限合法
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 与 log-page 同一套静态校验与内部摘要核对：顶层/记录键序与
+        # 字段类型、config/event 规范键序、event 已知键形、内部 sha256；
+        # 不校验配置语义、不重演事件
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            # * 从原 LOG records 下标 0 开始
+            offset = 0
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 从 offset 起扫描，时间闭区间、kind、applied 合取，原序原样取
+        # 至多 COUNT 项；matched 记 (原始下标, 原样记录)
+        matched = []
+        i = offset
+        while i < total and len(matched) < count:
+            record = records[i]
+            if start is None or record["t"] >= start:
+                if end is None or record["t"] <= end:
+                    if want_kind is None or _event_kind(
+                        record["event"]
+                    ) == want_kind:
+                        if want_applied is None or record[
+                            "applied"
+                        ] is want_applied:
+                            matched.append((i, record))
+            i += 1
+        # 已收满 COUNT 项且其后仍有匹配项时 next 为 LOG.sha256:<最后返回
+        # 项的下一原始下标>（最后匹配项下标 +1）；否则 null。向前只判定
+        # 是否仍有匹配，游标本身指最后返回项的紧后原始下标（同 log-page
+        # 的“下一下标”，命名空间为原 LOG records 下标）
+        nxt = None
+        if len(matched) == count:
+            last_index = matched[-1][0]
+            j = last_index + 1
+            while j < total:
+                candidate = records[j]
+                if (
+                    (start is None or candidate["t"] >= start)
+                    and (end is None or candidate["t"] <= end)
+                    and (
+                        want_kind is None
+                        or _event_kind(candidate["event"]) == want_kind
+                    )
+                    and (
+                        want_applied is None
+                        or candidate["applied"] is want_applied
+                    )
+                ):
+                    nxt = source_sha + ":" + str(last_index + 1)
+                    break
+                j += 1
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            # query 固定四键序：输入 * 写 null，其余整数、整数、字符串、布尔
+            "query": {
+                "start": start,
+                "end": end,
+                "kind": want_kind,
+                "applied": want_applied,
+            },
+            "records": [record for _, record in matched],
+            "next": nxt,
+        }
+        doc["sha256"] = hashlib.sha256(_query_prefix_bytes(doc)).hexdigest()
+        payload = _query_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    # 输出上界（含末尾 LF）在写出前判定；等于上限合法，失败 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 CONFIG_DIFF_MAX_INPUT_BYTES = 1024 * 1024
 
 
@@ -16100,6 +16261,7 @@ SUBCOMMANDS = frozenset((
     "log-filter",
     "log-summary",
     "log-page",
+    "log-query",
     "config-diff",
     "config-export",
     "config-import",
@@ -16250,6 +16412,27 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_log_page(args[1], args[2], args[3], *limits)
+    if args[:1] == ["log-query"]:
+        # log-query LOG START END KIND APPLIED CURSOR COUNT
+        #   [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
+        # 两上限成对可选（0 或 2 个），均须匹配 [1-9][0-9]*，默认 16 MiB；
+        # START/END/APPLIED 沿用 log-filter，KIND 取 * 或七类已知事件，
+        # CURSOR/COUNT 与参数格式、分块读取、字节边界沿用 log-page
+        if len(args) not in (8, 10):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[8:],
+            (0, 2),
+            (DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_query(
+            args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+            *limits
+        )
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
