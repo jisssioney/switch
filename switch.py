@@ -240,12 +240,23 @@ def validate_events(events, ports):
     return result
 
 
-def simulate(events, age):
+def simulate(events, age, observer=None):
     fdb = {}  # (vlan, mac) -> [port, seen]
+    if observer is not None:  # record/replay：逐事件记录 applied
+        observer["items"] = []
     for t, port, mac, vlan in events:
+        # 事件前该 (vlan, mac) 的 [port, seen]（不存在为 None）
+        previous = tuple(fdb[(vlan, mac)]) if (vlan, mac) in fdb else None
         for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
             del fdb[key]
         fdb[(vlan, mac)] = [port, t]
+        if observer is not None:
+            # 含 port、seen 的表项与事件前不同（新学习、迁移或 seen 推进）
+            # 才 applied；同时刻同口重复学习幂等，applied=False
+            applied = previous != (port, t)
+            observer["items"].append(
+                {"kind": "learn", "t": t, "applied": applied, "output": None}
+            )
     entries = []
     for (vlan, mac), (port, seen) in sorted(fdb.items(), key=lambda item: item[0]):
         entries.append(
@@ -13494,6 +13505,7 @@ EVENT_KIND_BY_KEYS = {
     STP_EVENT_KEYS: "link",
     MEMBER_EVENT_KEYS: "member",
     SERVICE_EVENT_KEYS: "service",
+    EVENT_KEYS: "learn",
     FRAME_KEYS_V2: "frame",
     FRAME_KEYS_ACL: "frame",
     QOS_CHECK_FRAME_KEYS: "frame",
@@ -13518,12 +13530,18 @@ def _event_kind(event):
 
 
 def _log_mode(config):
-    """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
+    """record/replay 按 config 形状选模式：fdb、stp、loop-detect、link-forward、
     link-state、forward-static、forward-stp、forward-decode、stp-decode、
     forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
     security-check、mirror-check、lag-check、storm-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
+        # 恰含 ports,age 且 ports 为字符串数组时为 fdb 模式（forward 旧
+        # 入口的 ports 为对象数组，形状不重叠）
+        if keys == CONFIG_KEYS and isinstance(
+            config.get("ports"), list
+        ) and all(isinstance(p, str) for p in config["ports"]):
+            return "fdb"
         if keys == STP_CONFIG_KEYS:
             return "stp"
         if keys == LOOP_CONFIG_KEYS:
@@ -13563,6 +13581,25 @@ def _log_mode(config):
         if keys == STORM_CHECK_CONFIG_KEYS:
             return "storm_check"
     return "security"
+
+
+def _run_fdb(config, events, observe, max_work=None):
+    """record/replay fdb 模式：校验 fdb 配置与事件并执行仿真。
+
+    语义同 fdb 子命令；max_work 非 None 时（record/replay）全量语义校验后
+    先按 fdb 公式（逐事件累计 K+1，K 为老化前表项数）以独立空映射无副作用
+    预演，首次超过即抛 FdbWorkLimit，不正式仿真。返回 (fdb 结果 dict,
+    observer 或 None)；每项 output 恒 None，applied 与 version 由
+    _build_log_doc/_verify_records 按 FDB 是否实际改变计算。
+    """
+    ports, age = validate_config(config)
+    fdb_events = validate_events(events, ports)
+    if max_work is not None:
+        # 与 fdb 入口同一公式：独立空 FDB，无副作用
+        fdb_work(fdb_events, age, max_work)
+    observer = {} if observe else None
+    result = simulate(fdb_events, age, observer=observer)
+    return result, observer
 
 
 def _run_stp(config, events, observe, max_work=None):
@@ -14449,8 +14486,10 @@ def _build_log_doc(config, events, items):
         raise InvalidInput("bad log")
     mode = _log_mode(config)
     records = []
-    # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
-    # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
+    # version 初值 0，取事件后值；fdb 模式含 port、seen 的表项实际改变
+    # （applied）才加 1（同时刻同口幂等重复学习不计），安全模式每次
+    # reload/rollback（无变化亦算）加 1，stp/环路模式链路 up 实际改变
+    # （applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，qos/lag/mirror/acl/security-check/qos-check/
     # acl-check/mirror-check/lag-check/storm-check 模式仅 applied 链路/
@@ -14462,7 +14501,7 @@ def _build_log_doc(config, events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
-        if mode in ("stp", "loop"):
+        if mode in ("fdb", "stp", "loop"):
             if observed["applied"]:
                 version += 1
         elif mode in (
@@ -14595,7 +14634,7 @@ def _verify_records(log, events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
-        if mode in ("stp", "loop"):
+        if mode in ("fdb", "stp", "loop"):
             if observed["applied"]:
                 version += 1
         elif mode in (
@@ -14692,7 +14731,11 @@ def _cmd_record(
         config = parse_json(config_raw)
         events = events_preview
         mode = _log_mode(config)
-        if mode == "stp":
+        if mode == "fdb":
+            result, observer = _run_fdb(
+                config, events, True, max_record_work
+            )
+        elif mode == "stp":
             result, observer = _run_stp(
                 config, events, True, max_record_work
             )
@@ -14791,6 +14834,7 @@ def _cmd_record(
         ReloadWorkLimit,
         StpWorkLimit,
         LoopWorkLimit,
+        FdbWorkLimit,
         ForwardWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
@@ -14849,7 +14893,11 @@ def _cmd_replay(
         # 状态语义校验后先按 record 同一公式无副作用预演；首次超限即停止，
         # 不正式重放，LOG 保持不动
         mode = _log_mode(config)
-        if mode == "stp":
+        if mode == "fdb":
+            result, observer = _run_fdb(
+                config, events, True, max_replay_work
+            )
+        elif mode == "stp":
             result, observer = _run_stp(
                 config, events, True, max_replay_work
             )
@@ -14946,6 +14994,7 @@ def _cmd_replay(
         ReloadWorkLimit,
         StpWorkLimit,
         LoopWorkLimit,
+        FdbWorkLimit,
         ForwardWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
