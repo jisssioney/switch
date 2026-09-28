@@ -15369,6 +15369,105 @@ def _cmd_log_summary(log_path, max_log_bytes, max_output_bytes):
     return 0
 
 
+PAGE_DIGEST_KEYS = ("schema", "source_sha256", "records", "next")
+# log-page 的 CURSOR：* 或 <sha256>:<offset>，sha256 为 64 位小写十六进制，
+# offset 为 0 或无前导零正整数（任意长度）
+_PAGE_CURSOR_RE = re.compile(r"\*|[0-9a-f]{64}:(?:0|[1-9][0-9]*)")
+
+
+def _page_prefix_bytes(doc):
+    """log-page 末项摘要文本：前四键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in PAGE_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _page_bytes(doc):
+    """log-page stdout 载荷：五键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in PAGE_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_page(
+    log_path, cursor_token, count_token,
+    max_log_bytes, max_output_bytes,
+):
+    # CURSOR 为 * 或 <sha256>:<offset>；COUNT 为不限长正十进制；
+    # 格式非法按 usage 退出 2（在打开文件之前判定）
+    if _PAGE_CURSOR_RE.fullmatch(cursor_token) is None:
+        _fail("usage")
+        return 2
+    if _LIMIT_RE.fullmatch(count_token) is None:
+        _fail("usage")
+        return 2
+    count = _limit_value(count_token)
+    try:
+        with open(log_path, "rb") as handle:
+            # 读取与字节边界完全沿用 log-filter：分块至多 65536 字节，
+            # 输入上限按原始字节计，等于上限合法
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 与 log-filter 同一套静态校验与内部摘要核对：顶层/记录键序与
+        # 字段类型、config/event 规范键序、event 已知键形、内部 sha256；
+        # 不校验配置语义、不重演事件
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            # * 从 records 下标 0 开始
+            offset = 0
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 其他游标的摘要须等于 LOG.sha256 且 offset≤记录数
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 从 offset 按原序取至多 COUNT 条原样记录（同对象）
+        page = records[offset:offset + count]
+        next_index = offset + len(page)
+        # 有后续时 next 为 LOG.sha256:<下一下标>，否则 null
+        nxt = (
+            source_sha + ":" + str(next_index)
+            if next_index < total
+            else None
+        )
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "records": page,
+            "next": nxt,
+        }
+        doc["sha256"] = hashlib.sha256(_page_prefix_bytes(doc)).hexdigest()
+        payload = _page_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    # 输出上界（含末尾 LF）在写出前判定；等于上限合法，失败 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 CONFIG_DIFF_MAX_INPUT_BYTES = 1024 * 1024
 
 
@@ -16000,6 +16099,7 @@ SUBCOMMANDS = frozenset((
     "replay",
     "log-filter",
     "log-summary",
+    "log-page",
     "config-diff",
     "config-export",
     "config-import",
@@ -16134,6 +16234,22 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_log_summary(args[1], *limits)
+    if args[:1] == ["log-page"]:
+        # log-page LOG CURSOR COUNT [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
+        # 两上限成对可选（0 或 2 个），均须匹配 [1-9][0-9]*，默认 16 MiB；
+        # 参数格式、分块读取与字节边界完全沿用 log-filter
+        if len(args) not in (4, 6):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[4:],
+            (0, 2),
+            (DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_page(args[1], args[2], args[3], *limits)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
