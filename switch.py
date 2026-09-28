@@ -13452,6 +13452,8 @@ DEFAULT_MAX_IMPORT_WORK = DEFAULT_MAX_EXPORT_WORK
 CONFIG_IMPORT_MAX_INPUT_BYTES = 1024 * 1024
 CONFIG_IMPORT_MAX_OUTPUT_BYTES = 1024 * 1024
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
+# log-filter 的 START/END：* 或任意长度非负整数（0 或无前导零正整数）
+_FILTER_BOUND_RE = re.compile(r"\*|0|[1-9][0-9]*")
 _READ_CHUNK = 65536
 
 
@@ -15192,6 +15194,95 @@ def _cmd_replay(
     return 0
 
 
+FILTER_DIGEST_KEYS = ("schema", "source_sha256", "records")
+
+
+def _filter_prefix_bytes(doc):
+    """log-filter 末项摘要文本：前三键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in FILTER_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _filter_bytes(doc):
+    """log-filter stdout 载荷：四键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in FILTER_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_filter(
+    log_path, start_token, end_token, applied_token,
+    max_log_bytes, max_output_bytes,
+):
+    # START/END 为 * 或任意长度非负整数（按数学整数比较）；均非 * 时
+    # START≤END；APPLIED 取 */true/false，否则 usage
+    if _FILTER_BOUND_RE.fullmatch(start_token) is None:
+        _fail("usage")
+        return 2
+    if _FILTER_BOUND_RE.fullmatch(end_token) is None:
+        _fail("usage")
+        return 2
+    if applied_token not in ("*", "true", "false"):
+        _fail("usage")
+        return 2
+    start = None if start_token == "*" else _limit_value(start_token)
+    end = None if end_token == "*" else _limit_value(end_token)
+    if start is not None and end is not None and start > end:
+        _fail("usage")
+        return 2
+    want_applied = None if applied_token == "*" else (applied_token == "true")
+    try:
+        with open(log_path, "rb") as handle:
+            # 分块至多 65536 字节读取，输入上限按原始字节计，等于上限合法
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 仅静态校验：顶层/记录键序与字段类型、config/event 规范键序、
+        # event 已知键形、内部 sha256；不校验配置语义、不重演事件，
+        # 也不推导 version/applied/output
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        kept = []
+        for record in log["records"]:
+            if start is not None and record["t"] < start:
+                continue
+            if end is not None and record["t"] > end:
+                continue
+            if want_applied is not None and record["applied"] is not want_applied:
+                continue
+            kept.append(record)
+        # 原样记录（同对象）保留原序；schema 固定 1，source_sha256 取原摘要
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": log["sha256"],
+            "records": kept,
+        }
+        doc["sha256"] = hashlib.sha256(_filter_prefix_bytes(doc)).hexdigest()
+        payload = _filter_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    # 输出上界（含末尾 LF）在写出前判定；等于上限合法，失败 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 CONFIG_DIFF_MAX_INPUT_BYTES = 1024 * 1024
 
 
@@ -15821,6 +15912,7 @@ def _cmd_link_forward(
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
+    "log-filter",
     "config-diff",
     "config-export",
     "config-import",
@@ -15924,6 +16016,21 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits, expected_sha256=expected)
+    if args[:1] == ["log-filter"]:
+        # log-filter LOG START END APPLIED [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
+        # 两上限成对可选（0 或 2 个），均须匹配 [1-9][0-9]*，默认 16 MiB
+        if len(args) not in (5, 7):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[5:],
+            (0, 2),
+            (DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_filter(args[1], args[2], args[3], args[4], *limits)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
