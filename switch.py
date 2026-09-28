@@ -13452,6 +13452,8 @@ DEFAULT_MAX_IMPORT_WORK = DEFAULT_MAX_EXPORT_WORK
 CONFIG_IMPORT_MAX_INPUT_BYTES = 1024 * 1024
 CONFIG_IMPORT_MAX_OUTPUT_BYTES = 1024 * 1024
 _LIMIT_RE = re.compile(r"[1-9][0-9]*")
+# log-filter 的 START/END：* 之外须为 0|[1-9][0-9]*（不限长度）
+_FILTER_BOUND_RE = re.compile(r"\*|(?:0|[1-9][0-9]*)")
 _READ_CHUNK = 65536
 
 
@@ -13500,6 +13502,8 @@ def _read_limited(handle, limit):
 
 RECORD_SCHEMA = 1
 LOG_KEYS = ("schema", "config", "records", "sha256")
+# log-filter 产物顶层键序固定
+FILTER_OUTPUT_KEYS = ("schema", "source_sha256", "records", "sha256")
 RECORD_KEYS = ("t", "version", "event", "applied", "output")
 EVENT_KIND_BY_KEYS = {
     STP_EVENT_KEYS: "link",
@@ -15192,6 +15196,82 @@ def _cmd_replay(
     return 0
 
 
+def _filter_prefix_bytes(doc):
+    """log-filter 摘要文本：schema,source_sha256,records 紧凑序列化后含 LF。"""
+    prefix = {
+        "schema": doc["schema"],
+        "source_sha256": doc["source_sha256"],
+        "records": doc["records"],
+    }
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_filter(
+    log_path, start, end, applied, max_log_bytes, max_output_bytes
+):
+    """按 t 闭区间与 applied 静态筛选 LOG 记录，不重演、不推导任何字段。
+
+    start/end 为 None（*）或非负整数；applied 为 None（*）或 bool。
+    """
+    try:
+        with open(log_path, "rb") as handle:
+            # 每块至多 65536 字节；输入上限按原始字节计数，超限即停
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 仅静态校验：顶层与记录键序、字段类型、config/event 规范键序、
+        # event 已知键形和内部 sha256；不校验配置语义，不重演事件，不
+        # 推导 version、applied 或 output
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        # 记录原样保留（值不重算），仅按 t 闭区间与 applied 匹配筛选，原序
+        kept = []
+        for record in log["records"]:
+            t = record["t"]
+            if start is not None and t < start:
+                continue
+            if end is not None and t > end:
+                continue
+            if applied is not None and record["applied"] is not applied:
+                continue
+            kept.append(record)
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "records": kept,
+        }
+        doc["sha256"] = hashlib.sha256(
+            _filter_prefix_bytes(doc)
+        ).hexdigest()
+        output = (
+            json.dumps(
+                {key: doc[key] for key in FILTER_OUTPUT_KEYS},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        # 输出上界含末尾 LF；等于上限合法，超限时 stdout 为空且 LOG 不动
+        if len(output) > max_output_bytes:
+            _fail("output_limit")
+            return 5
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    sys.stdout.buffer.write(output)
+    return 0
+
+
 CONFIG_DIFF_MAX_INPUT_BYTES = 1024 * 1024
 
 
@@ -15821,6 +15901,7 @@ def _cmd_link_forward(
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
+    "log-filter",
     "config-diff",
     "config-export",
     "config-import",
@@ -15924,6 +16005,52 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_replay(args[1], *limits, expected_sha256=expected)
+    if args[:1] == ["log-filter"]:
+        # log-filter LOG START END APPLIED [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
+        # 两上限成对可选（仅 0 或 2 项），默认各 16777216，均须匹配
+        # [1-9][0-9]*（不限长度）；START/END 为 * 或 0|[1-9][0-9]*，
+        # 均非 * 时须 START<=END；APPLIED 取 *|true|false，否则 usage/2
+        if len(args) not in (5, 7):
+            _fail("usage")
+            return 2
+        start_token, end_token, applied_token = args[2], args[3], args[4]
+        if _FILTER_BOUND_RE.fullmatch(start_token) is None:
+            _fail("usage")
+            return 2
+        if _FILTER_BOUND_RE.fullmatch(end_token) is None:
+            _fail("usage")
+            return 2
+        start = None if start_token == "*" else _limit_value(start_token)
+        end = None if end_token == "*" else _limit_value(end_token)
+        if start is not None and end is not None and start > end:
+            _fail("usage")
+            return 2
+        if applied_token == "*":
+            applied = None
+        elif applied_token == "true":
+            applied = True
+        elif applied_token == "false":
+            applied = False
+        else:
+            _fail("usage")
+            return 2
+        if len(args) == 7 and any(
+            _LIMIT_RE.fullmatch(token) is None for token in args[5:]
+        ):
+            _fail("usage")
+            return 2
+        max_log_bytes = (
+            _limit_value(args[5]) if len(args) == 7
+            else DEFAULT_MAX_LOG_BYTES
+        )
+        max_output_bytes = (
+            _limit_value(args[6]) if len(args) == 7
+            else DEFAULT_MAX_OUTPUT_BYTES
+        )
+        return _cmd_log_filter(
+            args[1], start, end, applied,
+            max_log_bytes, max_output_bytes,
+        )
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
