@@ -15283,6 +15283,102 @@ def _cmd_log_filter(
     return 0
 
 
+SUMMARY_DIGEST_KEYS = (
+    "schema",
+    "source_sha256",
+    "total",
+    "applied",
+    "kinds",
+)
+# 事件类别固定全列次序（即使该类为 0 项）
+SUMMARY_KINDS = (
+    "learn",
+    "frame",
+    "link",
+    "member",
+    "service",
+    "reload",
+    "rollback",
+)
+
+
+def _summary_prefix_bytes(doc):
+    """log-summary 末项摘要文本：前五键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in SUMMARY_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _summary_bytes(doc):
+    """log-summary stdout 载荷：六键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in SUMMARY_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_summary(log_path, max_log_bytes, max_output_bytes):
+    try:
+        with open(log_path, "rb") as handle:
+            # 分块至多 65536 字节读取，输入上限按原始字节计，等于上限合法
+            log_raw = _read_limited(handle, max_log_bytes)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 仅静态校验（同 log-filter）：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256；
+        # 不重演事件，也不推导 version/applied/output，统计直接取自记录
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != log["sha256"]:
+            raise InvalidInput("bad log sha256")
+        totals = {kind: 0 for kind in SUMMARY_KINDS}
+        applied_totals = {kind: 0 for kind in SUMMARY_KINDS}
+        total = 0
+        applied = 0
+        for record in log["records"]:
+            kind = _event_kind(record["event"])
+            totals[kind] += 1
+            total += 1
+            if record["applied"]:
+                applied_totals[kind] += 1
+                applied += 1
+        # schema 固定 1，source_sha256 取原 LOG 摘要；kinds 七类固定全列
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": log["sha256"],
+            "total": total,
+            "applied": applied,
+            "kinds": [
+                {
+                    "kind": kind,
+                    "total": totals[kind],
+                    "applied": applied_totals[kind],
+                }
+                for kind in SUMMARY_KINDS
+            ],
+        }
+        doc["sha256"] = hashlib.sha256(_summary_prefix_bytes(doc)).hexdigest()
+        payload = _summary_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    # 输出上界（含末尾 LF）在写出前判定；等于上限合法，失败 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 CONFIG_DIFF_MAX_INPUT_BYTES = 1024 * 1024
 
 
@@ -15913,6 +16009,7 @@ SUBCOMMANDS = frozenset((
     "record",
     "replay",
     "log-filter",
+    "log-summary",
     "config-diff",
     "config-export",
     "config-import",
@@ -16031,6 +16128,21 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_log_filter(args[1], args[2], args[3], args[4], *limits)
+    if args[:1] == ["log-summary"]:
+        # log-summary LOG [MAX_LOG_BYTES MAX_OUTPUT_BYTES]：
+        # 两上限成对可选（0 或 2 个），均须匹配 [1-9][0-9]*，默认 16 MiB
+        if len(args) not in (2, 4):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[2:],
+            (0, 2),
+            (DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_log_summary(args[1], *limits)
     if args[:1] == ["config-diff"]:
         # config-diff OLD NEW [MAX_DIFF_WORK [MAX_INPUT_BYTES
         #   MAX_OUTPUT_BYTES]]：可选上限仅 0、1、3 项；均须匹配
