@@ -13533,8 +13533,10 @@ def _event_kind(event):
 def _log_mode(config):
     """record/replay 按 config 形状选模式：fdb、forward、stp、loop-detect、
     link-forward、link-state、forward-static、forward-stp、forward-decode、
-    stp-decode、forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
-    security-check、mirror-check、lag-check、storm-check 或 port-security。"""
+    stp-check（七键配置，帧事件按 src/data 形状路由到 stp-check 或
+    stp-decode）、forward-stp-storm、lag、mirror、acl、acl-check、qos、
+    qos-check、security-check、mirror-check、lag-check、storm-check 或
+    port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         # 恰含 ports,age 且 ports 为字符串数组时为 fdb 模式（forward 旧
@@ -13568,7 +13570,9 @@ def _log_mode(config):
         if keys == FORWARD_CHECK_CONFIG_KEYS:
             return "forward_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
-            return "stp_decode"
+            # 七键配置由 stp-check 与 stp-decode 共享；帧事件形状在事件
+            # 校验阶段区分（含 src 按 stp-check，含 data 按 stp-decode）
+            return "stp_check"
         if keys == STORM_CONFIG_KEYS:
             return "forward_stp_storm"
         if keys == LAG_CONFIG_KEYS:
@@ -13880,30 +13884,60 @@ def _run_forward_decode(config, events, observe, max_work=None):
     return result, observer
 
 
-def _run_stp_decode(config, events, observe, max_work=None):
-    """record/replay stp-decode 模式：校验 stp-decode（stp-check 七键）
-    配置与混合事件并执行仿真。
+def _run_stp_check(config, events, observe, max_work=None):
+    """record/replay stp-check 七键配置模式：校验共享配置与混合事件并执行。
 
-    输入、全量校验与执行语义完全沿用 stp-decode 入口；max_work 非 None
-    时（record/replay）全量语义校验后先按 forward-stp 公式无副作用预演
-    （坏帧、准入拒绝、幂等链路均计费），首次超过即抛 ForwardStpWorkLimit，
-    不正式仿真。返回 (stp-decode 结果 dict, observer 或 None)；帧项恒
-    applied 且 output 为对应 t,class,action,ports 结果项，链路项仅 up
-    实际改变时 applied，output 恒 None。
+    与 stp-decode 入口共享配置形状：非链路帧事件含 src（stp-check 九字段
+    形状）时按 stp-check，含 data（t/port/data 原始帧形状）时按
+    stp-decode；两种帧形状混用（及无法识别的非链路形状）按非法输入拒绝。
+    仅链路事件或空事件序列沿用既有日志字节。全量语义校验后先按
+    forward-stp 既有公式无副作用预演（坏帧、准入拒绝、幂等链路均计费），
+    首次超过即抛 ForwardStpWorkLimit，不正式仿真。返回 (结果 dict,
+    observer 或 None)；帧项恒 applied 且 output 为对应 t,class,action,ports
+    结果项，链路项仅 up 实际改变时 applied，output 恒 None。
     """
     bridges, links, delay, bridge, ports, age, max_frame = (
         validate_stp_check_config(config)
     )
     link_ids = {link["id"] for link in links}
-    stp_events = validate_stp_decode_events(events, ports, link_ids)
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    frame_shape = None  # None=仅链路/空；"check"=src 形状；"decode"=data 形状
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            continue
+        if keys == STP_CHECK_FRAME_KEYS:
+            shape = "check"
+        elif keys == STP_DECODE_FRAME_KEYS:
+            shape = "decode"
+        else:
+            raise InvalidInput("bad event")
+        if frame_shape is None:
+            frame_shape = shape
+        elif frame_shape != shape:  # 两种帧形状混用
+            raise InvalidInput("bad event")
+    if frame_shape == "check":
+        stp_events = validate_stp_check_events(events, ports, link_ids)
+    else:
+        stp_events = validate_stp_decode_events(events, ports, link_ids)
     if max_work is not None:
-        # 与 stp-decode 入口同一 forward-stp 公式：只跟踪 up 链路数与帧数
+        # 与 stp-check/stp-decode 入口同一 forward-stp 公式：只跟踪 up
+        # 链路数与帧数，无副作用
         forward_stp_work(bridges, links, ports, stp_events, max_work)
     observer = {} if observe else None
-    result = stp_decode(
-        bridges, links, delay, bridge, ports, age, max_frame, stp_events,
-        observer=observer,
-    )
+    if frame_shape == "check":
+        result = forward_stp_check(
+            bridges, links, delay, bridge, ports, age, max_frame, stp_events,
+            observer=observer,
+        )
+    else:
+        result = stp_decode(
+            bridges, links, delay, bridge, ports, age, max_frame, stp_events,
+            observer=observer,
+        )
     return result, observer
 
 
@@ -14543,7 +14577,7 @@ def _build_log_doc(config, events, items):
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，qos/lag/mirror/acl/security-check/qos-check/
     # acl-check/mirror-check/lag-check/storm-check 模式仅 applied 链路/
-    # 成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-decode/
+    # 成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-check/
     # forward-stp-storm 模式仅 applied 链路项加 1（帧项恒 applied 但
     # 不计），forward-static 模式帧恒 applied 且 version 恒 0
     version = 0
@@ -14555,7 +14589,7 @@ def _build_log_doc(config, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "forward_stp", "stp_decode", "forward_stp_storm"
+            "link_forward", "forward_stp", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -14688,7 +14722,7 @@ def _verify_records(log, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "forward_stp", "stp_decode", "forward_stp_storm"
+            "link_forward", "forward_stp", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -14817,8 +14851,8 @@ def _cmd_record(
             result, observer = _run_forward_decode(
                 config, events, True, max_record_work
             )
-        elif mode == "stp_decode":
-            result, observer = _run_stp_decode(
+        elif mode == "stp_check":
+            result, observer = _run_stp_check(
                 config, events, True, max_record_work
             )
         elif mode == "forward_stp_storm":
@@ -14983,8 +15017,8 @@ def _cmd_replay(
             result, observer = _run_forward_decode(
                 config, events, True, max_replay_work
             )
-        elif mode == "stp_decode":
-            result, observer = _run_stp_decode(
+        elif mode == "stp_check":
+            result, observer = _run_stp_check(
                 config, events, True, max_replay_work
             )
         elif mode == "forward_stp_storm":
