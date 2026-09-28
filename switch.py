@@ -13506,6 +13506,7 @@ EVENT_KIND_BY_KEYS = {
     MEMBER_EVENT_KEYS: "member",
     SERVICE_EVENT_KEYS: "service",
     EVENT_KEYS: "learn",
+    FRAME_KEYS: "frame",
     FRAME_KEYS_V2: "frame",
     FRAME_KEYS_ACL: "frame",
     QOS_CHECK_FRAME_KEYS: "frame",
@@ -13530,9 +13531,9 @@ def _event_kind(event):
 
 
 def _log_mode(config):
-    """record/replay 按 config 形状选模式：fdb、stp、loop-detect、link-forward、
-    link-state、forward-static、forward-stp、forward-decode、stp-decode、
-    forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
+    """record/replay 按 config 形状选模式：fdb、forward、stp、loop-detect、
+    link-forward、link-state、forward-static、forward-stp、forward-decode、
+    stp-decode、forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
     security-check、mirror-check、lag-check、storm-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
@@ -13542,6 +13543,16 @@ def _log_mode(config):
             config.get("ports"), list
         ) and all(isinstance(p, str) for p in config["ports"]):
             return "fdb"
+        # 恰含 ports,age 且 ports 为非空对象数组时为 forward 模式，旧式
+        # access（name/vlan/up）与新式 802.1Q（name/mode/pvid/allowed/
+        # untagged/up）两种端口形状均沿用 forward 入口识别与校验
+        if (
+            keys == CONFIG_KEYS
+            and isinstance(config.get("ports"), list)
+            and bool(config["ports"])
+            and all(isinstance(p, dict) for p in config["ports"])
+        ):
+            return "forward"
         if keys == STP_CONFIG_KEYS:
             return "stp"
         if keys == LOOP_CONFIG_KEYS:
@@ -13718,6 +13729,45 @@ def _run_link_forward(config, events, observe, max_work=None):
     result = link_forward(
         fwd_ports, caps, age, max_frame, delay, lf_events, observer=observer
     )
+    return result, observer
+
+
+def _run_forward(config, events, observe, max_work=None):
+    """record/replay forward 模式：校验旧式 access 或新式 802.1Q 配置与
+    帧并执行转发。
+
+    输入、全量校验与执行完全沿用 forward 入口（is_v2_config 识别）；
+    max_work 非 None 时（record/replay）全量语义校验后先以独立空 FDB
+    按逐帧 K+P+1（K 为本帧老化前动态 FDB 项数，P 为端口数；拒绝帧与
+    down 口也计费）无副作用预演，首次超过即抛 ForwardWorkLimit，不
+    正式转发。返回 (forward 结果 dict, observer 或 None)；每帧恒
+    applied，version 恒 0，output 为对应 results 项。
+    """
+    if is_v2_config(config):
+        ports, age = validate_forward_config_v2(config)
+        frames = validate_frames_v2(events, ports)
+        if max_work is not None:
+            # 与 forward 入口同一公式：独立空 FDB，无副作用
+            forward_work_v2(frames, ports, age, max_work)
+        result = forward_v2(frames, ports, age)
+    else:
+        ports, age = validate_forward_config(config)
+        frames = validate_frames(events, ports)
+        if max_work is not None:
+            # 与 forward 入口同一公式：独立空 FDB，无副作用
+            forward_work(frames, ports, age, max_work)
+        result = forward(frames, ports, age)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
     return result, observer
 
 
@@ -14747,6 +14797,10 @@ def _cmd_record(
             result, observer = _run_link_forward(
                 config, events, True, max_record_work
             )
+        elif mode == "forward":
+            result, observer = _run_forward(
+                config, events, True, max_record_work
+            )
         elif mode == "link_state":
             result, observer = _run_link_state(
                 config, events, True, max_record_work
@@ -14907,6 +14961,10 @@ def _cmd_replay(
             )
         elif mode == "link_forward":
             result, observer = _run_link_forward(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward":
+            result, observer = _run_forward(
                 config, events, True, max_replay_work
             )
         elif mode == "link_state":
