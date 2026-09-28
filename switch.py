@@ -4364,6 +4364,22 @@ def mirror_work(
 def forward_mirror(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror, events
 ):
+    """mirror 公共入口：精确签名不变，无 observer 形参。
+
+    record/replay 所需的逐事件观察逻辑封装在内部 _forward_mirror_run 中。
+    """
+    return _forward_mirror_run(
+        bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+        events, observer=None,
+    )
+
+
+def _forward_mirror_run(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+    events, observer=None,
+):
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
@@ -4557,17 +4573,29 @@ def forward_mirror(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            link_changed = by_id[lid]["up"] != up
+            if link_changed:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
                 for name in old_forwarding - forwarding_ports(t):
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": link_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "member":
             _, t, member, up = item
+            member_changed = member_up[member] != up
             member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "member", "t": t, "applied": member_changed,
+                     "output": None}
+                )
             continue
         _, t, port_name, src, dst, tag = item
         port_stats[port_name]["rx"] += 1
@@ -4582,9 +4610,13 @@ def forward_mirror(
             )
         if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
             port_stats[port_name]["drop"] += 1
-            results.append(
-                {"t": t, "action": "drop", "ports": [], "mirrors": []}
-            )
+            entry = {"t": t, "action": "drop", "ports": [], "mirrors": []}
+            results.append(entry)
+            if observer is not None:  # 准入拒绝也逐帧记录
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
             continue
         # VLAN 准入后：入端口命中 sources 则复制入站标签
         ingress_copy = None
@@ -4676,9 +4708,13 @@ def forward_mirror(
                     copy = mirror_entry("egress", out_tag, name, t)
                     if copy is not None:
                         mirrors.append(copy)
-        results.append(
-            {"t": t, "action": action, "ports": out_ports, "mirrors": mirrors}
-        )
+        entry = {"t": t, "action": action, "ports": out_ports,
+                 "mirrors": mirrors}
+        results.append(entry)
+        if observer is not None:  # 帧项恒 applied，output 为对应结果项
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
     return {
         "results": results,
         "ports": [
@@ -13417,8 +13453,8 @@ def _event_kind(event):
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
     link-state、forward-static、forward-decode、stp-decode、forward-stp-storm、
-    lag、acl-check、qos、qos-check、security-check、mirror-check、lag-check、
-    storm-check 或 port-security。"""
+    lag、mirror、acl-check、qos、qos-check、security-check、mirror-check、
+    lag-check、storm-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
         if keys == STP_CONFIG_KEYS:
@@ -13439,6 +13475,8 @@ def _log_mode(config):
             return "forward_stp_storm"
         if keys == LAG_CONFIG_KEYS:
             return "lag"
+        if keys == MIRROR_CONFIG_KEYS:
+            return "mirror"
         if keys == ACL_CHECK_CONFIG_KEYS:
             return "acl_check"
         if keys == QOS_CONFIG_KEYS:
@@ -14036,6 +14074,61 @@ def _run_mirror_check(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_mirror(config, events, observe, max_work=None):
+    """record/replay mirror 模式：校验 mirror 配置与事件并执行仿真。
+
+    输入、全量校验与执行语义完全沿用 mirror 子命令；max_work 非 None
+    时（record/replay）全量语义校验后先按既有 MAX_MIRROR_WORK 公式
+    （准入拒绝、风暴或迁移抑制帧及幂等链路/成员事件均按帧/事件计费）
+    以独立链路副本与空状态无副作用预演，首次超过即抛 MirrorWorkLimit，
+    不正式仿真。返回 (mirror 结果 dict, observer 或 None)；帧项恒 applied
+    且 output 为对应 t,action,ports,mirrors 结果项，链路/成员项仅 up
+    实际改变时 applied，output 恒 None。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+    ) = validate_mirror_config(config)
+    link_ids = {link["id"] for link in links}
+    mirror_events = validate_lag_events(events, ports, link_ids, lags)
+    if max_work is not None:
+        # 与 mirror 入口同一公式：独立链路副本与空状态，无副作用
+        mirror_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            mirror_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = _forward_mirror_run(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        mirror_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _run_lag(config, events, observe, max_work=None):
     """record/replay lag 模式：校验 lag 配置与事件并执行仿真。
 
@@ -14204,7 +14297,7 @@ def _build_log_doc(config, events, items):
     # version 初值 0，取事件后值；安全模式每次 reload/rollback（无变化
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1，qos/lag/security-check/qos-check/acl-check/
+    # 仅 applied 项加 1，qos/lag/mirror/security-check/qos-check/acl-check/
     # mirror-check/lag-check/storm-check 模式仅 applied 链路/成员项加 1
     # （帧与 service 恒 applied 但不计），stp-decode/forward-stp-storm
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），forward-static
@@ -14224,8 +14317,8 @@ def _build_log_doc(config, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "qos", "lag", "security_check", "qos_check", "acl_check",
-            "mirror_check", "lag_check", "storm_check"
+            "qos", "lag", "mirror", "security_check", "qos_check",
+            "acl_check", "mirror_check", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
@@ -14355,8 +14448,8 @@ def _verify_records(log, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "qos", "lag", "security_check", "qos_check", "acl_check",
-            "mirror_check", "lag_check", "storm_check"
+            "qos", "lag", "mirror", "security_check", "qos_check",
+            "acl_check", "mirror_check", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
@@ -14474,6 +14567,10 @@ def _cmd_record(
             )
         elif mode == "lag":
             result, observer = _run_lag(
+                config, events, True, max_record_work
+            )
+        elif mode == "mirror":
+            result, observer = _run_mirror(
                 config, events, True, max_record_work
             )
         elif mode == "security_check":
@@ -14619,6 +14716,10 @@ def _cmd_replay(
             )
         elif mode == "lag":
             result, observer = _run_lag(
+                config, events, True, max_replay_work
+            )
+        elif mode == "mirror":
+            result, observer = _run_mirror(
                 config, events, True, max_replay_work
             )
         elif mode == "security_check":
