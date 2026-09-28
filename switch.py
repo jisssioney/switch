@@ -2913,8 +2913,11 @@ def validate_reload_events(events, ports, link_ids, lags, config,
 
 
 def forward_lag(
-    bridges, links, delay, bridge_name, ports, age, storm, lags, events
+    bridges, links, delay, bridge_name, ports, age, storm, lags, events,
+    observer=None
 ):
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
@@ -3082,17 +3085,29 @@ def forward_lag(
             del blocked[key]
         if item[0] == "link":
             _, t, lid, up = item
-            if by_id[lid]["up"] != up:  # 幂等链路事件不重算拓扑
+            link_changed = by_id[lid]["up"] != up
+            if link_changed:  # 幂等链路事件不重算拓扑
                 old_forwarding = forwarding_ports(t)
                 by_id[lid]["up"] = up
                 converge(t)
                 for name in old_forwarding - forwarding_ports(t):
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": link_changed,
+                     "output": None}
+                )
             continue
         if item[0] == "member":
             _, t, member, up = item
+            member_changed = member_up[member] != up
             member_up[member] = up  # 幂等无作用；可用性变化不清 FDB
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "member", "t": t, "applied": member_changed,
+                     "output": None}
+                )
             continue
         _, t, port_name, src, dst, tag = item
         port_stats[port_name]["rx"] += 1
@@ -3108,6 +3123,11 @@ def forward_lag(
         if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
             port_stats[port_name]["drop"] += 1
             results.append({"t": t, "action": "drop", "ports": []})
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": results[-1]}
+                )
             continue
         vlan_stats[vlan]["rx"] += 1
         ingress_lag = lag_of.get(port_name)
@@ -3184,6 +3204,11 @@ def forward_lag(
             port_stats[port_name]["drop"] += 1
             vlan_stats[vlan]["drop"] += 1
         results.append({"t": t, "action": action, "ports": out_ports})
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True,
+                 "output": results[-1]}
+            )
     return {
         "results": results,
         "ports": [
@@ -13378,7 +13403,7 @@ def _event_kind(event):
 def _log_mode(config):
     """record/replay 按 config 形状选模式：stp、loop-detect、link-forward、
     link-state、forward-static、forward-decode、stp-decode、forward-stp-storm、
-    acl-check、qos、qos-check、security-check、mirror-check、lag-check、
+    acl-check、qos、qos-check、security-check、mirror-check、lag、lag-check、
     storm-check 或 port-security。"""
     if isinstance(config, dict):
         keys = frozenset(config)
@@ -13408,6 +13433,8 @@ def _log_mode(config):
             return "security_check"
         if keys == MIRROR_CHECK_CONFIG_KEYS:
             return "mirror_check"
+        if keys == LAG_CONFIG_KEYS:
+            return "lag"
         if keys == LAG_CHECK_CONFIG_KEYS:
             return "lag_check"
         if keys == STORM_CHECK_CONFIG_KEYS:
@@ -13995,6 +14022,57 @@ def _run_mirror_check(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_lag(config, events, observe, max_work=None):
+    """record/replay lag 模式：校验 lag 配置与事件并执行仿真。
+
+    语义同 lag 子命令；max_work 非 None 时（record/replay）全量语义校验
+    后先按 lag 公式无副作用预演，拒绝、风暴或迁移抑制帧及幂等事件均计
+    费，首次超过即抛 LagWorkLimit，不正式仿真。返回 (lag 结果 dict,
+    observer 或 None)；帧项恒 applied 且 output 为对应 t,action,ports
+    结果项，链路/成员项仅状态实际改变时 applied，output 恒 None。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+    ) = validate_lag_config(config)
+    link_ids = {link["id"] for link in links}
+    lag_events = validate_lag_events(events, ports, link_ids, lags)
+    if max_work is not None:
+        # 与 lag 入口同一公式：独立链路副本与空状态，无副作用
+        lag_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            lag_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = forward_lag(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        lag_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _run_lag_check(config, events, observe, max_work=None):
     """record/replay lag-check 模式：校验 lag-check 配置与事件并执行仿真。
 
@@ -14112,7 +14190,7 @@ def _build_log_doc(config, events, items):
     # 亦算）加 1，stp/环路模式链路 up 实际改变（applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，qos/security-check/qos-check/acl-check/
-    # mirror-check/lag-check/storm-check 模式仅 applied 链路/成员项加 1
+    # mirror-check/lag/lag-check/storm-check 模式仅 applied 链路/成员项加 1
     # （帧与 service 恒 applied 但不计），stp-decode/forward-stp-storm
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），forward-static
     # 模式帧恒 applied 且 version 恒 0
@@ -14132,7 +14210,7 @@ def _build_log_doc(config, events, items):
                 version += 1
         elif mode in (
             "qos", "security_check", "qos_check", "acl_check",
-            "mirror_check", "lag_check", "storm_check"
+            "mirror_check", "lag", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
@@ -14263,7 +14341,7 @@ def _verify_records(log, events, items):
                 version += 1
         elif mode in (
             "qos", "security_check", "qos_check", "acl_check",
-            "mirror_check", "lag_check", "storm_check"
+            "mirror_check", "lag", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
                 version += 1
@@ -14397,6 +14475,10 @@ def _cmd_record(
             )
         elif mode == "mirror_check":
             result, observer = _run_mirror_check(
+                config, events, True, max_record_work
+            )
+        elif mode == "lag":
+            result, observer = _run_lag(
                 config, events, True, max_record_work
             )
         elif mode == "lag_check":
@@ -14538,6 +14620,10 @@ def _cmd_replay(
             )
         elif mode == "mirror_check":
             result, observer = _run_mirror_check(
+                config, events, True, max_replay_work
+            )
+        elif mode == "lag":
+            result, observer = _run_lag(
                 config, events, True, max_replay_work
             )
         elif mode == "lag_check":
