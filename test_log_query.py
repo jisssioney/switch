@@ -24,6 +24,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SWITCH = os.path.join(HERE, "switch.py")
 sys.path.insert(0, HERE)
 
+# 5000 位十进制须在输出中原样回显；测试自身用 json.loads 解析产物时同样
+# 需关闭 3.11+ 的 int↔str 位数上限
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
 import switch  # noqa: E402
 from test_record import base_config  # noqa: E402
 from test_record import frame  # noqa: E402
@@ -333,6 +338,41 @@ class HappyPathTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out.decode("utf-8"))["records"], [])
+
+    def test_five_thousand_digit_decimals_echoed_exactly(self):
+        # START/END/COUNT/游标 offset 均按不限长十进制处理：5000 位合法，
+        # START/END 在 query 中按原数学整数回显（不触发 3.11+ 位数上限）
+        log_bytes = frame_log(3)
+        source = log_doc(log_bytes)["sha256"]
+        huge = "1" * 5000
+        huge_value = int(huge)
+        code, out, err, _ = run_query(
+            log_bytes, "0", huge, "*", "*", "*", huge
+        )
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(doc["query"]["start"], 0)
+        self.assertEqual(doc["query"]["end"], huge_value)
+        self.assertEqual(len(doc["records"]), 3)
+        self.assertIsNone(doc["next"])
+        # 5000 位 COUNT 回显不涉及，但须原样接受并仍取全部 3 项
+        self.assertEqual(doc["sha256"], digest_of(doc))
+        # 5000 位游标 offset 不越界时合法：取一个 ≤记录数 的值无法用
+        # 5000 位表示，故 5000 位正整数必然 > 记录数 → invalid_input/4
+        code, out2, err2, _ = run_query(
+            log_bytes, "*", "*", "*", "*", source + ":" + huge, "1"
+        )
+        self.assertEqual(code, 4)
+        self.assertIn(b"invalid_input", err2)
+        self.assertEqual(out2, b"")
+        # START 超过所有 t：空结果，大整数仍逐字节写入摘要文本
+        code, out, err, _ = run_query(
+            log_bytes, huge, huge, "*", "*", "*", "9"
+        )
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(doc["records"], [])
+        self.assertEqual(doc["sha256"], digest_of(doc))
 
     def test_count_limits_page_and_next_uses_original_indices(self):
         log_bytes = frame_log(5)
