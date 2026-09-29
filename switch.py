@@ -12052,7 +12052,7 @@ def link_state(events, ports, delay):
     return _link_state_run(events, ports, delay, observer=None)
 
 
-def _link_state_run(events, ports, delay, observer=None):
+def _link_state_run(events, ports, delay, observer=None, snapshot_out=None):
     if observer is not None:  # record：逐事件记录 applied 与对应 results 项
         observer["items"] = []
     caps = {name: (rates, modes) for name, rates, modes in ports}
@@ -12118,6 +12118,30 @@ def _link_state_run(events, ports, delay, observer=None):
                 {"kind": "link", "t": t, "applied": applied,
                  "output": results[-1]}
             )
+    if snapshot_out is not None:
+        # 末事件时刻的全部端口状态（配置序）：pending 口为 wait，否则取
+        # committed 的 down/bad/up；仅 up 带 rate/mode
+        snapshot_ports = []
+        for name, _, _ in ports:
+            current = pending.get(name)
+            if current is not None:
+                snapshot_ports.append(
+                    {"name": name, "state": "wait",
+                     "rate": None, "mode": None}
+                )
+            else:
+                now = committed[name]
+                if now[0] == "up":
+                    snapshot_ports.append(
+                        {"name": name, "state": "up",
+                         "rate": now[1], "mode": now[2]}
+                    )
+                else:
+                    snapshot_ports.append(
+                        {"name": name, "state": now[0],
+                         "rate": None, "mode": None}
+                    )
+        snapshot_out["ports"] = snapshot_ports
     return {"results": results}
 
 
@@ -16251,6 +16275,124 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
     return 0
 
 
+LINK_LOG_DIGEST_KEYS = ("schema", "source_sha256", "offset", "snapshot")
+
+
+def _link_log_prefix_bytes(doc):
+    """log-link 末项摘要文本：前四键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in LINK_LOG_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _link_log_bytes(doc):
+    """log-link stdout 载荷：五键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in LINK_LOG_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_link(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-qos：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），* 表示 records 长度（重演全部）；offset 为不限长非负十进制
+    # 且不得越界。输入/输出上限固定各 16777216 字节，分块读取与字节边界
+    # 沿用 log-page，等于上限合法
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受 link-state 配置形状，其他模式
+        # 一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "link_state":
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重演完全沿用 replay 的 link-state 路径：
+        # 逐项核对 t/version/applied/output，重建 LOG 须与原文件逐字节
+        # 一致（max_work=None：全量记录核对不设工作量上限）
+        _, observer = _run_link_state(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条事件求链路状态快照：独立 committed/pending 状态、
+        # 无副作用。先按 link-state 工作量公式（逐事件在完成截止 <= t 的
+        # 协商前以 pending 数 Q 累计 Q+1）预演前 offset 项，等于上限合法，
+        # 首次超过即抛 LinkWorkLimit，再正式重演；offset=0 为 t=0 且全端口
+        # down，否则 t 取第 offset 项（末条）记录的事件时刻，协商未到期口
+        # 为 wait。ports 按配置序，项键序 name,state,rate,mode；state 取
+        # down/bad/wait/up，仅 up 时 rate 为整数、mode 取 half/full，其余
+        # 状态二者为 null
+        ports, delay = validate_link_state_config(config)
+        ls_events = validate_link_state_events(events, ports)
+        prefix_events = ls_events[:offset]
+        link_state_work(prefix_events, ports, delay, max_work)
+        snapshot_state = {}
+        _link_state_run(
+            prefix_events, ports, delay, snapshot_out=snapshot_state
+        )
+        if offset == 0:
+            # offset=0：t=0 且全端口 down
+            t = 0
+        else:
+            # 否则 t 取末条记录（第 offset 项）的事件时刻
+            t = prefix_events[-1][0]
+        snapshot = {"t": t, "ports": snapshot_state["ports"]}
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "snapshot": snapshot,
+        }
+        doc["sha256"] = hashlib.sha256(
+            _link_log_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _link_log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except LinkWorkLimit:
+        _fail("link_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 ACL_LOG_DIGEST_KEYS = (
     "schema", "source_sha256", "offset", "rules", "default"
 )
@@ -17724,6 +17866,7 @@ SUBCOMMANDS = frozenset((
     "log-fdb",
     "log-security",
     "log-qos",
+    "log-link",
     "log-mirror",
     "log-acl",
     "log-stp",
@@ -17976,6 +18119,25 @@ def main(argv):
             else DEFAULT_MAX_QOS_WORK
         )
         return _cmd_log_qos(args[1], args[2], max_work)
+    if args[:1] == ["log-link"]:
+        # log-link LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
+        # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
+        # （link-state 工作量公式：每事件处理到期项前以 pending 数 Q 累计
+        # Q+1）；LOG 仅接受 link-state 模式，其他模式 invalid_input/4
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_LINK_WORK
+        )
+        return _cmd_log_link(args[1], args[2], max_work)
     if args[:1] == ["log-mirror"]:
         # log-mirror LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
         # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
