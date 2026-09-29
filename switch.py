@@ -6529,10 +6529,15 @@ def acl_check_work(
 
 def forward_acl_check(
     bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
-    acl, max_frame, events, observer=None
+    acl, max_frame, events, observer=None, state_out=None
 ):
+    # state_out 非 None 时仅跟踪 ACL 命中（log-acl 前缀重演）：不维护
+    # 端口/VLAN 统计、结果与镜像
     if observer is not None:  # record/replay：逐事件记录 applied 与输出
         observer["items"] = []
+    if state_out is not None:
+        state_hits = [0] * len(acl)
+        state_default = 0
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
@@ -6728,8 +6733,8 @@ def forward_acl_check(
         }
 
     def acl_match(vlan, src, dst, ethertype, priority):
-        """按数组序首条命中；未命中视为 allow。"""
-        for rule in acl:
+        """按数组序首条命中；未命中视为 allow，下标返回 -1。"""
+        for idx, rule in enumerate(acl):
             if (
                 (rule["src"] is None or rule["src"] == src)
                 and (rule["dst"] is None or rule["dst"] == dst)
@@ -6742,8 +6747,8 @@ def forward_acl_check(
                     rule["priority"] is None or rule["priority"] == priority
                 )
             ):
-                return rule["action"], rule["to_vlan"]
-        return "allow", None
+                return rule["action"], rule["to_vlan"], idx
+        return "allow", None, -1
 
     converge(0)
     for item in events:
@@ -6838,7 +6843,16 @@ def forward_acl_check(
                 )
             continue
         # VLAN 准入后：以有效 VLAN 及原字段做 ACL 匹配（每帧仅一次）
-        acl_action, to_vlan = acl_match(vlan, src, dst, ethertype, priority)
+        acl_action, to_vlan, hit_index = acl_match(
+            vlan, src, dst, ethertype, priority
+        )
+        if state_out is not None:
+            # log-acl：首条匹配规则 hits 加 1；未命中加 default。坏帧与
+            # VLAN 拒绝在此之前已 continue，drop/remark 后续拒绝仍计命中
+            if hit_index < 0:
+                state_default += 1
+            else:
+                state_hits[hit_index] += 1
         if acl_action == "remark":
             if to_vlan in by_name[port_name]["allowed"]:
                 vlan = to_vlan  # 新 VLAN 用于后续全部处理
@@ -6968,6 +6982,18 @@ def forward_acl_check(
                 {"kind": "frame", "t": t, "applied": True,
                  "output": results[-1]}
             )
+    if state_out is not None:
+        # rules 按配置序，index 为零基整数，action 为原 action；default
+        # 固定 action=allow
+        state_out["rules"] = [
+            {
+                "index": idx,
+                "action": rule["action"],
+                "hits": state_hits[idx],
+            }
+            for idx, rule in enumerate(acl)
+        ]
+        state_out["default"] = {"action": "allow", "hits": state_default}
     return {
         "results": results,
         "ports": [
@@ -16225,6 +16251,159 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
     return 0
 
 
+ACL_LOG_DIGEST_KEYS = (
+    "schema", "source_sha256", "offset", "rules", "default"
+)
+
+
+def _acl_log_prefix_bytes(doc):
+    """log-acl 末项摘要文本：前五键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in ACL_LOG_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _acl_log_bytes(doc):
+    """log-acl stdout 载荷：六键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in ACL_LOG_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_acl(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-qos：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），* 表示 records 长度（重演全部）；offset 为不限长非负
+    # 十进制且不得越界。输入/输出上限固定各 16777216 字节，分块读取与
+    # 字节边界沿用 log-page，等于上限合法
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受 acl-check 配置形状，其他模式
+        # 一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "acl_check":
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重演完全沿用 replay 的 acl-check 路径：
+        # 逐项核对 t/version/applied/output，重建 LOG 须与原文件逐字节
+        # 一致（max_work=None：全量记录核对不设工作量上限）
+        _, observer = _run_acl_check(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条事件求 ACL 命中：独立空状态、无副作用。先按
+        # acl-check 工作量公式（与 acl 同口径：独立链路副本与空状态）预演
+        # 前 offset 项，等于上限合法，首次超过即抛 AclWorkLimit，再正式
+        # 重演。仅 good 帧通过入端 VLAN 准入后计数：首条匹配规则 hits
+        # 加 1，未命中加 default；坏帧、VLAN 拒绝、链路和成员事件不计，
+        # drop 或 remark 后续拒绝仍计命中。rules 按配置序，项键序
+        # index,action,hits；default 键序 action,hits，action 固定 allow
+        (
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            mirror,
+            acl,
+            max_frame,
+        ) = validate_acl_check_config(config)
+        link_ids = {link["id"] for link in links}
+        check_events = validate_acl_check_events(
+            events, ports, link_ids, lags
+        )
+        prefix_events = check_events[:offset]
+        acl_check_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            max_frame,
+            prefix_events,
+            max_work,
+        )
+        snapshot = {}
+        forward_acl_check(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            mirror,
+            acl,
+            max_frame,
+            prefix_events,
+            state_out=snapshot,
+        )
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "rules": snapshot["rules"],
+            "default": snapshot["default"],
+        }
+        doc["sha256"] = hashlib.sha256(
+            _acl_log_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _acl_log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except AclWorkLimit:
+        _fail("acl_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 STP_LOG_DIGEST_KEYS = ("schema", "source_sha256", "offset", "snapshot")
 
 
@@ -17382,6 +17561,7 @@ SUBCOMMANDS = frozenset((
     "log-fdb",
     "log-security",
     "log-qos",
+    "log-acl",
     "log-stp",
     "log-lag",
     "log-storm",
@@ -17632,6 +17812,24 @@ def main(argv):
             else DEFAULT_MAX_QOS_WORK
         )
         return _cmd_log_qos(args[1], args[2], max_work)
+    if args[:1] == ["log-acl"]:
+        # log-acl LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
+        # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
+        # （acl-check 工作量公式，与 acl 同口径）
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_ACL_WORK
+        )
+        return _cmd_log_acl(args[1], args[2], max_work)
     if args[:1] == ["log-stp"]:
         # log-stp LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
         # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
