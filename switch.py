@@ -16395,7 +16395,9 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
     # CURSOR 沿用 log-page：* 或 <sha256>:<offset>（调用前已按 usage/2
     # 校验），但 * 表示 records 长度（重演全部）；offset 为不限长非负
     # 十进制且不得越界。输入/输出上限固定各 16777216 字节，分块读取与
-    # 字节边界沿用 log-page，等于上限合法
+    # 字节边界沿用 log-page，等于上限合法。十二键配置同时接受
+    # qos-check（帧含 src）与 qos-decode（帧含 data）两种日志，混用报
+    # invalid_input/4，空事件沿用 qos-check
     try:
         with open(log_path, "rb") as handle:
             log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
@@ -16425,16 +16427,22 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
             offset = _limit_value(offset_token)
             if offset > total:
                 raise InvalidInput("bad cursor offset")
-        # 按 replay 合同先定模式：仅接受 qos-check 配置形状，其他模式
-        # 一律 invalid_input/4
+        # 按 replay 合同先定模式：十二键配置下帧含 src（十键）选
+        # qos-check，帧含 data（t/port/data 原始帧）选 qos-decode，两种
+        # 帧形状混用报 InvalidInput，仅链路/成员/service 项或空事件沿用
+        # qos-check；其他配置形状一律 invalid_input/4
         config = log["config"]
         events = [record["event"] for record in log["records"]]
-        if _log_mode(config, events) != "qos_check":
+        mode = _log_mode(config, events)
+        if mode not in ("qos_check", "qos_decode"):
             raise InvalidInput("bad log mode")
-        # 全量语义校验与从空状态重演完全沿用 replay 的 qos-check 路径：
+        # 全量语义校验与从空状态重演完全沿用 replay 的对应路径：
         # 逐项核对 t/version/applied/output，重建 LOG 须与原文件逐字节
         # 一致（max_work=None：全量记录核对不设工作量上限）
-        _, observer = _run_qos_check(config, events, True)
+        if mode == "qos_check":
+            _, observer = _run_qos_check(config, events, True)
+        else:
+            _, observer = _run_qos_decode(config, events, True)
         _verify_records(log, events, observer["items"])
         rebuilt = _build_log_doc(config, events, observer["items"])
         if _log_bytes(rebuilt) != log_raw:
@@ -16442,6 +16450,8 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
         # 仅重演前 offset 条事件求出口队列：独立空状态、无副作用。先按
         # qos-check 工作量公式（独立链路副本与空状态）预演前 offset 项，
         # 等于上限合法，首次超过即抛 QosWorkLimit，再正式重演；
+        # qos-decode 模式的原始帧先按 qos-decode 入口同一转换解码，预演
+        # 与重演共用同一解码事件序（坏帧、准入拒绝、幂等均计费）。
         # offset=0 为初始空队列（wrr 各口 current=3、remaining=weights[3]，
         # sp 二者为 null）。ports 按配置序，项键序 name,queues,current,
         # remaining；queues 依优先级 0..3 为四个 FIFO 帧号整数数组，
@@ -16461,9 +16471,16 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
             max_frame,
         ) = validate_qos_check_config(config)
         link_ids = {link["id"] for link in links}
-        check_events = validate_qos_check_events(
-            events, ports, link_ids, lags
-        )
+        if mode == "qos_check":
+            check_events = validate_qos_check_events(
+                events, ports, link_ids, lags
+            )
+        else:
+            # qos-decode：先全量校验原始混合事件，再按 frame-decode 规则
+            # 解码为 qos-check 十一元组事件序（与入口同一转换）
+            check_events = _decode_qos_events(
+                validate_qos_decode_events(events, ports, link_ids, lags)
+            )
         prefix_events = check_events[:offset]
         qos_check_work(
             bridges,
@@ -18587,7 +18604,7 @@ def main(argv):
     if args[:1] == ["log-qos"]:
         # log-qos LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
         # 完全沿用 log-security；MAX_WORK 为不限长正十进制，默认
-        # 10000000（qos-check 工作量公式）
+        # 10000000（qos-check 工作量公式，qos-decode 日志解码后同口径）
         if len(args) not in (3, 4):
             _fail("usage")
             return 2

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""log-qos 子命令回归：按游标重演 qos-check 模式 LOG 的前 offset 条事件
-并给出出口队列。
+"""log-qos 子命令回归：按游标重演 qos-check/qos-decode 模式 LOG 的前
+offset 条事件并给出出口队列。
 
 仅用标准库；端到端驱动 `python switch.py log-qos LOG CURSOR [MAX_WORK]`。
 参数、资源、CURSOR 及错误顺序完全沿用 log-security；成功产物键序固定为
 schema,source_sha256,offset,ports,sha256，末项为前四键紧凑 UTF-8 加 LF 的
 sha256；CURSOR 的 * 表示 records 长度（重演全部），否则
-<sha256>:<offset>，offset=0 为初始空队列。ports 按配置序，项键序
+<sha256>:<offset>，offset=0 为初始空队列。十二键配置下帧含 src 选
+qos-check、帧含 data（t/port/data 原始帧）选 qos-decode，两种帧形状混用
+invalid_input/4，无帧仍选 qos-check。ports 按配置序，项键序
 name,queues,current,remaining；queues 依优先级 0..3 为四个 FIFO 帧号
 整数数组，帧号按所有帧事件零基编号，坏帧占号但不入队；wrr 时 current 为
 0..3 整数、remaining 为正整数（下次 service 续用），sp 时二者为 null。
-LOG 须通过摘要核对、qos-check 语义、全部记录核对与重建日志逐字节一致，
-其他模式 invalid_input/4；重演前 offset 项按 qos-check 工作量公式计费，
+LOG 须通过摘要核对、对应模式语义、全部记录核对与重建日志逐字节一致，
+其他模式 invalid_input/4；重演前 offset 项按 qos-check 工作量公式计费
+（qos-decode 原始帧先按 qos-decode 解码，坏帧、拒绝、幂等均计费），
 等于上限合法，首次超过 stderr 仅 {"error":"qos_work_limit"} 加 LF 并
 退出 5。
 """
@@ -37,6 +40,7 @@ import switch as switch_mod  # noqa: E402
 from test_log_fdb import fdb_config, record  # noqa: E402
 from test_qos import base_config, service  # noqa: E402
 from test_qos_check import check_frame, config  # noqa: E402
+from test_qos_decode import raw_frame  # noqa: E402
 
 QOS_KEYS = ["schema", "source_sha256", "offset", "ports", "sha256"]
 PORT_KEYS = ["name", "queues", "current", "remaining"]
@@ -50,6 +54,15 @@ def good_frame(t, port, src, priority=0, vlan=None, dst=BCAST):
 
 def bad_frame(t, port, src, vlan=None):
     return check_frame(t, port, BCAST, length=10, src=src, vlan=vlan)
+
+
+def raw_good(t, port, src, **kwargs):
+    return raw_frame(t, port, BCAST, src, **kwargs)
+
+
+def raw_bad(t, port, src):
+    # runt：长度不足，坏帧占号但不入队
+    return raw_frame(t, port, BCAST, src, payload_len=0)
 
 
 def sp_config():
@@ -104,6 +117,25 @@ def simulate_ports(cfg, events):
     switch_mod.forward_qos_check(
         bridges, links, delay, bridge, ports, age, storm, lags, mirror,
         acl, qos, max_frame, check_events, state_out=state,
+    )
+    return state["ports"]
+
+
+def simulate_decode_ports(cfg, events):
+    """直接按 qos-decode 解码后求出口队列快照。"""
+    cfg = json.loads(json.dumps(cfg))
+    (
+        bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+        acl, qos, max_frame,
+    ) = switch_mod.validate_qos_check_config(cfg)
+    link_ids = {link["id"] for link in links}
+    decode_events = switch_mod.validate_qos_decode_events(
+        events, ports, link_ids, lags
+    )
+    state = {}
+    switch_mod.qos_decode(
+        bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+        acl, qos, max_frame, decode_events, state_out=state,
     )
     return state["ports"]
 
@@ -300,6 +332,222 @@ class HappyPathTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
 
 
+class QosDecodeLogTests(unittest.TestCase):
+    def qos_decode_log(self, events, cfg=None):
+        return record(cfg or config(), events)
+
+    def test_decode_star_queues_and_digest(self):
+        events = [
+            raw_good(0, "p1", "00:00:00:00:00:01"),
+            raw_good(1, "p1", "00:00:00:00:00:02"),
+        ]
+        log_bytes = self.qos_decode_log(events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, out, err, after = run_qos(log_bytes, "*")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        self.assertEqual(after, log_bytes)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(list(doc), QOS_KEYS)
+        self.assertEqual(doc["schema"], 1)
+        self.assertEqual(doc["source_sha256"], source)
+        self.assertEqual(doc["offset"], 2)
+        p2 = by_name(doc["ports"], "p2")
+        # 未标记帧 priority 解码为 0，两帧均入 p2 的 0 队
+        self.assertEqual(p2["queues"], [[0, 1], [], [], []])
+        for entry in doc["ports"]:
+            self.assertEqual(list(entry), PORT_KEYS)
+            self.assertIsInstance(entry["current"], int)
+            self.assertIn(entry["current"], (0, 1, 2, 3))
+            self.assertIsInstance(entry["remaining"], int)
+            self.assertGreater(entry["remaining"], 0)
+        self.assertEqual(doc["sha256"], digest_of(doc))
+
+    def test_decode_tagged_priority_selects_queue(self):
+        # p1 改 trunk（allowed 含 vlan1、无 untagged）：带 priority=3 的
+        # vlan1 标签帧准入，洪泛到 access vlan1 的 p2，按 qos_map[3]=3
+        # 入 p2 的 3 队
+        cfg = config()
+        cfg["ports"][0] = {
+            "name": "p1", "mode": "trunk", "pvid": 1,
+            "allowed": [1], "untagged": [], "up": True,
+        }
+        events = [raw_good(0, "p1", "00:00:00:00:00:01",
+                           vlan=1, priority=3)]
+        log_bytes = self.qos_decode_log(events, cfg)
+        code, out, err, _ = run_qos(log_bytes, "*")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out.decode("utf-8"))
+        p2 = by_name(doc["ports"], "p2")
+        self.assertEqual(p2["queues"][3], [0])
+
+    def test_decode_bad_frame_consumes_id_but_not_queued(self):
+        events = [
+            raw_good(0, "p1", "00:00:00:00:00:01"),  # fid0
+            raw_bad(1, "p1", "00:00:00:00:00:02"),   # fid1 runt
+            raw_good(2, "p1", "00:00:00:00:00:03"),  # fid2
+        ]
+        log_bytes = self.qos_decode_log(events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        expected = [
+            [[], [], [], []],
+            [[0], [], [], []],
+            [[0], [], [], []],          # 坏帧占号但不入队
+            [[0, 2], [], [], []],
+        ]
+        for offset in range(4):
+            code, out, err, _ = run_qos(log_bytes, source + ":%d" % offset)
+            self.assertEqual(code, 0, (offset, err))
+            doc = json.loads(out.decode("utf-8"))
+            self.assertEqual(doc["offset"], offset)
+            self.assertEqual(by_name(doc["ports"], "p2")["queues"],
+                             expected[offset])
+
+    def test_decode_prefix_matches_direct_simulation_every_offset(self):
+        cfg = config()
+        events = [
+            raw_good(0, "p1", "00:00:00:00:00:01", priority=0),
+            raw_bad(1, "p1", "00:00:00:00:00:02"),
+            raw_good(2, "p1", "00:00:00:00:00:03"),
+            service(3, "p2", 1),
+        ]
+        log_bytes = self.qos_decode_log(events, cfg)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        for offset in range(len(events) + 1):
+            code, out, err, _ = run_qos(log_bytes, source + ":%d" % offset)
+            self.assertEqual(code, 0, (offset, err))
+            got = json.loads(out.decode("utf-8"))["ports"]
+            self.assertEqual(got, simulate_decode_ports(cfg, events[:offset]))
+
+    def test_decode_wrr_service_continuation(self):
+        # 未标记帧 priority=0；qos_map 默认把 0 映射到 0 队。改用全 3 映射
+        # 使全部入 3 队，weights[3]=4，六帧后连续两次 service(2)
+        cfg = json.loads(json.dumps(
+            base_config(weights=[1, 2, 3, 4], qos_map=[3] * 8)
+        ))
+        cfg["max_frame"] = 1518
+        events = [
+            raw_good(i, "p1", "00:00:00:00:00:%02x" % (i + 1))
+            for i in range(6)
+        ]
+        events += [service(6, "p2", 2), service(7, "p2", 2)]
+        log_bytes = self.qos_decode_log(events, cfg)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+
+        def p2_at(offset):
+            code, out, err, _ = run_qos(log_bytes, source + ":%d" % offset)
+            self.assertEqual(code, 0, (offset, err))
+            return by_name(json.loads(out.decode("utf-8"))["ports"], "p2")
+
+        self.assertEqual(p2_at(6)["queues"][3], [0, 1, 2, 3, 4, 5])
+        self.assertEqual((p2_at(6)["current"], p2_at(6)["remaining"]),
+                         (3, 4))
+        self.assertEqual(p2_at(7)["queues"][3], [2, 3, 4, 5])
+        self.assertEqual((p2_at(7)["current"], p2_at(7)["remaining"]),
+                         (3, 2))
+        self.assertEqual(p2_at(8)["queues"][3], [4, 5])
+        self.assertEqual((p2_at(8)["current"], p2_at(8)["remaining"]),
+                         (2, 3))
+
+    def test_decode_sp_mode_null_scheduler(self):
+        cfg = sp_config()
+        events = [
+            raw_good(0, "p1", "00:00:00:00:00:01"),
+            service(1, "p2", 1),
+        ]
+        log_bytes = self.qos_decode_log(events, cfg)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        for offset in range(3):
+            code, out, err, _ = run_qos(log_bytes, source + ":%d" % offset)
+            self.assertEqual(code, 0, (offset, err))
+            p2 = by_name(json.loads(out.decode("utf-8"))["ports"], "p2")
+            self.assertIsNone(p2["current"])
+            self.assertIsNone(p2["remaining"])
+
+    def test_no_frame_events_still_route_qos_check(self):
+        # 仅 service 项（无帧）：模式按帧形状判定，无帧沿用 qos-check
+        events = [service(0, "p2", 1)]
+        log_bytes = self.qos_decode_log(events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, out, err, after = run_qos(log_bytes, source + ":1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out.decode("utf-8"))["offset"], 1)
+        self.assertEqual(after, log_bytes)
+
+    def test_tampered_decode_records_fail_verification(self):
+        events = [raw_good(0, "p1", "00:00:00:00:00:01")]
+        log_bytes = self.qos_decode_log(events)
+        doc = json.loads(log_bytes.decode("utf-8"))
+        doc["records"][0]["applied"] = False
+        prefix = {
+            "schema": doc["schema"],
+            "config": doc["config"],
+            "records": doc["records"],
+        }
+        doc["sha256"] = hashlib.sha256(
+            (json.dumps(prefix, separators=(",", ":")) + "\n").encode("utf-8")
+        ).hexdigest()
+        bad = (
+            json.dumps(doc, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        code, out, err, after = run_qos(bad, "*")
+        self.assertEqual(code, 4)
+        self.assertIn(b"invalid_input", err)
+        self.assertEqual(out, b"")
+        self.assertEqual(after, bad)
+
+
+class DecodeWorkLimitTests(unittest.TestCase):
+    def test_decode_frames_billed_by_qos_check_formula(self):
+        # 同 qos-check：base config 初始 C=1；好帧/坏帧（runt）各计 22，
+        # offset=1 累计 23：等于上限合法，22 首次超过报 qos_work_limit/5
+        good = raw_good(0, "p1", "00:00:00:00:00:01")
+        bad = raw_bad(1, "p1", "00:00:00:00:00:02")
+        log_bytes = record(config(), [good, bad])
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, out, err, _ = run_qos(log_bytes, source + ":1", "23")
+        self.assertEqual(code, 0, err)
+        code, out, err, after = run_qos(log_bytes, source + ":1", "22")
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"qos_work_limit"}\n')
+        self.assertEqual(out, b"")
+        self.assertEqual(after, log_bytes)
+
+    def test_decode_admission_reject_still_billed(self):
+        # access p1 收 priority=7 带标签帧被准入拒绝：不入队、不改变状态，
+        # 仍按帧计 22
+        rejected = raw_good(0, "p1", "00:00:00:00:00:01",
+                            vlan=1, priority=7)
+        log_bytes = record(config(), [rejected])
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, out, err, _ = run_qos(log_bytes, source + ":1", "23")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(by_name(doc["ports"], "p2")["queues"],
+                         [[], [], [], []])
+        code, _, err, _ = run_qos(log_bytes, source + ":1", "22")
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"qos_work_limit"}\n')
+
+    def test_decode_work_counts_only_prefix(self):
+        events = [
+            raw_bad(0, "p1", "00:00:00:00:00:01"),
+            raw_bad(1, "p1", "00:00:00:00:00:02"),
+        ]
+        log_bytes = record(config(), events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, _, err, _ = run_qos(log_bytes, source + ":2", "45")
+        self.assertEqual(code, 0, err)
+        code, _, err, _ = run_qos(log_bytes, source + ":2", "44")
+        self.assertEqual(code, 5)
+        self.assertEqual(err, b'{"error":"qos_work_limit"}\n')
+        code, _, err, _ = run_qos(log_bytes, source + ":1", "23")
+        self.assertEqual(code, 0, err)
+        code, out, err, _ = run_qos(log_bytes, source + ":0", "1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out.decode("utf-8"))["offset"], 0)
+
+
 class UsageTests(unittest.TestCase):
     def test_arg_counts(self):
         log_bytes = qos_log([good_frame(0, "p1", "00:00:00:00:00:01")])
@@ -439,17 +687,51 @@ class ErrorPrecedenceTests(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertEqual(after, log_bytes)
 
-    def test_qos_decode_mode_rejected(self):
-        # qos-decode（t/port/data 原始帧）LOG：配置形状同 qos-check，但
-        # log-qos 仅接受 qos-check 模式
-        from test_qos_decode import raw_frame
-        events = [raw_frame(0, "p1", BCAST, "00:00:00:00:00:01")]
+    def test_qos_decode_mode_accepted(self):
+        # qos-decode（t/port/data 原始帧）LOG：配置形状同 qos-check，
+        # log-qos 按帧形状选 qos-decode 并给出出口队列
+        events = [raw_good(0, "p1", "00:00:00:00:00:01")]
         log_bytes = record(config(), events)
         code, out, err, after = run_qos(log_bytes, "*")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        self.assertEqual(after, log_bytes)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(list(doc), QOS_KEYS)
+        self.assertEqual(doc["schema"], 1)
+        self.assertEqual(doc["source_sha256"],
+                         json.loads(log_bytes.decode("utf-8"))["sha256"])
+        self.assertEqual(doc["offset"], 1)
+        self.assertEqual(by_name(doc["ports"], "p2")["queues"][0], [0])
+        self.assertEqual(doc["sha256"], digest_of(doc))
+
+    def test_mixed_frame_shapes_rejected(self):
+        # 同一 LOG 内 src 帧与 data 帧混用：静态摘要合法但模式判定
+        # invalid_input/4，stdout 空、LOG 不动
+        src_frame = good_frame(0, "p1", "00:00:00:00:00:01")
+        log_bytes = record(config(), [src_frame])
+        doc = json.loads(log_bytes.decode("utf-8"))
+        doc["records"].append({
+            "t": 1, "version": 0,
+            "event": {"t": 1, "port": "p1", "data": "00"},
+            "applied": True, "output": None,
+        })
+        prefix = {
+            "schema": doc["schema"],
+            "config": doc["config"],
+            "records": doc["records"],
+        }
+        doc["sha256"] = hashlib.sha256(
+            (json.dumps(prefix, separators=(",", ":")) + "\n").encode("utf-8")
+        ).hexdigest()
+        bad = (
+            json.dumps(doc, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        code, out, err, after = run_qos(bad, "*")
         self.assertEqual(code, 4)
         self.assertIn(b"invalid_input", err)
         self.assertEqual(out, b"")
-        self.assertEqual(after, log_bytes)
+        self.assertEqual(after, bad)
 
     def test_tampered_records_fail_verification(self):
         # 帧恒 applied=true；篡改为 false 并重算内部摘要 → 记录核对失败
