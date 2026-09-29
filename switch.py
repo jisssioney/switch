@@ -13244,6 +13244,31 @@ def qos_decode(
     )
 
 
+def validate_security_decode_events(events, ports, link_ids, lags):
+    """security-decode 事件：链路/成员/service 项与 t/port/data 原始帧按 t 非降混合。
+
+    非帧项、帧外壳（hex、最短长度、单层 8100、双标签拒绝）、MAC 准入
+    （目的非全零、源非零单播）及混合序 t 非降均同 qos-decode，复用其
+    全量校验。
+    """
+    return validate_qos_decode_events(events, ports, link_ids, lags)
+
+
+def security_decode(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+    acl, qos, security, max_frame, events, observer=None,
+):
+    # 原始帧按 frame-decode 规则解码为 security-check 的十一元组事件序
+    # （alignment 恒真，分类退化为 runt/giant/bad_fcs/good，未标记帧
+    # priority 恒 0、vlan 为 None），链路、成员、service 项原样保留；
+    # 统计、转发、学习、镜像、队列与端口安全随后完全沿用 security-check。
+    decoded = _decode_qos_events(events)
+    return forward_security_check(
+        bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+        acl, qos, security, max_frame, decoded, observer=observer,
+    )
+
+
 def validate_storm_check_config(config):
     if (
         not isinstance(config, dict)
@@ -18442,6 +18467,84 @@ def _cmd_qos_decode(
     return 0
 
 
+def _cmd_security_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_security_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 两文件先全量校验，再做工作量预演，最后正式仿真（状态独立、无部分输出）
+        (
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            mirror,
+            acl,
+            qos,
+            security,
+            max_frame,
+        ) = validate_security_check_config(config)
+        link_ids = {link["id"] for link in links}
+        events = validate_security_decode_events(
+            events_doc, ports, link_ids, lags
+        )
+        # 资源、工作量契约同 security-check：全量校验后无副作用预演，坏帧
+        # 按帧计费，超限不正式仿真；原始帧与解码帧一一对应，帧数一致
+        security_check_work(
+            bridges, links, delay, bridge, ports, age, storm, lags, acl, qos,
+            security, max_frame, _decode_qos_events(events),
+            max_security_work,
+        )
+        result = security_decode(
+            bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+            acl, qos, security, max_frame, events,
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except SecurityWorkLimit:
+        _fail("security_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_forward(
     config_path,
     events_path,
@@ -18548,6 +18651,7 @@ SUBCOMMANDS = frozenset((
     "qos-decode",
     "port-security",
     "security-check",
+    "security-decode",
     "reload",
     "reload-rollback",
 ))
@@ -19165,6 +19269,28 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_qos_decode(args[1], args[2], *limits)
+    if args[:1] == ["security-decode"]:
+        # security-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_SECURITY_WORK]]]：
+        #   签名、资源、工作量与错误契约同 security-check，可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_SECURITY_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_security_decode(args[1], args[2], *limits)
     # stp/fdb/forward/forward-static/forward-stp/stp-check/forward-stp-storm/
     # storm-check/lag/lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/
     # port-security/security-check/reload/reload-rollback 额外允许 5 项
