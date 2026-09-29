@@ -12978,7 +12978,7 @@ def validate_storm_check_events(events, ports, link_ids):
 
 def storm_check(
     bridges, links, delay, bridge_name, ports, age, storm, max_frame, events,
-    observer=None,
+    observer=None, state_out=None,
 ):
     window = storm["window"]
     limits = storm["limits"]
@@ -13231,6 +13231,49 @@ def storm_check(
             observer["items"].append(
                 {"kind": "frame", "t": t, "applied": True, "output": entry}
             )
+    if state_out is not None:
+        # log-storm 抑制状态快照：t=0（空前缀）或末条已消费记录的 t。
+        # meters 仅列满足 t-x<window 的非空速率队列（迁移队列不计），按
+        # 配置端口序、VLAN 升序、broadcast/multicast/unknown 序，times
+        # 为其中 x 的原序非负整数数组；blocked 按配置端口序、VLAN 升序，
+        # 仅列 t<until 项，项键序 port,vlan,until
+        snapshot_t = events[-1][1] if events else 0
+        order = {port["name"]: index for index, port in enumerate(ports)}
+        category_order = {
+            category: index for index, category in enumerate(STORM_CATEGORIES)
+        }
+        live_meters = {}
+        for (port_name, vlan, category), queue in rate_queues.items():
+            times = [x for x in queue if snapshot_t - x < window]
+            if times:
+                live_meters[(port_name, vlan, category)] = times
+        meters = [
+            {"port": port_name, "vlan": vlan, "category": category,
+             "times": times}
+            for (port_name, vlan, category), times in sorted(
+                live_meters.items(),
+                key=lambda item: (
+                    order[item[0][0]], item[0][1],
+                    category_order[item[0][2]],
+                ),
+            )
+        ]
+        blocked_snapshot = [
+            {"port": port_name, "vlan": vlan, "until": until}
+            for port_name, vlan, until in sorted(
+                (
+                    (port_name, vlan, until)
+                    for (port_name, vlan), until in blocked.items()
+                    if snapshot_t < until
+                ),
+                key=lambda item: (order[item[0]], item[1]),
+            )
+        ]
+        state_out["snapshot"] = {
+            "t": snapshot_t,
+            "meters": meters,
+            "blocked": blocked_snapshot,
+        }
     return {
         "results": results,
         "ports": [
@@ -16440,6 +16483,144 @@ def _cmd_log_lag(log_path, cursor_token, max_work):
     return 0
 
 
+STORM_LOG_DIGEST_KEYS = ("schema", "source_sha256", "offset", "snapshot")
+
+
+def _storm_log_prefix_bytes(doc):
+    """log-storm 末项摘要文本：前四键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in STORM_LOG_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _storm_log_bytes(doc):
+    """log-storm stdout 载荷：五键紧凑非 ASCII 转义 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in STORM_LOG_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_storm(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-page：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），但 * 表示 records 长度（重演全部）；offset 为不限长非负
+    # 十进制且不得越界。输入/输出上限固定各 16777216 字节，分块读取与
+    # 字节边界沿用 log-page，等于上限合法
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受 storm-check 配置形状，其他模式
+        # 一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "storm_check":
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重演完全沿用 replay 的 storm-check 路径：
+        # 逐项核对 t/version/applied/output，重建 LOG 须与原文件逐字节
+        # 一致（max_work=None：全量记录核对不设工作量上限）
+        _, observer = _run_storm_check(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条事件求风暴抑制快照：独立空状态、无副作用。
+        # 先按 storm-check 工作量公式（与 forward-stp-storm 同口径：初值
+        # B+L+2U；帧计 K+H+Q+P+1，链路变化另加收敛，幂等计 K+H+Q+1）预演
+        # 前 offset 项，等于上限合法，首次超过即抛 StormWorkLimit，再正式
+        # 重演；offset=0 为 t=0 初态，否则 t 取第 offset 项记录的事件时刻
+        (
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            max_frame,
+        ) = validate_storm_check_config(config)
+        link_ids = {link["id"] for link in links}
+        check_events = validate_storm_check_events(events, ports, link_ids)
+        prefix_events = check_events[:offset]
+        storm_check_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            max_frame,
+            prefix_events,
+            max_work,
+        )
+        snapshot = {}
+        storm_check(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            max_frame,
+            prefix_events,
+            state_out=snapshot,
+        )
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "snapshot": snapshot["snapshot"],
+        }
+        doc["sha256"] = hashlib.sha256(
+            _storm_log_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _storm_log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except StormWorkLimit:
+        _fail("storm_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_log_diff(
     left_path,
     right_path,
@@ -17206,6 +17387,7 @@ SUBCOMMANDS = frozenset((
     "log-qos",
     "log-stp",
     "log-lag",
+    "log-storm",
     "log-diff",
     "config-diff",
     "config-export",
@@ -17489,6 +17671,24 @@ def main(argv):
             else DEFAULT_MAX_LAG_WORK
         )
         return _cmd_log_lag(args[1], args[2], max_work)
+    if args[:1] == ["log-storm"]:
+        # log-storm LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
+        # 完全沿用 log-lag；MAX_WORK 为不限长正十进制，默认 10000000
+        # （storm-check 工作量公式，与 forward-stp-storm 同口径）
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_STORM_WORK
+        )
+        return _cmd_log_storm(args[1], args[2], max_work)
     if args[:1] == ["log-diff"]:
         # log-diff LEFT RIGHT [MAX_LOG_BYTES MAX_OUTPUT_BYTES MAX_DIFF_WORK]：
         # 三上限可省略或全给（0 或 3 个），格式沿用 config-diff（均须匹配
