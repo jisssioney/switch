@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""log-qos 子命令回归：按游标重演 qos-check 模式 LOG 的前 offset 条事件
-并给出出口队列。
+"""log-qos 子命令回归：按游标重演 qos-check/qos-decode 模式 LOG 的前
+offset 条事件并给出出口队列。
 
 仅用标准库；端到端驱动 `python switch.py log-qos LOG CURSOR [MAX_WORK]`。
 参数、资源、CURSOR 及错误顺序完全沿用 log-security；成功产物键序固定为
@@ -10,10 +10,12 @@ sha256；CURSOR 的 * 表示 records 长度（重演全部），否则
 name,queues,current,remaining；queues 依优先级 0..3 为四个 FIFO 帧号
 整数数组，帧号按所有帧事件零基编号，坏帧占号但不入队；wrr 时 current 为
 0..3 整数、remaining 为正整数（下次 service 续用），sp 时二者为 null。
-LOG 须通过摘要核对、qos-check 语义、全部记录核对与重建日志逐字节一致，
-其他模式 invalid_input/4；重演前 offset 项按 qos-check 工作量公式计费，
-等于上限合法，首次超过 stderr 仅 {"error":"qos_work_limit"} 加 LF 并
-退出 5。
+两种模式共享十二键配置：帧含 src（十键）按 qos-check，含 data
+（t/port/data 原始帧）按 qos-decode，帧形状混用 invalid_input/4，无帧仍按
+qos-check。LOG 须通过摘要核对、对应模式语义、全部记录核对与重建日志逐字节
+一致，其他模式 invalid_input/4；重演前 offset 项按 qos-check 工作量公式
+计费（qos-decode 帧先解码；坏帧、准入拒绝与幂等均计费），等于上限合法，
+首次超过 stderr 仅 {"error":"qos_work_limit"} 加 LF 并退出 5。
 """
 
 import hashlib
@@ -439,12 +441,108 @@ class ErrorPrecedenceTests(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertEqual(after, log_bytes)
 
-    def test_qos_decode_mode_rejected(self):
-        # qos-decode（t/port/data 原始帧）LOG：配置形状同 qos-check，但
-        # log-qos 仅接受 qos-check 模式
+    def test_qos_decode_mode_accepted(self):
+        # qos-decode（t/port/data 原始帧）LOG：配置形状同 qos-check，
+        # log-qos 须按 qos-decode 解码后沿用 qos-check 语义给出出口队列
         from test_qos_decode import raw_frame
-        events = [raw_frame(0, "p1", BCAST, "00:00:00:00:00:01")]
+        events = [
+            raw_frame(0, "p1", BCAST, "00:00:00:00:00:01"),  # fid0 好帧
+            raw_frame(1, "p1", BCAST, "00:00:00:00:00:02",
+                      payload_len=0),                        # fid1 runt 坏帧
+            raw_frame(2, "p1", BCAST, "00:00:00:00:00:03"),  # fid2 好帧
+        ]
         log_bytes = record(config(), events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        code, out, err, after = run_qos(log_bytes, "*")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(after, log_bytes)
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(doc["source_sha256"], source)
+        self.assertEqual(doc["offset"], 3)
+        # 坏帧占号但不入队
+        self.assertEqual(by_name(doc["ports"], "p2")["queues"][0], [0, 2])
+
+    def test_qos_decode_prefix_matches_direct_simulation(self):
+        from test_qos_decode import raw_frame
+        events = [
+            raw_frame(0, "p1", BCAST, "00:00:00:00:00:01"),
+            raw_frame(1, "p1", BCAST, "00:00:00:00:00:02", payload_len=0),
+            raw_frame(2, "p1", BCAST, "00:00:00:00:00:03", priority=7),
+            service(3, "p2", 1),
+        ]
+        log_bytes = record(config(), events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        cfg = json.loads(json.dumps(config()))
+        (
+            bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+            acl, qos, max_frame,
+        ) = switch_mod.validate_qos_check_config(cfg)
+        link_ids = {link["id"] for link in links}
+        decoded_all = switch_mod._decode_qos_events(
+            switch_mod.validate_qos_decode_events(events, ports, link_ids, lags)
+        )
+        for offset in range(len(events) + 1):
+            code, out, err, _ = run_qos(log_bytes, source + ":%d" % offset)
+            self.assertEqual(code, 0, (offset, err))
+            state = {}
+            switch_mod.forward_qos_check(
+                bridges, links, delay, bridge, ports, age, storm, lags,
+                mirror, acl, qos, max_frame, decoded_all[:offset],
+                state_out=state,
+            )
+            self.assertEqual(
+                json.loads(out.decode("utf-8"))["ports"], state["ports"]
+            )
+
+    def test_qos_decode_work_uses_qos_check_formula(self):
+        # 初始 C=1；好帧 X+3P+M+R+1，坏帧按帧同价，X 随 FDB 增长：实测
+        # offset 0/1/2/3 累计 1/23/47/71，等于上限合法、首次超过报 5
+        from test_qos_decode import raw_frame
+        events = [
+            raw_frame(0, "p1", BCAST, "00:00:00:00:00:01"),
+            raw_frame(1, "p1", BCAST, "00:00:00:00:00:02", payload_len=0),
+            raw_frame(2, "p1", BCAST, "00:00:00:00:00:03"),
+        ]
+        log_bytes = record(config(), events)
+        source = json.loads(log_bytes.decode("utf-8"))["sha256"]
+        for offset, work in ((0, 1), (1, 23), (2, 47), (3, 71)):
+            code, _, err, _ = run_qos(
+                log_bytes, source + ":%d" % offset, str(work)
+            )
+            self.assertEqual(code, 0, (offset, work, err))
+            if work > 1:
+                code, out, err, after = run_qos(
+                    log_bytes, source + ":%d" % offset, str(work - 1)
+                )
+                self.assertEqual(code, 5, (offset, work))
+                self.assertEqual(err, b'{"error":"qos_work_limit"}\n')
+                self.assertEqual(out, b"")
+                self.assertEqual(after, log_bytes)
+
+    def test_mixed_frame_shapes_rejected(self):
+        # 同一十二键配置 LOG 中混用 src 帧与 data 帧：record 入口即拒绝，
+        # 手工构造内部摘要合法的混合 LOG，log-qos 在模式判定处 invalid_input/4
+        from test_qos_decode import raw_frame
+        data_frame = raw_frame(0, "p1", BCAST, "00:00:00:00:00:01")
+        check_frame = good_frame(1, "p1", "00:00:00:00:00:02")
+        base = json.loads(qos_log([good_frame(0, "p1",
+                                              "00:00:00:00:00:01")]).decode())
+        base["records"] = [
+            {"t": event["t"], "version": 0, "event": event,
+             "applied": True, "output": None}
+            for event in (data_frame, check_frame)
+        ]
+        prefix = {
+            "schema": base["schema"],
+            "config": base["config"],
+            "records": base["records"],
+        }
+        base["sha256"] = hashlib.sha256(
+            (json.dumps(prefix, separators=(",", ":")) + "\n").encode("utf-8")
+        ).hexdigest()
+        log_bytes = (
+            json.dumps(base, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
         code, out, err, after = run_qos(log_bytes, "*")
         self.assertEqual(code, 4)
         self.assertIn(b"invalid_input", err)
