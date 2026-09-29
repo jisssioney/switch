@@ -12996,6 +12996,156 @@ STORM_CHECK_CONFIG_KEYS = frozenset(
 )
 
 
+QOS_DECODE_FRAME_KEYS = FRAME_DECODE_FRAME_KEYS  # {"t", "port", "data"}
+
+
+def validate_qos_decode_events(events, ports, link_ids, lags):
+    """qos-decode 事件：链路/成员/service 项与 t/port/data 原始帧按 t 非降混合。
+
+    非帧项沿用 qos-check；帧子序列复用 forward-decode 全量校验（hex、
+    最短长度、单层 8100、双标签拒绝、目的非全零、源非零单播），再在混合
+    序上重放跨类型的 t 非降。
+    """
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    member_set = {member for lag in lags for member in lag["members"]}
+    frame_docs = []
+    frame_positions = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == QOS_DECODE_FRAME_KEYS:
+            frame_docs.append(event)
+            frame_positions.add(index)
+        elif keys not in (
+            STP_EVENT_KEYS, MEMBER_EVENT_KEYS, SERVICE_EVENT_KEYS
+        ):
+            raise InvalidInput("bad event")
+    # 帧子序列的外壳（hex、8100、双标签）与 MAC 规则同 forward-decode
+    checked_frames = validate_forward_decode_frames(frame_docs, ports)
+    raw_by_pos = dict(zip(sorted(frame_positions), checked_frames))
+    result = []
+    prev_t = None
+    for index, event in enumerate(events):
+        t = event["t"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:  # 各类型混合序上 t 非降
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if index in raw_by_pos:
+            _, port_name, raw = raw_by_pos[index]
+            result.append(("frame", t, port_name, raw))
+            continue
+        keys = frozenset(event)
+        if keys == STP_EVENT_KEYS:
+            lid = event["id"]
+            up = event["up"]
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == MEMBER_EVENT_KEYS:
+            member = event["member"]
+            up = event["up"]
+            if not isinstance(member, str) or member not in member_set:
+                raise InvalidInput("bad event member")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("member", t, member, up))
+        else:
+            port = event["port"]
+            count = event["count"]
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not _is_int(count) or count <= 0:
+                raise InvalidInput("bad count")
+            result.append(("service", t, port, count))
+    return result
+
+
+def _decode_qos_raw_frames(frames):
+    """按 frame-decode 规则解析原始帧为 qos-check 的十元组帧序。
+
+    无对齐概念，alignment 恒真；未标记帧 priority 恒为 0、vlan 为 None，
+    分类退化为 runt/giant/bad_fcs/good。
+    """
+    checked = []
+    for t, port, raw in frames:
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            priority = tci >> 13
+            vlan = tci & 0x0FFF
+            ethertype_offset = 16
+        else:
+            priority = 0
+            vlan = None
+            ethertype_offset = 12
+        ethertype = (
+            (raw[ethertype_offset] << 8) | raw[ethertype_offset + 1]
+        )
+        fcs = raw[-4:] == (zlib.crc32(raw[:-4]) & 0xFFFFFFFF).to_bytes(
+            4, "little"
+        )
+        checked.append(
+            (
+                t, port, src, dst, vlan, ethertype, priority,
+                len(raw), fcs, True,
+            )
+        )
+    return checked
+
+
+def _decode_qos_events(events):
+    """把校验后的 qos-decode 混合事件转为 qos-check 十一元组事件序。
+
+    链路/成员/service 项原样保留，原始帧按 frame-decode 规则解码
+    （alignment 恒真，未标记 priority 恒 0、vlan 为 None）；工作量预演与
+    正式仿真共用同一转换，保证计费与执行同形。
+    """
+    raw_frames = [
+        (item[1], item[2], item[3]) for item in events if item[0] == "frame"
+    ]
+    decoded_frames = _decode_qos_raw_frames(raw_frames)
+    decoded = []
+    frame_index = 0
+    for item in events:
+        if item[0] == "frame":
+            t, port_name = item[1], item[2]
+            (
+                _, _, src, dst, vlan, ethertype, priority,
+                length, fcs, alignment,
+            ) = decoded_frames[frame_index]
+            frame_index += 1
+            decoded.append(
+                ("frame", t, port_name, src, dst, vlan, ethertype, priority,
+                 length, fcs, alignment)
+            )
+        else:
+            decoded.append(item)
+    return decoded
+
+
+def qos_decode(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+    acl, qos, max_frame, events, observer=None, state_out=None,
+):
+    # 原始帧按 frame-decode 规则解码为 qos-check 的十一元组事件序
+    # （alignment 恒真，分类退化为 runt/giant/bad_fcs/good），链路、成员、
+    # service 项原样保留；统计、转发、学习、镜像与队列随后完全沿用
+    # qos-check。observer/state_out 透传，由 qos-check 主体逐事件记录。
+    decoded = _decode_qos_events(events)
+    return forward_qos_check(
+        bridges, links, delay, bridge_name, ports, age, storm, lags, mirror,
+        acl, qos, max_frame, decoded, observer=observer, state_out=state_out,
+    )
+
+
 def validate_storm_check_config(config):
     if (
         not isinstance(config, dict)
@@ -13679,8 +13829,9 @@ def _log_mode(config, events=None):
     link-forward、link-state、forward-static、forward-stp、forward-check/
     forward-decode（共享 ports,age,max_frame 三键配置，按帧形状区分）、
     stp-check/stp-decode（共享七键配置，按事件帧形状区分）、
-    forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check、
-    security-check、mirror-check、lag-check、storm-check 或 port-security。
+    forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check/
+    qos-decode（共享十二键配置，按事件帧形状区分）、security-check、
+    mirror-check、lag-check、storm-check 或 port-security。
 
     events 非 None 时用于区分共享配置形状的两种模式：三键配置的非空帧
     数组含 src（八键）按 forward-check，含 data（t/port/data 原始帧）按
@@ -13688,7 +13839,10 @@ def _log_mode(config, events=None):
     forward-decode 路由（既有日志字节不变）。stp 七键配置的非链路帧含
     src（九键）按 stp-check，含 data（t/port/data 原始帧）按 stp-decode；
     两种帧形状混用报 InvalidInput；仅链路项或空事件沿用既有 stp-decode
-    路由（既有日志字节不变）。
+    路由（既有日志字节不变）。qos 十二键配置的帧项含 src（十键）按
+    qos-check，含 data（t/port/data 原始帧）按 qos-decode，两种帧形状
+    混用报 InvalidInput；仅链路/成员/service 项或空事件沿用既有
+    qos-check 路由（既有日志字节不变）。
     """
     if isinstance(config, dict):
         keys = frozenset(config)
@@ -13770,7 +13924,27 @@ def _log_mode(config, events=None):
         if keys == QOS_CONFIG_KEYS:
             return "qos"
         if keys == QOS_CHECK_CONFIG_KEYS:
-            return "qos_check"
+            # qos-check 与 qos-decode 共享十二键配置：非链路/成员/service
+            # 帧含 src（十键）按 qos-check，含 data（t/port/data 原始帧）
+            # 按 qos-decode，两种帧形状混用即非法输入；无非帧帧项时沿用
+            # 既有 qos-check 路由（既有日志字节不变）
+            saw_src = False
+            saw_data = False
+            for event in events if isinstance(events, list) else ():
+                if not isinstance(event, dict):
+                    raise InvalidInput("bad log event")
+                ekeys = frozenset(event)
+                if ekeys == QOS_CHECK_FRAME_KEYS:
+                    saw_src = True
+                elif ekeys == FRAME_DECODE_FRAME_KEYS:
+                    saw_data = True
+                elif ekeys not in (
+                    STP_EVENT_KEYS, MEMBER_EVENT_KEYS, SERVICE_EVENT_KEYS
+                ):
+                    raise InvalidInput("bad log event")
+            if saw_src and saw_data:
+                raise InvalidInput("bad log event")
+            return "qos_decode" if saw_data else "qos_check"
         if keys == SECURITY_CHECK_CONFIG_KEYS:
             return "security_check"
         if keys == MIRROR_CHECK_CONFIG_KEYS:
@@ -14387,6 +14561,70 @@ def _run_qos_check(config, events, observe, max_work=None):
     return result, observer
 
 
+def _run_qos_decode(config, events, observe, max_work=None):
+    """record/replay qos-decode 模式：校验 qos-decode（qos-check 十二键）
+    配置与混合事件并执行仿真。
+
+    输入、全量校验与执行语义完全沿用 qos-decode 入口；max_work 非 None
+    时（record/replay）全量语义校验后先按 qos-check 公式（与 qos 同口径）
+    无副作用预演，坏帧按帧计费、准入拒绝与幂等事件均计费，首次超过即抛
+    QosWorkLimit，不正式仿真。返回 (qos-decode 结果 dict, observer 或
+    None)；帧与 service 项恒 applied 且 output 为对应 results 项，链路/
+    成员项仅状态实际改变时 applied，output 恒 None。
+    """
+    (
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        max_frame,
+    ) = validate_qos_check_config(config)
+    link_ids = {link["id"] for link in links}
+    decode_events = validate_qos_decode_events(events, ports, link_ids, lags)
+    if max_work is not None:
+        # 与 qos-decode 入口同一 qos-check 公式：独立链路副本与空状态
+        qos_check_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            qos,
+            max_frame,
+            _decode_qos_events(decode_events),
+            max_work,
+        )
+    observer = {} if observe else None
+    result = qos_decode(
+        bridges,
+        links,
+        delay,
+        bridge,
+        ports,
+        age,
+        storm,
+        lags,
+        mirror,
+        acl,
+        qos,
+        max_frame,
+        decode_events,
+        observer=observer,
+    )
+    return result, observer
+
+
 def _run_acl(config, events, observe, max_work=None):
     """record/replay acl 模式：校验 acl 配置与事件并执行仿真。
 
@@ -14789,8 +15027,8 @@ def _build_log_doc(config, events, items):
     # （applied）才加 1，链路协商
     # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
     # 仅 applied 项加 1，qos/lag/mirror/acl/security-check/qos-check/
-    # acl-check/mirror-check/lag-check/storm-check 模式仅 applied 链路/
-    # 成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-decode/
+    # qos-decode/acl-check/mirror-check/lag-check/storm-check 模式仅
+    # applied 链路/成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-decode/
     # stp-check/forward-stp-storm 模式仅 applied 链路项加 1（帧项恒
     # applied 但不计），forward-static 模式帧恒 applied 且 version 恒 0
     version = 0
@@ -14812,6 +15050,7 @@ def _build_log_doc(config, events, items):
                 version += 1
         elif mode in (
             "qos", "lag", "mirror", "acl", "security_check", "qos_check",
+            "qos_decode",
             "acl_check", "mirror_check", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
@@ -14946,6 +15185,7 @@ def _verify_records(log, events, items):
                 version += 1
         elif mode in (
             "qos", "lag", "mirror", "acl", "security_check", "qos_check",
+            "qos_decode",
             "acl_check", "mirror_check", "lag_check", "storm_check"
         ):
             if kind in ("link", "member") and observed["applied"]:
@@ -15108,6 +15348,10 @@ def _cmd_record(
             )
         elif mode == "qos_check":
             result, observer = _run_qos_check(
+                config, events, True, max_record_work
+            )
+        elif mode == "qos_decode":
+            result, observer = _run_qos_decode(
                 config, events, True, max_record_work
             )
         elif mode == "mirror_check":
@@ -15282,6 +15526,10 @@ def _cmd_replay(
             )
         elif mode == "qos_check":
             result, observer = _run_qos_check(
+                config, events, True, max_replay_work
+            )
+        elif mode == "qos_decode":
+            result, observer = _run_qos_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "mirror_check":
@@ -17956,6 +18204,82 @@ def _cmd_stp_decode(
     return 0
 
 
+def _cmd_qos_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_qos_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 两文件先全量校验，再做工作量预演，最后正式仿真（状态独立、无部分输出）
+        (
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            mirror,
+            acl,
+            qos,
+            max_frame,
+        ) = validate_qos_check_config(config)
+        link_ids = {link["id"] for link in links}
+        events = validate_qos_decode_events(
+            events_doc, ports, link_ids, lags
+        )
+        # 资源、工作量契约同 qos-check：全量校验后无副作用预演，坏帧按帧
+        # 计费，超限不正式仿真；原始帧与解码帧一一对应，帧数一致
+        qos_check_work(
+            bridges, links, delay, bridge, ports, age, storm, lags, acl, qos,
+            max_frame, _decode_qos_events(events), max_qos_work,
+        )
+        result = qos_decode(
+            bridges, links, delay, bridge, ports, age, storm, lags, mirror,
+            acl, qos, max_frame, events,
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except QosWorkLimit:
+        _fail("qos_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_link_forward(
     config_path,
     events_path,
@@ -18058,6 +18382,7 @@ SUBCOMMANDS = frozenset((
     "acl-check",
     "qos",
     "qos-check",
+    "qos-decode",
     "port-security",
     "security-check",
     "reload",
@@ -18634,6 +18959,28 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_link_forward(args[1], args[2], *limits)
+    if args[:1] == ["qos-decode"]:
+        # qos-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_QOS_WORK]]]：
+        #   签名、资源、工作量与错误契约同 qos-check，可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_QOS_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_qos_decode(args[1], args[2], *limits)
     # stp/fdb/forward/forward-static/forward-stp/stp-check/forward-stp-storm/
     # storm-check/lag/lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/
     # port-security/security-check/reload/reload-rollback 额外允许 5 项

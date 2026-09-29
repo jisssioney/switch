@@ -439,6 +439,18 @@ class ErrorPrecedenceTests(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertEqual(after, log_bytes)
 
+    def test_qos_decode_mode_rejected(self):
+        # qos-decode（t/port/data 原始帧）LOG：配置形状同 qos-check，但
+        # log-qos 仅接受 qos-check 模式
+        from test_qos_decode import raw_frame
+        events = [raw_frame(0, "p1", BCAST, "00:00:00:00:00:01")]
+        log_bytes = record(config(), events)
+        code, out, err, after = run_qos(log_bytes, "*")
+        self.assertEqual(code, 4)
+        self.assertIn(b"invalid_input", err)
+        self.assertEqual(out, b"")
+        self.assertEqual(after, log_bytes)
+
     def test_tampered_records_fail_verification(self):
         # 帧恒 applied=true；篡改为 false 并重算内部摘要 → 记录核对失败
         events = [good_frame(0, "p1", "00:00:00:00:00:01")]
