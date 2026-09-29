@@ -16274,6 +16274,172 @@ def _cmd_log_qos(log_path, cursor_token, max_work):
     return 0
 
 
+CONFIG_LOG_DIGEST_KEYS = ("schema", "source_sha256", "offset", "snapshot")
+CONFIG_SNAPSHOT_KEYS = ("t", "config", "stack")
+
+
+def _config_log_prefix_bytes(doc):
+    """log-config 末项摘要文本：前四键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in CONFIG_LOG_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _config_log_bytes(doc):
+    """log-config stdout 载荷：五键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in CONFIG_LOG_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _config_replay_snapshot(config, events):
+    """重演前 offset 条原始事件求当前配置与回滚栈。
+
+    与 validate_reload_events(allow_rollback=True) 同一栈语义（调用前该
+    序列已通过全量校验，空栈等非法情形不可能到达）：reload 事件在替换前
+    把当前配置压栈再采用新配置，rollback 事件按 LIFO 弹栈恢复，其余事件
+    不改变配置。返回 (t, config, stack)：t 为末条已消费记录的 t（无消费
+    项为 0）；config 为当前配置；stack 按入栈序保存可回滚配置。仅配置
+    对象递归按 Unicode 码点排序（数组保序、标量保类型与值）。
+    """
+    current = config
+    stack = []
+    t = 0
+    for event in events:
+        t = event["t"]
+        keys = frozenset(event)
+        if keys == RELOAD_EVENT_KEYS:
+            stack.append(current)  # 替换前压入当前配置
+            current = event["config"]
+        elif keys == ROLLBACK_EVENT_KEYS:
+            current = stack.pop()  # LIFO 恢复
+        # 其余事件不改变配置
+    snapshot = {
+        "t": t,
+        "config": _canonical(current),
+        "stack": [_canonical(item) for item in stack],
+    }
+    return {key: snapshot[key] for key in CONFIG_SNAPSHOT_KEYS}
+
+
+def _cmd_log_config(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-qos：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），* 取 records 长度（重演全部）；offset 为不限长非负十进制且
+    # 不得越界。输入/输出上限固定各 16777216 字节，分块读取与字节边界
+    # 沿用 log-page，等于上限合法
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            # * 表示 records 长度：offset 取记录数，即重演全部记录
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受 port-security 配置形状（_log_mode
+        # 返回 "security"），其他模式一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        if _log_mode(config, events) != "security":
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重演完全沿用 replay 的 port-security
+        # （reload/rollback）路径：逐项核对 t/version/applied/output，
+        # 重建 LOG 须与原文件逐字节一致
+        _, observer = _run_reload(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条事件求配置快照：独立校验、无副作用。先按
+        # reload 工作量公式（独立链路副本与空状态）预演前 offset 项，等于
+        # 上限合法，首次超过即抛 ReloadWorkLimit，再据 reload/rollback 栈
+        # 语义重演配置；offset=0 时 t=0、config 为初始配置、stack 为空
+        (
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            _mirror,
+            acl,
+            qos,
+            security,
+        ) = validate_security_config(config)
+        link_ids = {link["id"] for link in links}
+        reload_events, _final_config = validate_reload_events(
+            events, ports, link_ids, lags, config, allow_rollback=True
+        )
+        prefix_events = reload_events[:offset]
+        reload_work(
+            bridges,
+            links,
+            delay,
+            bridge,
+            ports,
+            age,
+            storm,
+            lags,
+            acl,
+            qos,
+            security,
+            prefix_events,
+            max_work,
+        )
+        snapshot = _config_replay_snapshot(config, events[:offset])
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "snapshot": snapshot,
+        }
+        doc["sha256"] = hashlib.sha256(
+            _config_log_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _config_log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except ReloadWorkLimit:
+        _fail("reload_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 ACL_LOG_DIGEST_KEYS = (
     "schema", "source_sha256", "offset", "rules", "default"
 )
@@ -17857,6 +18023,7 @@ SUBCOMMANDS = frozenset((
     "log-fdb",
     "log-security",
     "log-qos",
+    "log-config",
     "log-link",
     "log-mirror",
     "log-acl",
@@ -18110,6 +18277,25 @@ def main(argv):
             else DEFAULT_MAX_QOS_WORK
         )
         return _cmd_log_qos(args[1], args[2], max_work)
+    if args[:1] == ["log-config"]:
+        # log-config LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
+        # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
+        # （reload 工作量公式）；LOG 仅接受 port-security 模式，其他模式
+        # invalid_input/4
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_RELOAD_WORK
+        )
+        return _cmd_log_config(args[1], args[2], max_work)
     if args[:1] == ["log-link"]:
         # log-link LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
         # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
