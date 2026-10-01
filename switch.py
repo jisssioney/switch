@@ -12704,6 +12704,20 @@ LINK_WIRE_ADVANCE_EVENT_KEYS = frozenset(("t", "advance"))
 LINK_WIRE_OVERHEAD = 8 + 12  # 前导码与定界符 8 字节 + 帧间隔 12 字节
 
 
+def _link_wire_ordered(events, port_count, order):
+    """同一时刻按配置端口顺序稳定排列：(t, 端口序, 原序) 排序；advance
+    无端口，置于该时刻最后。record/replay 记录处理顺序与仿真共用本序。"""
+    indexed = list(enumerate(events))
+    indexed.sort(
+        key=lambda ix: (
+            ix[1][1],
+            port_count if ix[1][0] == "advance" else order[ix[1][2]],
+            ix[0],
+        )
+    )
+    return indexed
+
+
 def validate_link_wire_config(config):
     """link-wire 配置：同 link-forward，每口另需非负整数 queue_bytes。"""
     if (
@@ -12836,13 +12850,22 @@ def validate_link_wire_events(events, fwd_ports):
 
 
 def link_wire(
-    fwd_ports, caps, queues, age, max_frame, delay, events, work_limit=None
+    fwd_ports, caps, queues, age, max_frame, delay, events, work_limit=None,
+    observer=None,
 ):
     """link-wire 仿真。
 
     work_limit 非 None 时在各计费点累计工作量 W（初值 P），首次超过即抛
     LinkWireWorkLimit；预演与正式仿真共用本函数（独立状态、无部分输出）。
+    observer 非 None 时（record/replay），按实际处理顺序（同一时刻按端口
+    配置序、advance 位于该时刻最后）逐输入事件记录一项
+    {"kind", "t", "applied", "output"}：output 为该事件开始时结算的到期
+    协商/发送结果与事件自身结果在 results 中的连续切片（协商完成本身不
+    产生记录）；frame 项恒 applied；link 项仅目标链路状态变化时 applied；
+    advance 项仅实际完成至少一个待定协商或发送时 applied。
     """
+    if observer is not None:
+        observer["items"] = []
     order = {port["name"]: i for i, port in enumerate(fwd_ports)}
     by_name = {port["name"]: port for port in fwd_ports}
     committed = {name: ("down",) for name in by_name}
@@ -12881,16 +12904,22 @@ def link_wire(
         return name not in pending and committed[name][0] == "up"
 
     def settle_negotiations(t):
-        # 完成截止 <= t 的协商，口序同配置（与 link-state/link-forward 一致）
+        # 完成截止 <= t 的协商，口序同配置（与 link-state/link-forward 一致）；
+        # 返回本次完成的协商数（协商完成本身不产生 results 记录）
+        done = 0
         for port in fwd_ports:
             name = port["name"]
             if name in pending and pending[name][2] <= t:
                 rate, mode, _ = pending.pop(name)
                 committed[name] = ("up", rate, mode)
+                done += 1
+        return done
 
     def settle_transmissions(t):
         # 结算结束时刻 <= t 的发送：全局按 (end, 口配置序) 逐项弹出队头；
         # 同口串行且时长为正，弹出一口队头后其下一副本 end 必更晚。
+        # 返回本次结算的发送完成数
+        settled = 0
         while True:
             best = None  # (end, port_index, name)
             for name in by_name:
@@ -12900,7 +12929,7 @@ def link_wire(
                     if best is None or cand < best:
                         best = cand
             if best is None:
-                return
+                return settled
             name = best[2]
             copy = outstanding[name].popleft()
             occupied[name] -= copy["bytes"]
@@ -12910,14 +12939,18 @@ def link_wire(
                 {"t": copy["end"], "port": name,
                  "start": copy["start"], "bytes": copy["bytes"]}
             )
+            settled += 1
             charge()
 
     def settle(t):
-        settle_negotiations(t)
-        settle_transmissions(t)
+        return settle_negotiations(t) + settle_transmissions(t)
 
     def apply_link(t, port, admin, peer, rates, modes):
-        """同 link-forward 的协商状态迁移；返回 (state,rate,mode,left_up)。"""
+        """同 link-forward 的协商状态迁移；返回 (state,rate,mode,changed)。
+
+        changed 仅在目标链路状态相对当前有效态发生变化时为真（同
+        link-forward 的 applied 口径：目标未变不重置协商）。
+        """
         if not admin or not peer:
             target = ("down",)
         else:
@@ -12939,7 +12972,8 @@ def link_wire(
             if current is not None
             else committed[port]
         )
-        if target == effective:
+        changed = target != effective
+        if not changed:
             pass
         elif target[0] == "up":
             pending[port] = (target[1], target[2], t + delay)
@@ -12983,7 +13017,7 @@ def link_wire(
             {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
         )
         charge()
-        return state, rate, mode
+        return state, rate, mode, changed
 
     def reschedule(port, ct):
         # 碰撞后剩余副本从碰撞时刻重新串行排程（入队均不晚于 ct）
@@ -12996,26 +13030,9 @@ def link_wire(
 
     # 同一时刻按配置端口顺序稳定排列：(t, 端口序, 原序) 排序；advance 无端口，
     # 置于该时刻最后（仅结算、不产生记录，位置不影响输出与最终状态）。
-    indexed = list(enumerate(events))
-    indexed.sort(
-        key=lambda ix: (
-            ix[1][1],
-            len(fwd_ports) if ix[1][0] == "advance" else order[ix[1][2]],
-            ix[0],
-        )
-    )
+    indexed = _link_wire_ordered(events, len(fwd_ports), order)
 
-    for _, item in indexed:
-        t = item[1]
-        settle(t)  # 幂等：同一时刻首次调用完成全部到期项，其后为空操作
-        charge()  # 每个输入事件计 1
-        kind = item[0]
-        if kind == "advance":
-            continue
-        if kind == "link":
-            _, t, port, admin, peer, rates, modes = item
-            apply_link(t, port, admin, peer, rates, modes)
-            continue
+    def handle_frame(item):
         (
             _,
             t,
@@ -13063,7 +13080,7 @@ def link_wire(
             )
             charge()
             reschedule(port_name, t)
-            continue
+            return
         stats[port_name]["rx_frames"] += 1
         stats[port_name]["rx_bytes"] += inbound_wire
         if length < FRAME_CHECK_RUNT_LENGTH:
@@ -13081,7 +13098,7 @@ def link_wire(
                 {"t": t, "class": cls, "action": "drop", "ports": []}
             )
             charge()
-            continue
+            return
         if tag is None:
             vlan = ingress["pvid"]
             rejected = False
@@ -13097,7 +13114,7 @@ def link_wire(
                 {"t": t, "class": cls, "action": "drop", "ports": []}
             )
             charge()
-            continue
+            return
         egress = []
         action = "drop"
         if is_up(port_name):  # 仅 up 口学习并作出口（同 link-forward）
@@ -13173,6 +13190,55 @@ def link_wire(
                 {"t": t, "port": name, "vlan": out_vlan, "bytes": wire_bytes}
             )
             charge()
+
+    for orig_index, item in indexed:
+        t = item[1]
+        # 每事件先结算到期协商与发送；同刻首个实际处理事件取得这些到期
+        # 结果（settle 幂等，其后同刻事件结算为空），observer 输出切片
+        # 自结算前的 results 长度起
+        begin = len(results)
+        settled = settle(t)
+        charge()  # 每个输入事件计 1
+        kind = item[0]
+        if kind == "advance":
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "advance",
+                        "t": t,
+                        "applied": settled > 0,
+                        "output": results[begin:],
+                        "index": orig_index,
+                    }
+                )
+            continue
+        if kind == "link":
+            _, t, port, admin, peer, rates, modes = item
+            _, _, _, changed = apply_link(t, port, admin, peer, rates, modes)
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "link",
+                        "t": t,
+                        "applied": changed,
+                        "output": results[begin:],
+                        "index": orig_index,
+                    }
+                )
+            continue
+        handle_frame(item)
+        if observer is not None:
+            # 帧项只要被处理即 applied（坏帧、VLAN 准入拒绝、碰撞、队列满
+            # 均算）；output 为到期发送结果与本帧自身结果的连续切片
+            observer["items"].append(
+                {
+                    "kind": "frame",
+                    "t": item[1],
+                    "applied": True,
+                    "output": results[begin:],
+                    "index": orig_index,
+                }
+            )
     # 末事件后不自动排空：未完成副本保留在状态中，仅输出已有记录
     return {
         "results": results,
@@ -14432,6 +14498,7 @@ EVENT_KIND_BY_KEYS = {
     ROLLBACK_EVENT_KEYS: "rollback",
     LINK_FORWARD_LINK_EVENT_KEYS: "link",
     LINK_FORWARD_FRAME_EVENT_KEYS: "frame",
+    LINK_WIRE_ADVANCE_EVENT_KEYS: "advance",
     FRAME_DECODE_FRAME_KEYS: "frame",
     FORWARD_CHECK_FRAME_KEYS: "frame",
 }
@@ -14490,6 +14557,16 @@ def _log_mode(config, events=None):
         if keys == LOOP_CONFIG_KEYS:
             return "loop"
         if keys == LINK_FORWARD_CONFIG_KEYS:
+            # link-wire 与 link-forward 共享四键配置：每口另含非负整数
+            # queue_bytes 时为 link-wire（事件另接受 advance 项）
+            port_docs = config.get("ports")
+            if (
+                isinstance(port_docs, list)
+                and port_docs
+                and all(isinstance(p, dict) for p in port_docs)
+                and all("queue_bytes" in p for p in port_docs)
+            ):
+                return "link_wire"
             return "link_forward"
         if keys == LINK_STATE_CONFIG_KEYS:
             return "link_state"
@@ -14713,6 +14790,35 @@ def _run_link_forward(config, events, observe, max_work=None):
     observer = {} if observe else None
     result = link_forward(
         fwd_ports, caps, age, max_frame, delay, lf_events, observer=observer
+    )
+    return result, observer
+
+
+def _run_link_wire(config, events, observe, max_work=None):
+    """record/replay link-wire 模式：校验 link-wire 配置与 link/frame/
+    advance 混合事件并执行线速仿真。
+
+    输入、全量校验、同刻排序（端口配置序、advance 居末）、工作量计费与
+    仿真语义完全沿用 link-wire 入口；max_work 非 None 时（record/replay）
+    全量语义校验后先按 link-wire 公式无副作用预演（W 初值 P，每输入事件、
+    每条结果、碰撞后每个重排程副本各计 1），首次超过即抛
+    LinkWireWorkLimit，不正式仿真。返回 (link-wire 结果 dict, observer 或
+    None)；observer 按实际处理顺序逐事件给 applied 与 output 连续切片。
+    """
+    (
+        fwd_ports, caps, queues, age, max_frame, delay,
+    ) = validate_link_wire_config(config)
+    lw_events = validate_link_wire_events(events, fwd_ports)
+    if max_work is not None:
+        # 与 link-wire 入口同一公式：独立状态、无副作用
+        link_wire_work(
+            fwd_ports, caps, queues, age, max_frame, delay, lw_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = link_wire(
+        fwd_ports, caps, queues, age, max_frame, delay, lw_events,
+        observer=observer,
     )
     return result, observer
 
@@ -15638,6 +15744,20 @@ def _run_storm_check(config, events, observe, max_work=None):
     return result, observer
 
 
+def _ordered_pairs(config, events, items):
+    """返回按记录顺序排列的 (event, observed) 对。
+
+    link-wire 的 items 由仿真按实际处理顺序（同刻端口配置序、advance
+    居末）产生，并携带原事件输入索引；record 时 events 为输入序、replay
+    时 events 取自 records 本身即处理序，两种情况下 events[index] 都取
+    回对应的原事件。其余模式保持输入顺序。
+    """
+    mode = _log_mode(config, events)
+    if mode != "link_wire":
+        return list(zip(events, items))
+    return [(events[observed["index"]], observed) for observed in items]
+
+
 def _build_log_doc(config, events, items):
     """构造 LOG 文档（含 sha256）；records 与事件等长、同序。"""
     if len(events) != len(items):
@@ -15648,14 +15768,17 @@ def _build_log_doc(config, events, items):
     # （applied）才加 1（同时刻同口幂等重复学习不计），安全模式每次
     # reload/rollback（无变化亦算）加 1，stp/环路模式链路 up 实际改变
     # （applied）才加 1，链路协商
-    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），链路状态模式
-    # 仅 applied 项加 1，qos/lag/mirror/acl/security-check/qos-check/
-    # qos-decode/acl-check/mirror-check/lag-check/storm-check 模式仅
-    # applied 链路/成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-decode/
-    # stp-check/forward-stp-storm 模式仅 applied 链路项加 1（帧项恒
-    # applied 但不计），forward-static 模式帧恒 applied 且 version 恒 0
+    # 模式仅 applied 链路项加 1（帧项恒 applied 但不计），link-wire 同
+    # link-forward（帧恒 applied、advance 仅推进结算，均不计 version），
+    # 链路状态模式仅 applied 项加 1，qos/lag/mirror/acl/security-check/
+    # qos-check/qos-decode/acl-check/mirror-check/lag-check/storm-check
+    # 模式仅 applied 链路/成员项加 1（帧与 service 恒 applied 但不计），
+    # forward-stp/stp-decode/stp-check/forward-stp-storm 模式仅 applied
+    # 链路项加 1（帧项恒 applied 但不计），forward-static 模式帧恒
+    # applied 且 version 恒 0
     version = 0
-    for event, observed in zip(events, items):
+    # link-wire 记录按处理顺序（同刻端口序、advance 居末），其余按输入序
+    for event, observed in _ordered_pairs(config, events, items):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log")
@@ -15663,8 +15786,8 @@ def _build_log_doc(config, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "forward_stp", "stp_decode", "stp_check",
-            "forward_stp_storm"
+            "link_forward", "link_wire", "forward_stp", "stp_decode",
+            "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -15774,8 +15897,10 @@ def _validate_log_shape(log):
         _event_kind(event)
         if not isinstance(record["applied"], bool):
             raise InvalidInput("bad log applied")
+        # output 为 null（无对应结果项的模式/事件）、单个结果对象，或
+        # link-wire 模式下该事件的到期结算与自身结果数组
         if record["output"] is not None and not isinstance(
-            record["output"], dict
+            record["output"], (dict, list)
         ):
             raise InvalidInput("bad log output")
     digest = log["sha256"]
@@ -15788,9 +15913,14 @@ def _verify_records(log, events, items):
     records = log["records"]
     if len(records) != len(items):
         raise InvalidInput("bad log records")
-    mode = _log_mode(log["config"], events)
+    config = log["config"]
+    mode = _log_mode(config, events)
     version = 0
-    for event, observed, record in zip(events, items, records):
+    # link-wire 的 records 按处理顺序排列；record 时 events 为输入序，
+    # replay 时 events 取自 records 已是该序（_ordered_pairs 稳定，重复
+    # 排序幂等）
+    pairs = _ordered_pairs(config, events, items)
+    for record, (event, observed) in zip(records, pairs):
         kind = _event_kind(event)
         if kind != observed["kind"]:
             raise InvalidInput("bad log record")
@@ -15798,8 +15928,8 @@ def _verify_records(log, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "forward_stp", "stp_decode", "stp_check",
-            "forward_stp_storm"
+            "link_forward", "link_wire", "forward_stp", "stp_decode",
+            "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -15909,6 +16039,10 @@ def _cmd_record(
             result, observer = _run_link_forward(
                 config, events, True, max_record_work
             )
+        elif mode == "link_wire":
+            result, observer = _run_link_wire(
+                config, events, True, max_record_work
+            )
         elif mode == "forward":
             result, observer = _run_forward(
                 config, events, True, max_record_work
@@ -16016,6 +16150,7 @@ def _cmd_record(
         ForwardWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
+        LinkWireWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
@@ -16085,6 +16220,10 @@ def _cmd_replay(
             )
         elif mode == "link_forward":
             result, observer = _run_link_forward(
+                config, events, True, max_replay_work
+            )
+        elif mode == "link_wire":
+            result, observer = _run_link_wire(
                 config, events, True, max_replay_work
             )
         elif mode == "forward":
@@ -16192,6 +16331,7 @@ def _cmd_replay(
         ForwardWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
+        LinkWireWorkLimit,
         LinkWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
@@ -16347,6 +16487,11 @@ def _cmd_log_summary(log_path, max_log_bytes, max_output_bytes):
         applied_total = 0
         for record in log["records"]:
             kind = _event_kind(record["event"])
+            # kinds 词表固定为既有七类：link-wire 的 advance 事件虽为
+            # 合法日志事件，但不属于该词表，按非法输入处理（不改变既有
+            # 日志的 summary 字节）
+            if kind not in totals:
+                raise InvalidInput("bad log event kind")
             totals[kind] += 1
             total += 1
             if record["applied"]:
