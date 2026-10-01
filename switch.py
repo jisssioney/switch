@@ -13418,6 +13418,134 @@ def link_wire_work(fwd_ports, caps, queues, age, max_frame, delay, events,
     )
 
 
+# ---------------------------------------------------------------------------
+# link-wire-decode：CONFIG 与 link-wire 完全相同；EVENTS 中 link、advance
+# 项保持 link-wire 原语义，帧项改为仅含 t、port、data 的完整以太帧（小写
+# 偶数位十六进制）。入口先完整解析校验两个文件，再把每个原始帧按现有
+# frame-decode 口径解释为单层 802.1Q 帧（复用 forward-decode 的全量帧
+# 校验：合法 hex、最短 18/带标签 22 字节、单层 8100、双标签拒绝、目的非
+# 全零、源非零单播），解码为 link-wire 九元组帧（无对齐概念，alignment
+# 恒真）。错误 FCS、长度<64、>max_frame 为可处理坏帧，分别以 bad_fcs、
+# runt、giant 进入 link-wire 既有丢弃与计数路径；标签增删、20 字节线路
+# 开销、半双工碰撞、链路中断清队列、queue_bytes 与计费语义完全沿用
+# link-wire，输出与把同一原始帧准确转换后调用 link-wire 逐字节一致。
+# ---------------------------------------------------------------------------
+
+LINK_WIRE_DECODE_FRAME_KEYS = FRAME_DECODE_FRAME_KEYS  # {"t", "port", "data"}
+
+
+def validate_link_wire_decode_events(events, fwd_ports):
+    """link-wire-decode 事件：link/advance 项同 link-wire；帧项为
+    t/port/data 原始帧，三类按 t 非降混合。
+
+    帧子序列复用 forward-decode 全量校验（hex、最短长度、单层 8100、双
+    标签拒绝、目的非全零、源非零单播），再在混合序上重放跨类型的 t 非降；
+    返回 ("frame", t, port, raw) 与 link/advance 元组的混合序，原序保留。
+    """
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in fwd_ports}
+    frame_docs = []
+    frame_positions = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        if keys == LINK_WIRE_DECODE_FRAME_KEYS:
+            frame_docs.append(event)
+            frame_positions.add(index)
+        elif keys not in (
+            LINK_WIRE_LINK_EVENT_KEYS, LINK_WIRE_ADVANCE_EVENT_KEYS
+        ):
+            # 不允许混入 link-wire 的抽象帧形状（八键）
+            raise InvalidInput("bad event")
+    # 帧子序列的外壳（hex、8100、双标签）与 MAC 规则同 forward-decode
+    checked_frames = validate_forward_decode_frames(frame_docs, fwd_ports)
+    raw_by_pos = dict(zip(sorted(frame_positions), checked_frames))
+    result = []
+    prev_t = None
+    for index, event in enumerate(events):
+        keys = frozenset(event)
+        t = event["t"]
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:  # 各类型混合序上 t 非降
+            raise InvalidInput("t not monotonic")
+        prev_t = t
+        if index in raw_by_pos:
+            _, port_name, raw = raw_by_pos[index]
+            result.append(("frame", t, port_name, raw))
+        elif keys == LINK_WIRE_ADVANCE_EVENT_KEYS:
+            if event["advance"] is not True:
+                raise InvalidInput("bad advance")
+            result.append(("advance", t))
+        else:
+            port = event["port"]
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            admin = event["admin"]
+            peer = event["peer"]
+            if not isinstance(admin, bool) or not isinstance(peer, bool):
+                raise InvalidInput("bad admin/peer")
+            rates = _validate_link_state_rates(event["rates"])
+            modes = _validate_link_state_modes(event["modes"])
+            result.append(("link", t, port, admin, peer, rates, modes))
+    return result
+
+
+def _decode_link_wire_events(events):
+    """按 frame-decode 规则把原始帧解码为 link-wire 九元组事件序。
+
+    link/advance 项原样保留；帧项 ("frame", t, port, raw) 经
+    _decode_raw_frames（src/dst 规范小写 MAC、vlan 取自单层 8100、length
+    为实际字节数、fcs 由 CRC32 重算、alignment 恒真）转为
+    ("frame", t, port, src, dst, vlan, length, fcs, True)，与调用方手工
+    拆分后喂给 link-wire 的抽象帧逐字段一致。
+    """
+    raw_frames = [
+        (item[1], item[2], item[3]) for item in events if item[0] == "frame"
+    ]
+    decoded_frames = _decode_raw_frames(raw_frames)
+    decoded = []
+    frame_index = 0
+    for item in events:
+        if item[0] == "frame":
+            t, port_name, src, dst, vlan, length, fcs, alignment = (
+                decoded_frames[frame_index]
+            )
+            frame_index += 1
+            decoded.append(
+                ("frame", t, port_name, src, dst, vlan, length, fcs, alignment)
+            )
+        else:
+            decoded.append(item)
+    return decoded
+
+
+def link_wire_decode(
+    fwd_ports, caps, queues, age, max_frame, delay, events, work_limit=None,
+    observer=None,
+):
+    """link-wire-decode 仿真：原始帧解码为 link-wire 事件序后完全沿用
+    link-wire（同一时刻排序、结算、碰撞、队列、计费与 observer 语义）。"""
+    return link_wire(
+        fwd_ports, caps, queues, age, max_frame, delay,
+        _decode_link_wire_events(events),
+        work_limit=work_limit, observer=observer,
+    )
+
+
+def link_wire_decode_work(fwd_ports, caps, queues, age, max_frame, delay,
+                          events, limit):
+    """link-wire-decode 工作量预演：与 link-wire 同一公式，独立状态、无
+    副作用、不产出；先按入口同一转换解码原始帧，等于上限合法。"""
+    link_wire(
+        fwd_ports, caps, queues, age, max_frame, delay,
+        _decode_link_wire_events(events),
+        work_limit=limit,
+    )
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -14660,7 +14788,8 @@ def _event_kind(event):
 
 def _log_mode(config, events=None):
     """record/replay 按 config 形状选模式：fdb、forward、stp、loop-detect、
-    link-forward、link-state、forward-static、forward-stp、forward-check/
+    link-forward、link-state、link-wire/link-wire-decode（共享含
+    queue_bytes 的配置，按帧形状区分）、forward-static、forward-stp、forward-check/
     forward-decode（共享 ports,age,max_frame 三键配置，按帧形状区分）、
     stp-check/stp-decode（共享七键配置，按事件帧形状区分）、
     forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check/
@@ -14676,7 +14805,10 @@ def _log_mode(config, events=None):
     路由（既有日志字节不变）。qos 十二键配置的帧项含 src（十键）按
     qos-check，含 data（t/port/data 原始帧）按 qos-decode，两种帧形状
     混用报 InvalidInput；仅链路/成员/service 项或空事件沿用既有
-    qos-check 路由（既有日志字节不变）。
+    qos-check 路由（既有日志字节不变）。含 queue_bytes 配置的帧项含 src
+    （八键）按 link-wire，含 data（t/port/data 原始帧）按 link-wire-decode，
+    两种帧形状混用报 InvalidInput；仅 link/advance 项或空事件沿用既有
+    link-wire 路由（旧日志哈希与字节不变）。
     """
     if isinstance(config, dict):
         keys = frozenset(config)
@@ -14714,7 +14846,29 @@ def _log_mode(config, events=None):
                     for p in ports_doc
                 )
             ):
-                return "link_wire"
+                # link-wire 与 link-wire-decode 共享含 queue_bytes 的配置：
+                # 非 link/advance 的帧项含 src（八键抽象帧）按 link-wire，
+                # 含 data（t/port/data 原始帧）按 link-wire-decode，两种帧
+                # 形状混用即非法输入；仅 link/advance 项或空事件沿用既有
+                # link-wire 路由（旧日志字节与哈希不变）。
+                saw_src = False
+                saw_data = False
+                for event in events if isinstance(events, list) else ():
+                    if not isinstance(event, dict):
+                        raise InvalidInput("bad log event")
+                    ekeys = frozenset(event)
+                    if ekeys == LINK_WIRE_FRAME_EVENT_KEYS:
+                        saw_src = True
+                    elif ekeys == FRAME_DECODE_FRAME_KEYS:
+                        saw_data = True
+                    elif ekeys not in (
+                        LINK_WIRE_LINK_EVENT_KEYS,
+                        LINK_WIRE_ADVANCE_EVENT_KEYS,
+                    ):
+                        raise InvalidInput("bad log event")
+                if saw_src and saw_data:
+                    raise InvalidInput("bad log event")
+                return "link_wire_decode" if saw_data else "link_wire"
             return "link_forward"
         if keys == LINK_STATE_CONFIG_KEYS:
             return "link_state"
@@ -14976,6 +15130,44 @@ def _run_link_wire(config, events, observe, max_work=None):
         # advance 最后）：仿真即按此序追加 item；再给出同一排列的规范化
         # 前输入事件，供 record/replay 构建/核对日志。各记录 output 依次
         # 拼接恰为直接结果数组。
+        indexed = _link_wire_indexed(fwd_ports, lw_events)
+        observer["events"] = [events[ix] for ix, _ in indexed]
+    return result, observer
+
+
+def _run_link_wire_decode(config, events, observe, max_work=None):
+    """record/replay link-wire-decode 模式：校验含 queue_bytes 的配置与
+    link/advance 及 t/port/data 原始帧混合事件并执行线速仿真。
+
+    输入、全量校验、同一时刻排序、工作量计费与仿真语义完全沿用
+    link-wire-decode 入口（原始帧按 frame-decode 口径先全量校验再解码为
+    link-wire 九元组）；max_work 非 None 时（record/replay）全量语义校验
+    后先按 link-wire 公式无副作用预演，首次超过即抛 LinkWireWorkLimit，
+    不正式仿真。observer 的 items 与 events 排列规则同 _run_link_wire：
+    同一时刻按端口配置序、advance 最后；frame 恒 applied（坏帧、准入、
+    碰撞、队列满丢弃亦然），link 仅状态实际改变时 applied，advance 仅
+    实际完成到期协商或发送时 applied。返回 (link-wire 结果 dict,
+    observer 或 None)，直接结果与 link-wire 同形状。
+    """
+    (
+        fwd_ports, caps, queues, age, max_frame, delay,
+    ) = validate_link_wire_config(config)
+    lw_events = validate_link_wire_decode_events(events, fwd_ports)
+    if max_work is not None:
+        # 与 link-wire-decode 入口同一公式：先按同一转换解码，再以独立
+        # 状态跑同一仿真，无副作用
+        link_wire_decode_work(
+            fwd_ports, caps, queues, age, max_frame, delay, lw_events,
+            max_work,
+        )
+    observer = {} if observe else None
+    result = link_wire_decode(
+        fwd_ports, caps, queues, age, max_frame, delay, lw_events,
+        observer=observer,
+    )
+    if observer is not None:
+        # 日志按实际处理顺序保存记录；帧元组前三段（kind/t/port）解码前后
+        # 相同，_link_wire_indexed 排序结果与仿真内部一致。
         indexed = _link_wire_indexed(fwd_ports, lw_events)
         observer["events"] = [events[ix] for ix, _ in indexed]
     return result, observer
@@ -15927,8 +16119,8 @@ def _build_log_doc(config, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "link_wire", "forward_stp", "stp_decode",
-            "stp_check", "forward_stp_storm"
+            "link_forward", "link_wire", "link_wire_decode", "forward_stp",
+            "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -16064,8 +16256,8 @@ def _verify_records(log, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "link_wire", "forward_stp", "stp_decode",
-            "stp_check", "forward_stp_storm"
+            "link_forward", "link_wire", "link_wire_decode", "forward_stp",
+            "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -16177,6 +16369,10 @@ def _cmd_record(
             )
         elif mode == "link_wire":
             result, observer = _run_link_wire(
+                config, events, True, max_record_work
+            )
+        elif mode == "link_wire_decode":
+            result, observer = _run_link_wire_decode(
                 config, events, True, max_record_work
             )
         elif mode == "forward":
@@ -16362,6 +16558,10 @@ def _cmd_replay(
             )
         elif mode == "link_wire":
             result, observer = _run_link_wire(
+                config, events, True, max_replay_work
+            )
+        elif mode == "link_wire_decode":
+            result, observer = _run_link_wire_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "forward":
@@ -19373,6 +19573,66 @@ def _cmd_link_wire(
     return 0
 
 
+def _cmd_link_wire_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_link_wire_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # CONFIG 同 link-wire；EVENTS 先全量校验（含每个原始帧的外壳与
+        # MAC 准入），再做工作量预演，最后正式仿真（状态独立、无部分输出）
+        (
+            fwd_ports, caps, queues, age, max_frame, delay,
+        ) = validate_link_wire_config(config)
+        events = validate_link_wire_decode_events(events_doc, fwd_ports)
+        link_wire_decode_work(
+            fwd_ports, caps, queues, age, max_frame, delay, events,
+            max_link_wire_work,
+        )
+        result = link_wire_decode(
+            fwd_ports, caps, queues, age, max_frame, delay, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except LinkWireWorkLimit:
+        _fail("link_wire_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
@@ -19404,6 +19664,7 @@ SUBCOMMANDS = frozenset((
     "stp-decode",
     "link-forward",
     "link-wire",
+    "link-wire-decode",
     "fdb",
     "forward",
     "forward-static",
@@ -20041,6 +20302,28 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_link_wire(args[1], args[2], *limits)
+    if args[:1] == ["link-wire-decode"]:
+        # link-wire-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_WIRE_WORK]]]：
+        #   参数、资源、校验顺序与错误契约同 link-wire，可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_LINK_WIRE_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_link_wire_decode(args[1], args[2], *limits)
     if args[:1] == ["qos-decode"]:
         # qos-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_QOS_WORK]]]：
