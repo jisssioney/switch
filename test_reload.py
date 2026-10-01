@@ -271,7 +271,71 @@ class ReloadInvalidTest(unittest.TestCase):
     def test_immutable_nested_changed(self):
         config = base_config()
         new = copy.deepcopy(config)
+        new["ports"][0]["pvid"] = 2
+        run_invalid(config, [{"t": 0, "config": new}])
+
+    def test_storm_now_mutable(self):
+        config = base_config()
+        new = copy.deepcopy(config)
         new["storm"]["hold"] = 11
+        result = run(config, [{"t": 0, "config": new}])
+        self.assertEqual(
+            [c["key"] for c in result["results"][0]["changes"]], ["storm"]
+        )
+        self.assertEqual(result["config"]["storm"]["hold"], 11)
+
+    def test_mirror_now_mutable(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["mirror"]["target"] = "p3"
+        new["mirror"]["sources"] = ["p2"]
+        result = run(config, [{"t": 0, "config": new}])
+        self.assertEqual(
+            [c["key"] for c in result["results"][0]["changes"]], ["mirror"]
+        )
+        self.assertEqual(result["config"]["mirror"]["target"], "p3")
+
+    def test_changes_order_age_storm_mirror_acl_qos_security(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["age"] = 50
+        new["storm"]["hold"] = 11
+        new["mirror"]["direction"] = "ingress"
+        new["acl"] = [
+            {
+                "src": None,
+                "dst": "ff:ff:ff:ff:ff:ff",
+                "vlan": None,
+                "ethertype": None,
+                "priority": None,
+                "action": "drop",
+                "to_vlan": None,
+            }
+        ]
+        new["qos"]["cap"] = 500
+        new["security"][0]["limit"] = 5
+        result = run(config, [{"t": 0, "config": new}])
+        self.assertEqual(
+            [c["key"] for c in result["results"][0]["changes"]],
+            ["age", "storm", "mirror", "acl", "qos", "security"],
+        )
+
+    def test_bad_storm_in_reload_invalid(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["storm"]["window"] = 0
+        run_invalid(config, [{"t": 0, "config": new}])
+
+    def test_bad_mirror_target_in_reload_invalid(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["mirror"]["target"] = "nope"
+        run_invalid(config, [{"t": 0, "config": new}])
+
+    def test_mirror_source_target_constraint_in_reload_invalid(self):
+        config = base_config()
+        new = copy.deepcopy(config)
+        new["mirror"]["target"] = "p4"  # target 不得为 LAG 成员
         run_invalid(config, [{"t": 0, "config": new}])
 
     def test_dynamic_count_exceeds_new_limit(self):
