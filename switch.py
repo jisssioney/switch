@@ -157,6 +157,10 @@ class LinkWireWorkLimit(Exception):
     pass
 
 
+class LinkFlowWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -13552,6 +13556,694 @@ def link_wire_decode_work(fwd_ports, caps, queues, age, max_frame, delay,
     )
 
 
+# ---------------------------------------------------------------------------
+# link-flow-decode：CONFIG 同 link-wire-decode，每口额外声明布尔
+# flow_control（端口九键）；事件同为 link/advance/{t,port,data} 混合显式
+# 时钟，校验口径与 link-wire-decode 完全一致。原始帧解码后，未带 VLAN
+# 标签、目的 MAC 01:80:c2:00:00:01、以太类型 0x8808、操作码 0x0001、长度
+# 恰 64 字节、保留字节全零且分类 good 的 PAUSE 帧在入端口本地终止：不
+# 学习源 MAC、不参与 VLAN 转发。端口 up/full 且启用流控时按网络字节序读
+# 16 位 quanta，设置/覆盖发送截止时刻 t+ceil(quanta*512000/rate)；已开始
+# 的帧继续完成，未开始队列副本整体重排且顺序不变，新副本接调整后队尾；
+# 零值在当前帧完成后恢复；后续非零值覆盖旧截止时刻；链路离开 up 清除
+# 暂停。不支持时输出 pause_unsupported 且不改队列；控制帧长度/操作码/
+# 保留字节非法输出 malformed_pause；坏 FCS、短帧、超长帧沿用既有分类
+# 优先级。advance 结算暂停到期与发送完成，末事件后不自动排空。
+# ---------------------------------------------------------------------------
+
+LINK_FLOW_PAUSE_DST = "01:80:c2:00:00:01"
+LINK_FLOW_PAUSE_ETHERTYPE = 0x8808
+LINK_FLOW_PAUSE_OPCODE = 0x0001
+LINK_FLOW_PAUSE_QUANTA_TICKS = 512000  # 每量子 512 bit 时间，单位 ns/Mbps
+
+
+def validate_link_flow_config(config):
+    """link-flow-decode 配置：同 link-wire，每口再声明布尔 flow_control。"""
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != LINK_WIRE_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    delay = config["delay"]
+    if not _is_int(delay) or delay <= 0:
+        raise InvalidInput("bad delay")
+    max_frame = config["max_frame"]
+    if (
+        not _is_int(max_frame)
+        or not FRAME_CHECK_MIN_MAX_FRAME
+        <= max_frame
+        <= FRAME_CHECK_MAX_MAX_FRAME
+    ):
+        raise InvalidInput("bad max_frame")
+    age = config["age"]
+    if not _is_int(age) or age <= 0:
+        raise InvalidInput("age must be a positive integer")
+    port_docs = config["ports"]
+    if not isinstance(port_docs, list) or not port_docs:
+        raise InvalidInput("ports must be a non-empty list")
+    expected = (
+        (PORT_KEYS_V2 - {"up"})
+        | {"rates", "modes", "queue_bytes", "flow_control"}
+    )
+    names = []
+    caps = {}
+    queues = {}
+    flows = {}
+    fwd_ports = []
+    for port in port_docs:
+        if not isinstance(port, dict) or frozenset(port) != expected:
+            raise InvalidInput("bad port")
+        name = port["name"]
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("bad port name")
+        names.append(name)
+        rates = _validate_link_state_rates(port["rates"])
+        modes = _validate_link_state_modes(port["modes"])
+        caps[name] = (rates, modes)
+        queue_bytes = port["queue_bytes"]
+        if not _is_int(queue_bytes) or queue_bytes < 0:
+            raise InvalidInput("bad queue_bytes")
+        queues[name] = queue_bytes
+        flow_control = port["flow_control"]
+        if not isinstance(flow_control, bool):
+            raise InvalidInput("bad flow_control")
+        flows[name] = flow_control
+        fwd_ports.append(
+            {
+                "name": name,
+                "mode": port["mode"],
+                "pvid": port["pvid"],
+                "allowed": port["allowed"],
+                "untagged": port["untagged"],
+                "up": False,
+            }
+        )
+    if len(set(names)) != len(names):
+        raise InvalidInput("ports must be distinct")
+    validate_forward_config_v2({"ports": fwd_ports, "age": age})
+    return fwd_ports, caps, queues, flows, age, max_frame, delay
+
+
+def validate_link_flow_decode_events(events, fwd_ports):
+    """link-flow-decode 事件形状与 link-wire-decode 完全一致。
+
+    PAUSE 的长度/操作码/保留字节合法性不属于输入校验（非法控制帧是运行期
+    malformed_pause 结果而非整次 invalid_input），故全量校验逐点沿用
+    link-wire-decode（原始帧外壳、单层 802.1Q、MAC 准入、混合序 t 非降）。
+    """
+    return validate_link_wire_decode_events(events, fwd_ports)
+
+
+def _decode_link_flow_events(events):
+    """校验后的 link-flow 事件对：link/advance 原样；frame 附解码九元组。
+
+    返回 (kind, ...) 事件表，frame 项为
+    ("frame", t, port, raw, decoded)，decoded 为 frame-decode 九元组
+    （src, dst, vlan, length, fcs, alignment 在其中）。
+    """
+    raw_frames = [
+        (item[1], item[2], item[3]) for item in events if item[0] == "frame"
+    ]
+    decoded_frames = _decode_raw_frames(raw_frames)
+    decoded = []
+    frame_index = 0
+    for item in events:
+        if item[0] == "frame":
+            decoded.append(
+                ("frame", item[1], item[2], item[3],
+                 decoded_frames[frame_index])
+            )
+            frame_index += 1
+        else:
+            decoded.append(item)
+    return decoded
+
+
+def link_flow(
+    fwd_ports, caps, queues, flows, age, max_frame, delay, events,
+    work_limit=None, observer=None,
+):
+    """link-flow-decode 仿真：link-wire 线速模型加 802.3x PAUSE。
+
+    work_limit 非 None 时在各计费点累计工作量 W（初值 P），首次超过即抛
+    LinkFlowWorkLimit；预演与正式仿真共用本函数（独立状态、无部分输出）。
+    observer 语义同 link_wire：frame 恒 applied，link 仅状态实际改变时
+    applied，advance 仅实际完成到期项时 applied。
+    """
+    order = {port["name"]: i for i, port in enumerate(fwd_ports)}
+    by_name = {port["name"]: port for port in fwd_ports}
+    committed = {name: ("down",) for name in by_name}
+    pending = {}  # name -> (rate, mode, deadline)
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    # 每口未完成副本：deque，按入队（即串行发送）顺序，队头为正在发送副本
+    outstanding = {name: deque() for name in by_name}
+    occupied = {name: 0 for name in by_name}  # 未完成副本线上字节总和
+    # PAUSE：pause_until 为当前发送截止时刻（None 未暂停）；hold_began 为
+    # 队头副本因暂停无法开始的等待区间起点（可为晚于当前时钟的“队头完成
+    # 时刻”待生效值）；pause_ns 为累计实际暂停时长。
+    pause_until = {name: None for name in by_name}
+    hold_began = {name: None for name in by_name}
+    pause_ns = {name: 0 for name in by_name}
+    stats = {
+        name: {
+            "rx_frames": 0,
+            "rx_bytes": 0,
+            "tx_frames": 0,
+            "tx_bytes": 0,
+            "collision_frames": 0,
+            "collision_bytes": 0,
+            "queue_full_frames": 0,
+            "queue_full_bytes": 0,
+            "link_down_frames": 0,
+            "link_down_bytes": 0,
+            "pause_frames": 0,
+            "pause_unsupported_frames": 0,
+            "pause_duration_ns": 0,
+        }
+        for name in by_name
+    }
+    results = []
+    if observer is not None:  # record/replay：按处理顺序逐事件记录
+        observer["items"] = []
+    work = len(fwd_ports)  # W 初值 P
+    if work_limit is not None and work > work_limit:
+        raise LinkFlowWorkLimit()
+
+    def charge(n=1):
+        nonlocal work
+        work += n
+        if work_limit is not None and work > work_limit:
+            raise LinkFlowWorkLimit()
+
+    def is_up(name):
+        return name not in pending and committed[name][0] == "up"
+
+    def accrue_hold(name, now):
+        # 按墙钟累计暂停实际生效区间：hold_began 为该区间起点（可为晚于
+        # 当前时钟的“在发副本结束时刻”待生效值），截止到有效截止时刻。
+        # 结算到截止时刻即关闭并清除已到期暂停；覆盖/清零/离 up 在事件点
+        # 先经本函数再重置。
+        began = hold_began[name]
+        until = pause_until[name]
+        if until is not None and now >= until:
+            # 暂停自然到期：先累计到截止时刻，再清除暂停态
+            if began is not None and until > began:
+                pause_ns[name] += until - began
+            hold_began[name] = None
+            pause_until[name] = None
+            return
+        if began is None or now <= began:
+            return
+        # now > began 且暂停未到期：累计自上次检查点，并把检查点推到 now
+        pause_ns[name] += now - began
+        hold_began[name] = now if until is not None else None
+
+    def settle_negotiations(t):
+        # 完成截止 <= t 的协商，口序同配置（与 link-state/link-forward 一致）；
+        # 返回完成的协商数（协商到期本身不产生 results 记录）
+        settled = 0
+        for port in fwd_ports:
+            name = port["name"]
+            if name in pending and pending[name][2] <= t:
+                rate, mode, _ = pending.pop(name)
+                committed[name] = ("up", rate, mode)
+                settled += 1
+        return settled
+
+    def settle_transmissions(t):
+        # 结算结束时刻 <= t 的发送：全局按 (end, 口配置序) 逐项弹出队头；
+        # 同口串行且时长为正，弹出一口队头后其下一副本 end 必更晚。
+        while True:
+            best = None  # (end, port_index, name)
+            for name in by_name:
+                q = outstanding[name]
+                if q and q[0]["end"] <= t:
+                    cand = (q[0]["end"], order[name], name)
+                    if best is None or cand < best:
+                        best = cand
+            if best is None:
+                return
+            name = best[2]
+            end = best[0]
+            copy = outstanding[name].popleft()
+            occupied[name] -= copy["bytes"]
+            stats[name]["tx_frames"] += 1
+            stats[name]["tx_bytes"] += copy["bytes"]
+            results.append(
+                {"t": end, "port": name,
+                 "start": copy["start"], "bytes": copy["bytes"]}
+            )
+            charge()
+            # 暂停等待区间由 PAUSE 到达设置、随各事件 settle 累计，与队列
+            # 中是否仍有副本无关（端口在截止时刻前保持暂停态）。
+
+    def settle(t):
+        # 返回本次完成的到期协商数（发送完成不返回值，以 results 增量计）
+        negotiated = settle_negotiations(t)
+        settle_transmissions(t)
+        for name in by_name:  # 暂停等待时长随结算推进累计
+            accrue_hold(name, t)
+        return negotiated
+
+    def apply_link(t, port, admin, peer, rates, modes):
+        """同 link-forward 的协商状态迁移；返回 (state,rate,mode,applied)。"""
+        if not admin or not peer:
+            target = ("down",)
+        else:
+            local_rates, local_modes = caps[port]
+            common_rates = [r for r in local_rates if r in rates]
+            common_modes = [m for m in local_modes if m in modes]
+            if not common_rates or not common_modes:
+                target = ("bad",)
+            else:
+                target = (
+                    "up",
+                    max(common_rates),
+                    "full" if "full" in common_modes else "half",
+                )
+        before_up = port not in pending and committed[port][0] == "up"
+        current = pending.get(port)
+        effective = (
+            ("up", current[0], current[1])
+            if current is not None
+            else committed[port]
+        )
+        if target == effective:
+            applied = False  # 目标未变：不改变协商状态
+        elif target[0] == "up":
+            pending[port] = (target[1], target[2], t + delay)
+            applied = True
+        else:
+            pending.pop(port, None)
+            committed[port] = target
+            applied = True
+        current = pending.get(port)
+        if current is not None:
+            state, rate, mode = "wait", None, None
+            now_up = False
+        else:
+            now = committed[port]
+            if now[0] == "up":
+                state, rate, mode = "up", now[1], now[2]
+                now_up = True
+            else:
+                state, rate, mode = now[0], None, None
+                now_up = False
+        left_up = before_up and not now_up
+        if left_up:
+            # 先结算已在本时刻开始前完成；清该口 FDB（同 link-forward）；
+            # 链路离开 up 清除暂停（等待时长已在 settle(t) 累计到 t）
+            for key in [k for k, (p, _) in fdb.items() if p == port]:
+                del fdb[key]
+            pause_until[port] = None
+            hold_began[port] = None
+            q = outstanding[port]
+            while q:  # 未完成副本（含正在发送）按入队序以 link_down 丢弃
+                copy = q.popleft()
+                occupied[port] -= copy["bytes"]
+                stats[port]["link_down_frames"] += 1
+                stats[port]["link_down_bytes"] += copy["bytes"]
+                results.append(
+                    {
+                        "t": t,
+                        "port": port,
+                        "start": copy["start"],
+                        "bytes": copy["bytes"],
+                        "reason": "link_down",
+                    }
+                )
+                charge()
+        results.append(
+            {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
+        )
+        charge()
+        return state, rate, mode, applied
+
+    def reschedule(port, ct):
+        # 碰撞后剩余副本从碰撞时刻重新串行排程（入队均不晚于 ct）
+        prev_end = ct
+        for copy in outstanding[port]:
+            copy["start"] = prev_end
+            copy["end"] = prev_end + copy["duration"]
+            prev_end = copy["end"]
+            charge()
+
+    def repause(port, t, until):
+        """PAUSE 到达：已开始副本不动；未开始副本自锚点整体串行重排。
+
+        锚点 = max(当前时钟/在发副本结束时刻, 新截止时刻)；零值（until 为
+        None）锚点不含截止时刻，即当前帧完成后恢复。仅实际后移（新开始
+        时刻更晚）的副本计费；顺序不变。返回（在发副本结束时刻或 t）。
+        """
+        q = outstanding[port]
+        in_flight = q[0] if q and q[0]["start"] <= t else None
+        base = in_flight["end"] if in_flight is not None else t
+        anchor = base if until is None else max(base, until)
+        waiting = list(q)[1:] if in_flight is not None else list(q)
+        for copy in waiting:
+            new_start = anchor
+            if new_start > copy["start"]:
+                charge()  # 每次后移的队列副本计 1
+            copy["start"] = new_start
+            copy["end"] = new_start + copy["duration"]
+            anchor = copy["end"]
+        return base
+
+    # 同一时刻按配置端口顺序稳定排列：(t, 端口序, 原序) 排序；advance 无端口，
+    # 置于该时刻最后（仅结算、不产生记录，位置不影响输出与最终状态）。events
+    # 为 _decode_link_flow_events 的产物（frame 项附解码九元组）。
+    indexed = _link_wire_indexed(fwd_ports, events)
+
+    def note_frame(begin):
+        # frame 只要被处理即 applied（坏帧、VLAN 准入拒绝、碰撞、队列满、
+        # PAUSE 本地终止亦然）；output 为结算结果后接本帧全部结果的连续片段
+        if observer is not None:
+            observer["items"].append(
+                {
+                    "kind": "frame",
+                    "t": t,
+                    "applied": True,
+                    "output": list(results[begin:]),
+                }
+            )
+
+    for _, item in indexed:
+        t = item[1]
+        # 该事件开始时先结算到期协商、发送完成与暂停等待；仅该时刻第一个
+        # 实际处理的事件能取得此前到期结果。
+        begin = len(results)
+        negotiated = settle(t)
+        charge()  # 每个输入事件计 1
+        kind = item[0]
+        if kind == "advance":
+            # advance 仅实际完成至少一个到期协商或发送时 applied；除结算
+            # 外不产生自身结果
+            applied = negotiated > 0 or len(results) > begin
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "advance",
+                        "t": t,
+                        "applied": applied,
+                        "output": list(results[begin:]),
+                    }
+                )
+            continue
+        if kind == "link":
+            _, t, port, admin, peer, rates, modes = item
+            _, _, _, applied = apply_link(t, port, admin, peer, rates, modes)
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "link",
+                        "t": t,
+                        "applied": applied,
+                        "output": list(results[begin:]),
+                    }
+                )
+            continue
+        (
+            _,
+            t,
+            port_name,
+            raw,
+            (_, _, src, dst, tag, length, fcs, alignment),
+        ) = item
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        # 入站帧在线上的物理字节：length 为帧实际长度（入站带标签时已含 4
+        # 字节标签），另加固定前导码/定界符与帧间隔
+        inbound_wire = length + LINK_WIRE_OVERHEAD
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif not alignment:
+            cls = "alignment"
+        elif not fcs:
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        # MAC 控制 PAUSE 身份：未带标签 + 慢协议组播目的 + 0x8808。good
+        # 的 PAUSE 帧在入端口本地终止（含 half 口不支持情形），先于半双工
+        # 碰撞判定，保证 pause_unsupported 不改队列。
+        is_pause_shape = (
+            cls == "good"
+            and tag is None
+            and dst == LINK_FLOW_PAUSE_DST
+            and len(raw) >= 14
+            and (raw[12] << 8 | raw[13]) == LINK_FLOW_PAUSE_ETHERTYPE
+        )
+        head = outstanding[port_name][0] if outstanding[port_name] else None
+        colliding = (
+            not is_pause_shape
+            and head is not None
+            and is_up(port_name)
+            and committed[port_name][2] == "half"
+            and head["start"] <= t < head["end"]
+        )
+        if colliding:
+            # half 口自身发送区间收帧：入站帧与正在发送副本均终止、不学习，
+            # 后续副本自碰撞时刻重新排程
+            copy = outstanding[port_name].popleft()
+            occupied[port_name] -= copy["bytes"]
+            key = (copy["fvlan"], copy["fsrc"])
+            # 回滚该副本入站帧所做学习：仅当表项仍是其当时写入的同一表项
+            if fdb.get(key) == [copy["fing"], copy["fseen"]]:
+                del fdb[key]
+            stats[port_name]["collision_frames"] += 2
+            stats[port_name]["collision_bytes"] += inbound_wire + copy["bytes"]
+            results.append(
+                {
+                    "t": t,
+                    "port": port_name,
+                    "start": copy["start"],
+                    "bytes": copy["bytes"],
+                    "inbound": inbound_wire,
+                    "reason": "collision",
+                }
+            )
+            charge()
+            reschedule(port_name, t)
+            note_frame(begin)
+            continue
+        stats[port_name]["rx_frames"] += 1
+        stats[port_name]["rx_bytes"] += inbound_wire
+        if cls != "good":
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if is_pause_shape:
+            # PAUSE 帧本地终止：不学习源 MAC、不参与 VLAN 转发。合法性先于
+            # 端口状态判定（控制帧自身非法即 malformed_pause，不计入接收数）。
+            opcode = (raw[14] << 8) | raw[15] if len(raw) >= 16 else None
+            reserved_ok = (
+                length == FRAME_CHECK_RUNT_LENGTH
+                and len(raw) >= 60
+                and not any(raw[18:length - 4])
+            )
+            if (
+                length != FRAME_CHECK_RUNT_LENGTH
+                or opcode != LINK_FLOW_PAUSE_OPCODE
+                or not reserved_ok
+            ):
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "malformed_pause"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            # 形态合法的 PAUSE：接收数 +1（不支持口为其子集）
+            stats[port_name]["pause_frames"] += 1
+            quanta = (raw[16] << 8) | raw[17]
+            if not (
+                is_up(port_name)
+                and committed[port_name][2] == "full"
+                and flows[port_name]
+            ):
+                # down/wait/bad/half 或未启用流控：消费但不改队列
+                stats[port_name]["pause_unsupported_frames"] += 1
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "pause_unsupported"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            if quanta == 0:
+                # 零值：当前帧完成后恢复；旧等待区间已在 settle(t) 累计，
+                # 未开始副本提前到在发副本完成之后（保序）。
+                pause_until[port_name] = None
+                hold_began[port_name] = None
+                repause(port_name, t, None)
+                results.append(
+                    {"t": t, "port": port_name, "action": "pause",
+                     "quanta": 0, "until": None}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            rate = committed[port_name][1]
+            until = t + (
+                quanta * LINK_FLOW_PAUSE_QUANTA_TICKS + rate - 1
+            ) // rate
+            # 覆盖旧截止时刻；旧等待区间已在 settle(t) 累计到 t
+            pause_until[port_name] = until
+            base = repause(port_name, t, until)
+            # 仅当暂停超过端口自然可发时刻时存在实际等待区间
+            if until > base:
+                hold_began[port_name] = base
+            else:
+                hold_began[port_name] = None
+            results.append(
+                {"t": t, "port": port_name, "action": "pause",
+                 "quanta": quanta, "until": until}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+            tagged_ingress = False
+        else:
+            vlan = tag
+            tagged_ingress = True
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        egress = []
+        action = "drop"
+        if is_up(port_name):  # 仅 up 口学习并作出口（同 link-forward）
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target_name = hit[0]
+                if (
+                    is_up(target_name)
+                    and vlan in by_name[target_name]["allowed"]
+                ):
+                    egress = [target_name]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in fwd_ports
+                    if vlan in port["allowed"]
+                    and is_up(port["name"])
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        copies = []
+        for name in egress:
+            out_vlan = None if vlan in by_name[name]["untagged"] else vlan
+            out_ports.append({"name": name, "vlan": out_vlan})
+            frame_len = length + (
+                4 if not tagged_ingress and out_vlan is not None else
+                -4 if tagged_ingress and out_vlan is None else 0
+            )
+            wire_bytes = frame_len + LINK_WIRE_OVERHEAD
+            copies.append((name, out_vlan, wire_bytes))
+        results.append(
+            {"t": t, "class": cls, "action": action, "ports": out_ports}
+        )
+        charge()
+        for name, out_vlan, wire_bytes in copies:
+            egr_rate = committed[name][1]  # 出口 up，其协商速率在排程内不变
+            duration = (wire_bytes * 8000 + egr_rate - 1) // egr_rate
+            q = outstanding[name]
+            if occupied[name] + wire_bytes > queues[name]:
+                stats[name]["queue_full_frames"] += 1
+                stats[name]["queue_full_bytes"] += wire_bytes
+                results.append(
+                    {
+                        "t": t,
+                        "port": name,
+                        "vlan": out_vlan,
+                        "bytes": wire_bytes,
+                        "reason": "queue_full",
+                    }
+                )
+                charge()
+                continue  # 丢弃该副本，不影响同一原帧的其他出口
+            # 新副本接在调整后队尾；暂停有效时不得早于截止时刻开始
+            start = t if not q else max(t, q[-1]["end"])
+            until = pause_until[name]
+            if until is not None and t < until:
+                start = max(start, until)
+            copy = {
+                "egress": name,
+                "vlan": out_vlan,
+                "bytes": wire_bytes,
+                "duration": duration,
+                "start": start,
+                "end": start + duration,
+                "fvlan": vlan,
+                "fsrc": src,
+                "fing": port_name,
+                "fseen": t,
+            }
+            q.append(copy)
+            occupied[name] += wire_bytes
+            results.append(
+                {"t": t, "port": name, "vlan": out_vlan, "bytes": wire_bytes}
+            )
+            charge()
+        note_frame(begin)
+    # 末事件后不自动排空：未完成副本保留在状态中，仅输出已有记录
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": name,
+                "rx_frames": stats[name]["rx_frames"],
+                "rx_bytes": stats[name]["rx_bytes"],
+                "tx_frames": stats[name]["tx_frames"],
+                "tx_bytes": stats[name]["tx_bytes"],
+                "collision_frames": stats[name]["collision_frames"],
+                "collision_bytes": stats[name]["collision_bytes"],
+                "queue_full_frames": stats[name]["queue_full_frames"],
+                "queue_full_bytes": stats[name]["queue_full_bytes"],
+                "link_down_frames": stats[name]["link_down_frames"],
+                "link_down_bytes": stats[name]["link_down_bytes"],
+                "pause_frames": stats[name]["pause_frames"],
+                "pause_unsupported_frames":
+                    stats[name]["pause_unsupported_frames"],
+                "pause_duration_ns": pause_ns[name],
+            }
+            for name in by_name
+        ],
+    }
+
+
+def link_flow_work(fwd_ports, caps, queues, flows, age, max_frame, delay,
+                   events, limit):
+    """link-flow-decode 工作量预演：以独立状态跑同一仿真，无副作用、不产出。
+
+    W 初值为端口数 P；每输入事件、每条 results 记录、碰撞后每个重排程副本
+    及 PAUSE 后每个实际后移的队列副本各计 1。等于上限合法，首次超过即抛
+    LinkFlowWorkLimit。
+    """
+    link_flow(
+        fwd_ports, caps, queues, flows, age, max_frame, delay, events,
+        work_limit=limit,
+    )
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -14703,6 +15395,7 @@ DEFAULT_MAX_STATS_WORK = 10000000
 DEFAULT_MAX_LINK_WORK = 10000000
 DEFAULT_MAX_LINK_FORWARD_WORK = 10000000
 DEFAULT_MAX_LINK_WIRE_WORK = 10000000
+DEFAULT_MAX_LINK_FLOW_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -14800,7 +15493,9 @@ def _log_mode(config, events=None):
     forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check/
     qos-decode（共享十二键配置，按事件帧形状区分）、security-check、
     mirror-check、lag-check、storm-check、port-security，或 link-wire/
-    link-wire-decode（共享含 queue_bytes 配置，按事件帧形状区分）。
+    link-wire-decode（共享含 queue_bytes 配置，按事件帧形状区分），或
+    link-flow-decode（含 queue_bytes 与 flow_control 的端口配置，事件为
+    原始帧形状）。
 
     events 非 None 时用于区分共享配置形状的两种模式：三键配置的非空帧
     数组含 src（八键）按 forward-check，含 data（t/port/data 原始帧）按
@@ -14840,11 +15535,36 @@ def _log_mode(config, events=None):
             return "loop"
         if keys == LINK_FORWARD_CONFIG_KEYS:
             # link-wire 与 link-forward 顶层同键，但端口形状不重叠：
-            # link-wire 每口恰多 queue_bytes（八键）。端口文档均含
-            # queue_bytes 即按 link-wire 系路由（事件可含 advance），其余
-            # 沿用 link-forward；形状不全者由对应全量校验判非法。
+            # link-wire 每口恰多 queue_bytes（八键），link-flow-decode 再
+            # 多 flow_control（九键）。端口文档均含 flow_control 即按
+            # link-flow-decode 路由（必同时含 queue_bytes，形状不全由全量
+            # 校验判非法）；均含 queue_bytes 按 link-wire 系路由（事件可含
+            # advance），其余沿用 link-forward。
             ports_doc = config.get("ports")
             if (
+                isinstance(ports_doc, list)
+                and ports_doc
+                and all(
+                    isinstance(p, dict) and "flow_control" in p
+                    for p in ports_doc
+                )
+            ):
+                # link-flow-decode 仅接受 {t,port,data} 原始帧（PAUSE 为
+                # 其中一种），link/advance 同 link-wire；抽象帧与两种帧形
+                # 状混用即非法输入；仅 link/advance 项或空事件亦按本模式
+                # 路由。
+                for event in events if isinstance(events, list) else ():
+                    if not isinstance(event, dict):
+                        raise InvalidInput("bad log event")
+                    ekeys = frozenset(event)
+                    if ekeys not in (
+                        FRAME_DECODE_FRAME_KEYS,
+                        LINK_WIRE_LINK_EVENT_KEYS,
+                        LINK_WIRE_ADVANCE_EVENT_KEYS,
+                    ):
+                        raise InvalidInput("bad log event")
+                return "link_flow_decode"
+            elif (
                 isinstance(ports_doc, list)
                 and ports_doc
                 and all(
@@ -15174,6 +15894,42 @@ def _run_link_wire_decode(config, events, observe, max_work=None):
         # 排列仅取决于各事件 kind/t/port，解码前后一一对应且三者不变，故
         # 以解码事件求处理序、回取原始（未解码）输入事件供日志构建/核对。
         indexed = _link_wire_indexed(fwd_ports, decoded_events)
+        observer["events"] = [events[ix] for ix, _ in indexed]
+    return result, observer
+
+
+def _run_link_flow_decode(config, events, observe, max_work=None):
+    """record/replay link-flow-decode 模式：校验含 queue_bytes、flow_control
+    的配置与 link/advance 及 {t,port,data} 原始帧混合事件并执行线速仿真。
+
+    输入、全量校验、同一时刻排序、工作量计费与仿真语义完全沿用
+    link-flow-decode 入口；max_work 非 None 时（record/replay）全量语义
+    校验后先按 link-flow 公式无副作用预演，首次超过即抛 LinkFlowWorkLimit，
+    不正式仿真。日志记录的 applied/output 口径与 link-wire 相同（frame 恒
+    applied，link 仅状态实际改变时 applied，advance 仅实际完成到期项时
+    applied；output 为连续结果数组）。返回 (结果 dict, observer 或 None)。
+    """
+    (
+        fwd_ports, caps, queues, flows, age, max_frame, delay,
+    ) = validate_link_flow_config(config)
+    raw_events = validate_link_flow_decode_events(events, fwd_ports)
+    flow_events = _decode_link_flow_events(raw_events)
+    if max_work is not None:
+        # 与 link-flow-decode 入口同一公式：解码为纯函数，独立状态跑同一
+        # 仿真，无副作用
+        link_flow_work(
+            fwd_ports, caps, queues, flows, age, max_frame, delay,
+            flow_events, max_work,
+        )
+    observer = {} if observe else None
+    result = link_flow(
+        fwd_ports, caps, queues, flows, age, max_frame, delay, flow_events,
+        observer=observer,
+    )
+    if observer is not None:
+        # 排列仅取决于各事件 kind/t/port，解码前后一一对应且三者不变，故
+        # 以解码事件求处理序、回取原始（未解码）输入事件供日志构建/核对。
+        indexed = _link_wire_indexed(fwd_ports, flow_events)
         observer["events"] = [events[ix] for ix, _ in indexed]
     return result, observer
 
@@ -16124,7 +16880,8 @@ def _build_log_doc(config, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "link_wire", "link_wire_decode", "forward_stp",
+            "link_forward", "link_wire", "link_wire_decode",
+            "link_flow_decode", "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
@@ -16261,7 +17018,8 @@ def _verify_records(log, events, items):
             if observed["applied"]:
                 version += 1
         elif mode in (
-            "link_forward", "link_wire", "link_wire_decode", "forward_stp",
+            "link_forward", "link_wire", "link_wire_decode",
+            "link_flow_decode", "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
@@ -16380,6 +17138,10 @@ def _cmd_record(
             result, observer = _run_link_wire_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "link_flow_decode":
+            result, observer = _run_link_flow_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "forward":
             result, observer = _run_forward(
                 config, events, True, max_record_work
@@ -16491,6 +17253,7 @@ def _cmd_record(
         LinkForwardWorkLimit,
         LinkWorkLimit,
         LinkWireWorkLimit,
+        LinkFlowWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
         AclWorkLimit,
@@ -16567,6 +17330,10 @@ def _cmd_replay(
             )
         elif mode == "link_wire_decode":
             result, observer = _run_link_wire_decode(
+                config, events, True, max_replay_work
+            )
+        elif mode == "link_flow_decode":
+            result, observer = _run_link_flow_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "forward":
@@ -16680,6 +17447,7 @@ def _cmd_replay(
         LinkForwardWorkLimit,
         LinkWorkLimit,
         LinkWireWorkLimit,
+        LinkFlowWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
         AclWorkLimit,
@@ -19640,6 +20408,69 @@ def _cmd_link_wire_decode(
     return 0
 
 
+def _cmd_link_flow_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_link_flow_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # CONFIG 同 link-wire-decode 但每口多 flow_control；EVENTS 先全量
+        # 校验（形状同 link-wire-decode，PAUSE 合法性是运行期结果而非输入
+        # 错误），再解码并按 link-flow 公式工作量预演，最后正式仿真
+        # （状态独立、无部分输出）
+        (
+            fwd_ports, caps, queues, flows, age, max_frame, delay,
+        ) = validate_link_flow_config(config)
+        raw_events = validate_link_flow_decode_events(events_doc, fwd_ports)
+        events = _decode_link_flow_events(raw_events)
+        link_flow_work(
+            fwd_ports, caps, queues, flows, age, max_frame, delay, events,
+            max_link_flow_work,
+        )
+        result = link_flow(
+            fwd_ports, caps, queues, flows, age, max_frame, delay, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except LinkFlowWorkLimit:
+        _fail("link_flow_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
@@ -19672,6 +20503,7 @@ SUBCOMMANDS = frozenset((
     "link-forward",
     "link-wire",
     "link-wire-decode",
+    "link-flow-decode",
     "fdb",
     "forward",
     "forward-static",
@@ -20332,6 +21164,29 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_link_wire_decode(args[1], args[2], *limits)
+    if args[:1] == ["link-flow-decode"]:
+        # link-flow-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FLOW_WORK]]]：
+        #   参数、资源与错误契约完全沿用 link-wire-decode，可选上限仅
+        #   0、2、4、5 项；工作量超限错误名为 link_flow_work_limit
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_LINK_FLOW_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_link_flow_decode(args[1], args[2], *limits)
     if args[:1] == ["qos-decode"]:
         # qos-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_QOS_WORK]]]：
