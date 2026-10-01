@@ -271,7 +271,7 @@ class ReloadInvalidTest(unittest.TestCase):
     def test_immutable_nested_changed(self):
         config = base_config()
         new = copy.deepcopy(config)
-        new["storm"]["hold"] = 11
+        new["lags"][0]["name"] = "L2"  # lags 属不可变项，嵌套改动亦拒绝
         run_invalid(config, [{"t": 0, "config": new}])
 
     def test_dynamic_count_exceeds_new_limit(self):
@@ -404,16 +404,17 @@ class ReloadWorkLimitTest(unittest.TestCase):
                 self.assertEqual(err, b'{"error":"usage"}\n')
 
     def test_equal_legal_first_exceed_exit5(self):
-        # 工作量：初始 B+L+2U=1；帧 19/22；重载 X+D+P+A+T+1=4+2+5+1+0+1=13；
-        # 末帧 X+3P+M+R+D+S+1=4+15+2+1+2+0+1=25；累计 80
+        # 工作量：初始 B+L+2U=1；帧 19/22；重载 X+D+P+A+T+H+1
+        # =4+2+5+1+0+2+1=15（H=2：两条已放行广播各留一条风暴记录）；
+        # 末帧 X+3P+M+R+D+S+1=4+15+2+1+2+0+1=25；累计 82
         config, events = self.events()
         code, out, err = run_cli(
-            config, events, extra=self.LIMITS_OK + ["80"]
+            config, events, extra=self.LIMITS_OK + ["82"]
         )
         self.assertEqual(code, 0)
         self.assertEqual(err, b"")
         code, out, err = run_cli(
-            config, events, extra=self.LIMITS_OK + ["79"]
+            config, events, extra=self.LIMITS_OK + ["81"]
         )
         self.assertEqual(code, 5)
         self.assertEqual(out, b"")

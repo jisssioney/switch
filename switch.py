@@ -2,6 +2,7 @@
 """二层以太网交换机仿真（仅标准库）。"""
 
 from collections import deque
+import bisect
 import hashlib
 import heapq
 import json
@@ -83,7 +84,9 @@ SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
 RELOAD_EVENT_KEYS = frozenset(("t", "config"))
 ROLLBACK_EVENT_KEYS = frozenset(("t", "rollback"))
-RELOAD_MUTABLE_KEYS = ("age", "acl", "qos", "security")
+RELOAD_MUTABLE_KEYS = (
+    "age", "storm", "mirror", "acl", "qos", "security"
+)
 
 
 class InvalidInput(Exception):
@@ -2272,6 +2275,59 @@ def _qos_queues_fit(counts, qos):
     return all(counts[i] <= quotas[i] for i in range(4))
 
 
+class _TsQueue:
+    """单调时间戳队列：逻辑视图为 items[head:]，支持按窗口 O(log n) 计数。
+
+    热加载缩短当前 storm window 时，已落在新窗口外但未过历代最大窗口的
+    记录仍须保留（回滚到长窗口后恢复影响），故不能像旧实现那样仅按当前
+    窗口左修剪后用 len() 判定。用带 head 的有序表：popleft 懒推进 head，
+    积累到一半即压缩，总内存 O(事件数)，判定 O(log n)。
+    """
+
+    __slots__ = ("items", "head")
+
+    def __init__(self):
+        self.items = []
+        self.head = 0
+
+    def __len__(self):
+        return len(self.items) - self.head
+
+    def __bool__(self):
+        return self.head < len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[self.head + index]
+
+    def append(self, ts):
+        self.items.append(ts)
+
+    def popleft(self):
+        ts = self.items[self.head]
+        self.head += 1
+        if self.head >= 64 and self.head * 2 >= len(self.items):
+            del self.items[:self.head]
+            self.head = 0
+        return ts
+
+    def window_count(self, t, window):
+        """当前 window 内（t - ts < window）记录数。"""
+        return len(self.items) - bisect.bisect_right(
+            self.items, t - window, self.head
+        )
+
+
+def _storm_prune(queue, t, retain_window):
+    """弹出超出保留窗口的风暴/MAC 迁移时间记录（左闭边界同判定规则）。"""
+    while queue and t - queue[0] >= retain_window:
+        queue.popleft()
+
+
+def _storm_window_count(queue, t, window):
+    """当前 window 内（t - ts < window）的记录数；队列按时间升序。"""
+    return queue.window_count(t, window)
+
+
 def validate_security_config(config):
     if not isinstance(config, dict) or frozenset(config) != SECURITY_CONFIG_KEYS:
         raise InvalidInput("bad config")
@@ -2768,7 +2824,8 @@ def validate_reload_events(events, ports, link_ids, lags, config,
     """reload 子命令事件：普通事件沿用 qos，另含 {t, config} 重载事件。
 
     返回 (事件序列, 末态原始配置)；重载事件的 config 须为完整有效配置，
-    且仅 age/acl/qos/security 可与当时配置不同。全部校验先于执行。
+    且仅 age/storm/mirror/acl/qos/security 可与当时配置不同。全部校验
+    先于执行。
     allow_rollback 时另含 {t, rollback} 事件（rollback 只能为 true）：
     reload 前压入当前配置，rollback 弹栈恢复，空栈为 invalid_input。
     """
@@ -2866,9 +2923,9 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _bridge,
                 _ports,
                 new_age,
-                _storm,
+                new_storm,
                 _lags,
-                _mirror,
+                new_mirror,
                 new_acl,
                 new_qos,
                 new_security,
@@ -2879,7 +2936,8 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     and new_config[key] != current[key]
                 ):
                     raise InvalidInput(
-                        "reload may only change age/acl/qos/security"
+                        "reload may only change "
+                        "age/storm/mirror/acl/qos/security"
                     )
             changes = []
             for key in RELOAD_MUTABLE_KEYS:
@@ -2899,6 +2957,8 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     "reload",
                     t,
                     new_age,
+                    new_storm,
+                    new_mirror,
                     new_acl,
                     new_qos,
                     new_security,
@@ -2923,9 +2983,9 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _bridge,
                 _ports,
                 new_age,
-                _storm,
+                new_storm,
                 _lags,
-                _mirror,
+                new_mirror,
                 new_acl,
                 new_qos,
                 new_security,
@@ -2946,6 +3006,8 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     "rollback",
                     t,
                     new_age,
+                    new_storm,
+                    new_mirror,
                     new_acl,
                     new_qos,
                     new_security,
@@ -9749,14 +9811,23 @@ def reload_work(
     X+3P+M+R+D+S+1；链路先应用 up，改变以新 U 计 X+N+B+L+2U+2P+1，
     幂等计 X+1；成员 down 计 X+S+1、up 计 X+1；服务计 X+S+1；重载令
     A/T 为新 ACL 规则数/新静态绑定数，计 X+D+P+A+T+1，qos 变化分支
-    另计 N+5，再采用新 age/ACL/qos/security（队列超新 qos 边界整批
-    无效）。再按既有队列、调度、清队与安全规则处理并更新预演状态。
+    另计 N+5；重载与回滚再各加 H（当时保留的风暴/MAC 迁移时间记录与
+    封锁项总数，与 X 同点取、老化解封前的原始计数），再采用新
+    age/storm/ACL/qos/security（队列超新 qos 边界整批无效）。风暴
+    时间记录按历代最大 window 保留，缩短当前窗口暂无关记录不清除，
+    判定只计当前 window 内记录。再按既有队列、调度、清队与安全规则
+    处理并更新预演状态。
     累计等于上限合法，首次超过即抛 ReloadWorkLimit。
     """
     window = storm["window"]
     limits = storm["limits"]
     move_limit = storm["move_limit"]
     hold = storm["hold"]
+    # 历代配置（含回滚可达配置）最大 window：保留窗口只增不减
+    retain_window = window
+    # MAC 迁移记录容量上界：历代最大 move_limit（配置未变时即初始值，
+    # 与旧 deque(maxlen=move_limit) 逐态相同）
+    move_cap = move_limit
     qos_map = qos["map"]
     cap = qos["cap"]
     sched_mode = qos["mode"]
@@ -9914,22 +9985,24 @@ def reload_work(
         if category is not None:
             queue = rate_queues.get((port_name, vlan, category))
             if queue is None:
-                queue = deque(maxlen=limits[category])
+                queue = _TsQueue()  # 裁剪由保留窗口负责（热加载可能缩限）
                 rate_queues[(port_name, vlan, category)] = queue
-            while queue and t - queue[0] >= window:
-                queue.popleft()
-            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
-                return True
+            _storm_prune(queue, t, retain_window)
+            if _storm_window_count(queue, t, window) >= limits[category]:
+                return True  # 当前窗口余量已达上限：丢弃
         prev = last_learn.get((vlan, src))
         if prev is not None and prev != learn_port:  # 学习端口迁移
             queue = move_queues.get((vlan, src))
             if queue is None:
-                queue = deque(maxlen=move_limit)
+                queue = _TsQueue()
                 move_queues[(vlan, src)] = queue
-            while queue and t - queue[0] >= window:
+            _storm_prune(queue, t, retain_window)
+            # 历代最大 move_limit 容量上界（等价旧 deque(maxlen)；增大
+            # move_limit 后无需重建容器即可多保留）
+            while len(queue) >= move_cap:
                 queue.popleft()
             queue.append(t)
-            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+            if _storm_window_count(queue, t, window) >= move_limit:
                 blocked[(port_name, vlan)] = t + hold
                 return True
         if category is not None:  # 速率名额仅在帧实际放行时占用
@@ -10027,8 +10100,10 @@ def reload_work(
             # record/replay 按 invalid_input 退出 4，且绝不触碰 LOG；
             # rollback 按 reload 分支计费，A/T 取恢复配置的 ACL 规则数/
             # 静态绑定数
-            new_qos = item[4]
-            new_security = item[5]
+            new_storm = item[3]
+            new_acl = item[5]
+            new_qos = item[6]
+            new_security = item[7]
             reload_by_port = {entry["port"]: entry for entry in new_security}
             reload_static_owner = {}
             for entry in new_security:
@@ -10046,14 +10121,21 @@ def reload_work(
                 if not _qos_queues_fit(counts, new_qos):
                     raise InvalidInput("queued frames exceed new qos bounds")
             # A/T 为新 ACL 规则数/新静态绑定数；qos 变化分支另计 N+5，
-            # N 为变更前全部出口排队帧总数
+            # N 为变更前全部出口排队帧总数；H 为当时保留的风暴/MAC 迁移
+            # 时间记录（缩短窗口暂无关者亦计）与封锁项总数
+            H = (
+                len(blocked)
+                + sum(len(queue) for queue in rate_queues.values())
+                + sum(len(queue) for queue in move_queues.values())
+            )
             charge = (
                 X
                 + D
                 + P
-                + len(item[3])
+                + len(new_acl)
                 + sum(len(entry["static"]) for entry in new_security)
                 + 1
+                + H
             )
             if new_qos != qos:
                 charge += sum(
@@ -10117,7 +10199,8 @@ def reload_work(
                     wrr_state[port_name] = [q, rem]
             continue
         if kind in ("reload", "rollback"):
-            _, _, new_age, new_acl, new_qos, new_security, _ = item
+            _, _, new_age, new_storm, _new_mirror, new_acl, new_qos, \
+                new_security, _ = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
             for entry in new_security:
@@ -10125,9 +10208,11 @@ def reload_work(
                     new_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
-            # 原子替换 age/acl/qos/security；FDB、绑定、安全状态、队列内容、
-            # 调度、风暴记录全部保留，新规则自下一事件生效；qos 变化时
-            # WRR 重置为 q=3,rem=weights[3]
+            # 原子替换 age/storm/acl/qos/security；FDB、绑定、安全状态、
+            # 队列内容、调度、风暴记录全部保留，新规则自下一事件生效；
+            # 已有封锁沿用原解除时刻，新封锁使用当时 hold；缩短窗口暂
+            # 无关的时间记录按历代最大 window 保留；qos 变化时 WRR 重置
+            # 为 q=3,rem=weights[3]
             if new_qos != qos:
                 qos = new_qos
                 qos_map = new_qos["map"]
@@ -10139,6 +10224,14 @@ def reload_work(
                 for name in wrr_state:
                     wrr_state[name] = [3, weights[3]]
             age = new_age
+            window = new_storm["window"]
+            limits = new_storm["limits"]
+            move_limit = new_storm["move_limit"]
+            hold = new_storm["hold"]
+            if window > retain_window:
+                retain_window = window
+            if move_limit > move_cap:
+                move_cap = move_limit
             acl = new_acl
             R = len(new_acl)
             sec_by_port = new_by_port
@@ -10241,6 +10334,14 @@ def forward_security(
     limits = storm["limits"]
     move_limit = storm["move_limit"]
     hold = storm["hold"]
+    # 热加载保留窗口：历代配置（含回滚可达配置）中的最大 window。风暴与
+    # MAC 迁移时间记录只按该上界过期，缩短当前 window 时暂无关记录保留，
+    # 回滚到较长窗口后仍可恢复影响；判定只计当前 window 内记录
+    retain_window = window
+    # MAC 迁移记录容量上界：历代最大 move_limit。配置未变时即初始
+    # move_limit，与旧 deque(maxlen=move_limit) 逐字节同态；热加载缩小
+    # move_limit 后超出新阈值的现存记录仍保留至过期
+    move_cap = move_limit
     sources = mirror["sources"]
     mirror_target = mirror["target"]
     direction = mirror["direction"]
@@ -10409,22 +10510,26 @@ def forward_security(
         if category is not None:
             queue = rate_queues.get((port_name, vlan, category))
             if queue is None:
-                queue = deque(maxlen=limits[category])
+                queue = _TsQueue()  # 裁剪由保留窗口负责（热加载可能缩限）
                 rate_queues[(port_name, vlan, category)] = queue
-            while queue and t - queue[0] >= window:
-                queue.popleft()
-            if len(queue) >= limits[category]:  # 余量已达上限：丢弃
-                return True
+            _storm_prune(queue, t, retain_window)
+            # 判定只使用当前 window 内记录
+            if _storm_window_count(queue, t, window) >= limits[category]:
+                return True  # 当前窗口余量已达上限：丢弃
         prev = last_learn.get((vlan, src))
         if prev is not None and prev != learn_port:  # 学习端口迁移
             queue = move_queues.get((vlan, src))
             if queue is None:
-                queue = deque(maxlen=move_limit)
+                queue = _TsQueue()
                 move_queues[(vlan, src)] = queue
-            while queue and t - queue[0] >= window:
+            _storm_prune(queue, t, retain_window)
+            # 历代最大 move_limit 容量上界（等价旧 deque(maxlen)；增大
+            # move_limit 后无需重建容器即可多保留）
+            while len(queue) >= move_cap:
                 queue.popleft()
             queue.append(t)
-            if len(queue) >= move_limit:  # 迁移数达上限：封锁入端口/VLAN 并丢弃
+            # 迁移数判定只计当前 window；达上限按当时 hold 新封锁
+            if _storm_window_count(queue, t, window) >= move_limit:
                 blocked[(port_name, vlan)] = t + hold
                 return True
         if category is not None:  # 速率名额仅在帧实际放行时占用
@@ -10433,25 +10538,33 @@ def forward_security(
         last_learn[(vlan, src)] = learn_port
         return False
 
-    def target_available(t):
-        """镜像输出口须物理 up；其本桥链路（若有）也须 up。STP 不阻止镜像。"""
-        if mirror_target in sec_down:
+    def target_available(t, target=None):
+        """镜像输出口须物理 up；其本桥链路（若有）也须 up。STP 不阻止镜像。
+
+        target 为 None 时取当前镜像口；已入队帧传入入队时冻结的目标口。
+        """
+        name = mirror_target if target is None else target
+        if name in sec_down:
             return False
-        port = by_name[mirror_target]
+        port = by_name[name]
         if not port["up"]:
             return False
-        link = port_link.get(mirror_target)
+        link = port_link.get(name)
         if link is not None and not link["up"]:
             return False
         return True
 
-    def mirror_entry(direction_name, tag, source, t):
-        """构造镜像副本；tag 为源侧线路上实际携带的标签（可为 None）。"""
-        if not target_available(t):  # 不可用则无副本
+    def mirror_entry(direction_name, tag, source, t, target=None):
+        """构造镜像副本；tag 为源侧线路上实际携带的标签（可为 None）。
+
+        target 为 None 时取当前镜像口；已入队帧传入入队时冻结的目标口。
+        """
+        name = mirror_target if target is None else target
+        if not target_available(t, name):  # 不可用则无副本
             return None
-        port_stats[mirror_target]["tx"] += 1  # 副本只计 target 的 tx
+        port_stats[name]["tx"] += 1  # 副本只计 target 的 tx
         return {
-            "name": mirror_target,
+            "name": name,
             "vlan": tag,
             "direction": direction_name,
             "source": source,
@@ -10571,13 +10684,12 @@ def forward_security(
                     port_stats[port_name]["tx"] += 1  # tx 仅服务时计
                     vlan_stats[frame["vlan"]]["tx"] += 1
                     frames.append(frame["id"])
-                    # 仅实际产生出站副本才追加（无 null 占位），与发送帧同序
-                    if (
-                        direction in ("egress", "both")
-                        and port_name in source_set
-                    ):
+                    # 出口镜像在入队时冻结（源判定、方向与目标口），重载不
+                    # 追溯已入队帧；仅实际产生出站副本才追加（无 null 占位）
+                    if frame["egress_mirror"] is not None:
                         copy = mirror_entry(
-                            "egress", frame["mirror"], port_name, t
+                            "egress", frame["mirror"], port_name, t,
+                            target=frame["egress_mirror"],
                         )
                         if copy is not None:
                             mirrors.append(copy)
@@ -10618,7 +10730,10 @@ def forward_security(
                 )
             continue
         if item[0] in ("reload", "rollback"):
-            _, t, new_age, new_acl, new_qos, new_security, changes = item
+            (
+                _, t, new_age, new_storm, new_mirror, new_acl, new_qos,
+                new_security, changes,
+            ) = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
             for entry in new_security:
@@ -10639,12 +10754,31 @@ def forward_security(
                 counts = [len(q) for q in egress_queues[name]]
                 if not _qos_queues_fit(counts, new_qos):
                     raise InvalidInput("queued frames exceed new qos bounds")
-            # 原子替换 age/acl/qos/security；FDB、绑定、安全状态、队列内容、
-            # 风暴记录与计数全部保留，新规则自下一事件生效；已排队帧保留
-            # 帧号、VLAN、队列号，不重分类、不丢弃。qos 变化时各端口 WRR
-            # 重置为 q=3,rem=weights[3]，否则保留游标
+            # 原子替换 age/storm/mirror/acl/qos/security；FDB、绑定、安全
+            # 状态、队列内容、调度、风暴时间记录与计数全部保留，新规则自
+            # 下一事件生效；已排队帧保留帧号、VLAN、队列号，不重分类、
+            # 不丢弃。storm：window/limits/move_limit/hold 自下一帧参与
+            # 判定，已有封锁沿用原解除时刻（不解除、不重计时），新封锁
+            # 使用当时 hold；缩短窗口暂时无关的记录仍按历代最大 window
+            # 保留，使回滚到较长窗口后恢复影响，阈值低于现存计数亦合法。
+            # mirror：sources/target/direction 自下一帧决定镜像副本，不
+            # 追溯已处理或已入队帧（已入队帧在入队时固定出口镜像判定与
+            # 目标口）。qos 变化时各端口 WRR 重置为 q=3,rem=weights[3]，
+            # 否则保留游标
             qos_changed = new_qos != qos
             age = new_age
+            window = new_storm["window"]
+            limits = new_storm["limits"]
+            move_limit = new_storm["move_limit"]
+            hold = new_storm["hold"]
+            if window > retain_window:
+                retain_window = window
+            if move_limit > move_cap:
+                move_cap = move_limit
+            sources = new_mirror["sources"]
+            mirror_target = new_mirror["target"]
+            direction = new_mirror["direction"]
+            source_set = set(sources)
             acl = new_acl
             qos = new_qos
             qos_map = new_qos["map"]
@@ -10805,8 +10939,16 @@ def forward_security(
         for name in egress:  # 按 egress 序逐口入队；镜像不随之产生
             out_tag = None if vlan in by_name[name]["untagged"] else vlan
             if admit(name, queue_idx):
+                # 出口镜像在入队时冻结目标口与启用判定；重载后服务本帧
+                # 不追溯新 sources/direction/target
+                frozen_mirror = (
+                    mirror_target
+                    if direction in ("egress", "both") and name in source_set
+                    else None
+                )
                 egress_queues[name][queue_idx].append(
-                    {"id": fid, "vlan": vlan, "mirror": out_tag}
+                    {"id": fid, "vlan": vlan, "mirror": out_tag,
+                     "egress_mirror": frozen_mirror}
                 )
                 out_ports.append({"name": name, "vlan": out_tag})
             else:  # 拒绝：计出口与 VLAN drop，不入队

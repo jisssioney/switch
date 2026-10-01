@@ -475,8 +475,9 @@ class ErrorPrecedenceTests(unittest.TestCase):
 
 class WorkLimitTests(unittest.TestCase):
     def events(self):
-        # 初始 B+L+2U=1；首帧空状态 19；reload 10；rollback 10；末帧 22；
-        # 累计 62（与 reload-rollback 同一公式）
+        # 初始 B+L+2U=1；首帧空状态 19（累计 20）；reload 与 rollback 各
+        # X+D+P+A+T+H+1=2+1+5+1+0+1+1=11（H=1：首帧留一条风暴记录）；
+        # 末帧 22；累计 64（与 reload-rollback 同一公式）
         new = changed_config(age=50)
         return [
             frame(0, "p1", "00:00:00:00:00:01"),
@@ -487,9 +488,9 @@ class WorkLimitTests(unittest.TestCase):
 
     def test_equal_limit_legal_first_exceed_rejected(self):
         log_bytes = reload_log(self.events())
-        code, out, err, _ = run_config(log_bytes, "*", "62")
+        code, out, err, _ = run_config(log_bytes, "*", "64")
         self.assertEqual(code, 0, err)
-        code, out, err, after = run_config(log_bytes, "*", "61")
+        code, out, err, after = run_config(log_bytes, "*", "63")
         self.assertEqual(code, 5)
         self.assertEqual(err, b'{"error":"reload_work_limit"}\n')
         self.assertEqual(out, b"")
@@ -504,10 +505,10 @@ class WorkLimitTests(unittest.TestCase):
         code, _, err, _ = run_config(log_bytes, source + ":1", "19")
         self.assertEqual(code, 5)
         self.assertEqual(err, b'{"error":"reload_work_limit"}\n')
-        # offset=2：再加重载 10 = 30
-        code, _, err, _ = run_config(log_bytes, source + ":2", "30")
+        # offset=2：再加重载 11（含 H=1）= 31
+        code, _, err, _ = run_config(log_bytes, source + ":2", "31")
         self.assertEqual(code, 0, err)
-        code, _, err, _ = run_config(log_bytes, source + ":2", "29")
+        code, _, err, _ = run_config(log_bytes, source + ":2", "30")
         self.assertEqual(code, 5)
         # offset=0：仅初始收敛 1
         code, out, err, _ = run_config(log_bytes, source + ":0", "1")

@@ -391,18 +391,20 @@ class RollbackWorkLimitTest(unittest.TestCase):
         ]
 
     def test_equal_legal_first_exceed_exit5(self):
-        # 工作量：初始 B+L+2U=1；帧 19；重载 X+D+P+A+T+1=2+1+5+1+0+1=10；
-        # 回滚同式 10（A/T 取恢复配置）；末帧 22；累计 62
+        # 工作量：初始 B+L+2U=1；帧 19；重载 X+D+P+A+T+H+1
+        # =2+1+5+1+0+1+1=11（H=1：首帧留下一条风暴记录，重载与回滚点
+        # 均仍在保留窗口内）；回滚同式 11（A/T 取恢复配置）；末帧 22；
+        # 累计 64
         config, events = self.events()
         code, out, err = run_cli(
             config, events, mode="reload-rollback",
-            extra=self.LIMITS_OK + ["62"],
+            extra=self.LIMITS_OK + ["64"],
         )
         self.assertEqual(code, 0)
         self.assertEqual(err, b"")
         code, out, err = run_cli(
             config, events, mode="reload-rollback",
-            extra=self.LIMITS_OK + ["61"],
+            extra=self.LIMITS_OK + ["63"],
         )
         self.assertEqual(code, 5)
         self.assertEqual(out, b"")
