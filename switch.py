@@ -28,6 +28,11 @@ PORT_KEYS_V2 = frozenset(("name", "mode", "pvid", "allowed", "untagged", "up"))
 FRAME_KEYS_V2 = frozenset(("t", "port", "src", "dst", "vlan"))
 FORWARD_STATIC_CONFIG_KEYS = frozenset(("ports", "age", "static"))
 STATIC_KEYS = frozenset(("vlan", "mac", "port"))
+FORWARD_CAPACITY_CONFIG_KEYS = frozenset(
+    ("ports", "age", "static", "fdb_capacity")
+)
+FDB_CAPACITY_KEYS = frozenset(("global", "vlans"))
+FDB_CAPACITY_VLAN_KEYS = frozenset(("vlan", "limit"))
 PORT_MODES = ("access", "trunk", "hybrid")
 STP_CONFIG_KEYS = frozenset(("bridges", "links", "delay"))
 STP_LINK_KEYS = frozenset(("id", "x", "y", "cost", "up"))
@@ -109,6 +114,10 @@ class FdbWorkLimit(Exception):
 
 
 class ForwardWorkLimit(Exception):
+    pass
+
+
+class FdbCapacityWorkLimit(Exception):
     pass
 
 
@@ -856,6 +865,289 @@ def forward_static_work(frames, ports, age, static, limit):
             )
         if not rejected and ingress["up"] and (vlan, src) not in static_keys:
             fdb[(vlan, src)] = [port_name, t]
+
+
+def validate_forward_capacity_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != FORWARD_CAPACITY_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    # ports/age/static 与 forward-static 同规则
+    ports, age, static = validate_forward_static_config(
+        {
+            "ports": config["ports"],
+            "age": config["age"],
+            "static": config["static"],
+        }
+    )
+    capacity = config["fdb_capacity"]
+    if not isinstance(capacity, dict) or frozenset(capacity) != FDB_CAPACITY_KEYS:
+        raise InvalidInput("bad fdb_capacity")
+    cap_global = capacity["global"]
+    if not _is_int(cap_global) or cap_global < 0:
+        raise InvalidInput("bad fdb_capacity global")
+    overrides = capacity["vlans"]
+    if not isinstance(overrides, list):
+        raise InvalidInput("fdb_capacity vlans must be a list")
+    cap_vlans = {}
+    prev_vlan = None
+    for item in overrides:
+        if not isinstance(item, dict) or frozenset(item) != FDB_CAPACITY_VLAN_KEYS:
+            raise InvalidInput("bad fdb_capacity vlan entry")
+        vlan = item["vlan"]
+        limit = item["limit"]
+        if not _valid_vlan_id(vlan):
+            raise InvalidInput("bad fdb_capacity vlan")
+        if not _is_int(limit) or limit < 0:
+            raise InvalidInput("bad fdb_capacity vlan limit")
+        # 按 VLAN 数值严格递增（重复即非法）
+        if prev_vlan is not None and vlan <= prev_vlan:
+            raise InvalidInput("fdb_capacity vlans not sorted")
+        prev_vlan = vlan
+        cap_vlans[vlan] = limit
+    return ports, age, static, cap_global, cap_vlans
+
+
+def _capacity_learn(fdb, vlan, src, port_name, t, cap_global, cap_vlans):
+    """在已满 FDB 中学习新动态项 (vlan, src)。
+
+    调用前 (vlan, src) 不存在且非静态；返回 (inserted, evicted)：
+    inserted 表示是否写入新项，evicted 为被删项的
+    (vlan, mac, port, seen) 或 None。有覆盖项的 VLAN 先受自身上限
+    约束，满则只在该 VLAN 内按 (seen, mac) 选牺牲项；未满再看全局，
+    全局满则从全部动态项按 (seen, vlan, mac) 选牺牲项。其余 VLAN 只受
+    全局上限约束。对应上限为零时不学习也不驱逐。
+    """
+    dynamic = [
+        (key, entry)
+        for key, entry in fdb.items()
+        if entry[2] == "dynamic"
+    ]
+    override = cap_vlans.get(vlan)
+    if override is not None:
+        in_vlan = [(key, entry) for key, entry in dynamic if key[0] == vlan]
+        if len(in_vlan) >= override:
+            if override == 0:
+                return False, None
+            (ev_vlan, ev_mac), ev_entry = min(
+                in_vlan, key=lambda item: (item[1][1], item[0][1])
+            )
+            del fdb[(ev_vlan, ev_mac)]
+            fdb[(vlan, src)] = [port_name, t, "dynamic"]
+            return True, (ev_vlan, ev_mac, ev_entry[0], ev_entry[1])
+    total = len(dynamic)
+    if total >= cap_global:
+        if cap_global == 0:
+            return False, None
+        (ev_vlan, ev_mac), ev_entry = min(
+            dynamic, key=lambda item: (item[1][1], item[0][0], item[0][1])
+        )
+        del fdb[(ev_vlan, ev_mac)]
+        fdb[(vlan, src)] = [port_name, t, "dynamic"]
+        return True, (ev_vlan, ev_mac, ev_entry[0], ev_entry[1])
+    fdb[(vlan, src)] = [port_name, t, "dynamic"]
+    return True, None
+
+
+def forward_capacity(frames, ports, age, static, cap_global, cap_vlans):
+    """forward-static 转发语义 + 动态学习表容量约束。
+
+    每帧先按事件时间老化动态项，再处理源地址：已有动态项刷新或迁移且
+    不增加数量；学习新项时按 VLAN 覆盖上限、全局上限的顺序驱逐最久未
+    见（last_seen 最小，依次按 VLAN 数值、MAC 字典序）的动态项。静态
+    项不占动态容量、永不老化且不被容量处理删除；对应上限为零时不学习
+    也不驱逐，但仍正常转发。
+    """
+    by_name = {port["name"]: port for port in ports}
+    fdb = {}  # (vlan, mac) -> [port, seen, source]；静态项 seen 为 None
+    for vlan, mac, port_name in static:
+        fdb[(vlan, mac)] = [port_name, None, "static"]
+    port_stats = {port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports}
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    eviction_counts = {}
+    results = []
+    for t, port_name, src, dst, tag in frames:
+        for key in [
+            k
+            for k, entry in fdb.items()
+            if entry[2] == "dynamic" and t - entry[1] >= age
+        ]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        port_stats[port_name]["rx"] += 1
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # 拒绝帧丢弃且不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            results.append(
+                {"t": t, "action": "drop", "ports": [],
+                 "learned": False, "evicted": None}
+            )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        egress = []
+        action = "drop"
+        learned = False
+        evicted = None
+        if ingress["up"]:
+            entry = fdb.get((vlan, src))
+            if entry is not None and entry[2] == "static":
+                # 静态命中：端口不同丢弃且不学习；同口继续但不改表
+                blocked = entry[0] != port_name
+            elif entry is not None:
+                # 已有动态项刷新或迁移：不增加数量、不触发驱逐
+                blocked = False
+                learned = True
+                entry[0] = port_name
+                entry[1] = t
+            else:
+                blocked = False
+                inserted, victim = _capacity_learn(
+                    fdb, vlan, src, port_name, t, cap_global, cap_vlans
+                )
+                learned = inserted
+                if victim is not None:
+                    ev_vlan, ev_mac, ev_port, ev_seen = victim
+                    evicted = {
+                        "vlan": ev_vlan,
+                        "mac": ev_mac,
+                        "port": ev_port,
+                        "seen": ev_seen,
+                    }
+                    eviction_counts[ev_vlan] = (
+                        eviction_counts.get(ev_vlan, 0) + 1
+                    )
+            if not blocked:
+                hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+                if hit is not None and hit[0] != port_name:
+                    target = by_name[hit[0]]
+                    if target["up"] and vlan in target["allowed"]:
+                        egress = [hit[0]]
+                        action = "unicast"
+                elif hit is None:
+                    egress = [
+                        port["name"]
+                        for port in ports
+                        if vlan in port["allowed"]
+                        and port["up"]
+                        and port["name"] != port_name
+                    ]
+                    if egress:
+                        action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        results.append(
+            {
+                "t": t,
+                "action": action,
+                "ports": out_ports,
+                "learned": learned,
+                "evicted": evicted,
+            }
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "fdb": [
+            {
+                "vlan": vlan,
+                "mac": mac,
+                "port": entry[0],
+                "source": entry[2],
+                "seen": entry[1],
+            }
+            for (vlan, mac), entry in sorted(fdb.items())
+        ],
+        "evictions": [
+            {"vlan": vlan, "count": eviction_counts[vlan]}
+            for vlan in sorted(eviction_counts)
+        ],
+    }
+
+
+def forward_capacity_work(
+    frames, ports, age, static, cap_global, cap_vlans, limit
+):
+    """forward-capacity 的工作量预演：独立预置静态项的 FDB，无副作用。
+
+    逐帧以老化前全部表项数 K（静态与动态）计 K+P+1，P 为端口数；
+    随后完全复演老化、VLAN 准入与容量学习/驱逐（静态项不老化、不刷新、
+    不被覆盖）。累计等于上限合法，首次超过即抛 FdbCapacityWorkLimit。
+    """
+    by_name = {port["name"]: port for port in ports}
+    width = len(ports) + 1
+    fdb = {}  # (vlan, mac) -> [port, seen, source]；静态项 seen 为 None
+    static_keys = set()
+    for vlan, mac, port_name in static:
+        fdb[(vlan, mac)] = [port_name, None, "static"]
+        static_keys.add((vlan, mac))
+    work = 0
+    for t, port_name, src, dst, tag in frames:
+        work += len(fdb) + width
+        if work > limit:
+            raise FdbCapacityWorkLimit
+        for key in [
+            k
+            for k, entry in fdb.items()
+            if entry[2] == "dynamic" and t - entry[1] >= age
+        ]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if not rejected and ingress["up"] and (vlan, src) not in static_keys:
+            entry = fdb.get((vlan, src))
+            if entry is not None:  # 动态刷新或迁移：数量不变
+                entry[0] = port_name
+                entry[1] = t
+            else:
+                _capacity_learn(
+                    fdb, vlan, src, port_name, t, cap_global, cap_vlans
+                )
 
 
 def validate_stp_config(config):
@@ -17422,7 +17714,8 @@ def _event_kind(event):
 
 def _log_mode(config, events=None):
     """record/replay 按 config 形状选模式：fdb、forward、stp、loop-detect、
-    link-forward、link-state、forward-static、forward-stp、forward-check/
+    link-forward、link-state、forward-static、forward-capacity、
+    forward-stp、forward-check/
     forward-decode（共享 ports,age,max_frame 三键配置，按帧形状区分）、
     stp-check/stp-decode（共享七键配置，按事件帧形状区分）、
     forward-stp-storm、lag、mirror、acl、acl-check、qos、qos-check/
@@ -17536,6 +17829,8 @@ def _log_mode(config, events=None):
             return "link_state"
         if keys == FORWARD_STATIC_CONFIG_KEYS:
             return "forward_static"
+        if keys == FORWARD_CAPACITY_CONFIG_KEYS:
+            return "forward_capacity"
         if keys == FORWARD_STP_CONFIG_KEYS:
             return "forward_stp"
         if keys == FORWARD_CHECK_CONFIG_KEYS:
@@ -18051,6 +18346,44 @@ def _run_forward_static(config, events, observe, max_work=None):
         # 与 forward-static 入口同一公式：独立预置静态项的 FDB，无副作用
         forward_static_work(frames, ports, age, static, max_work)
     result = forward_static(frames, ports, age, static)
+    observer = {} if observe else None
+    if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
+        observer["items"] = [
+            {
+                "kind": "frame",
+                "t": item["t"],
+                "applied": True,
+                "output": item,
+            }
+            for item in result["results"]
+        ]
+    return result, observer
+
+
+def _run_forward_capacity(config, events, observe, max_work=None):
+    """record/replay forward-capacity 模式：校验 forward-capacity 配置与帧
+    并执行仿真。
+
+    语义同 forward-capacity 子命令；max_work 非 None 时（record/replay）
+    全量语义校验后先按逐帧 K+P+1（K 为老化前静态及动态表项数，P 为端口
+    数）并复演容量学习/驱逐无副作用预演，首次超过即抛
+    FdbCapacityWorkLimit，不正式转发。返回 (forward-capacity 结果 dict,
+    observer 或 None)；每帧恒 applied，version 恒 0，output 为对应
+    results 项（键序 t,action,ports,learned,evicted）。
+    """
+    ports, age, static, cap_global, cap_vlans = (
+        validate_forward_capacity_config(config)
+    )
+    frames = validate_frames_v2(events, ports)
+    if max_work is not None:
+        # 与 forward-capacity 入口同一公式：独立预置静态项并复演容量
+        # 学习/驱逐的 FDB，无副作用
+        forward_capacity_work(
+            frames, ports, age, static, cap_global, cap_vlans, max_work
+        )
+    result = forward_capacity(
+        frames, ports, age, static, cap_global, cap_vlans
+    )
     observer = {} if observe else None
     if observer is not None:  # record/replay：逐帧记录 applied 与对应 results 项
         observer["items"] = [
@@ -18913,7 +19246,8 @@ def _build_log_doc(config, events, items):
     # qos-decode/acl-check/mirror-check/lag-check/storm-check 模式仅
     # applied 链路/成员项加 1（帧与 service 恒 applied 但不计），forward-stp/stp-decode/
     # stp-check/forward-stp-storm 模式仅 applied 链路项加 1（帧项恒
-    # applied 但不计），forward-static 模式帧恒 applied 且 version 恒 0
+    # applied 但不计），forward-static/forward-capacity 模式帧恒 applied
+    # 且 version 恒 0
     version = 0
     for event, observed in zip(events, items):
         kind = _event_kind(event)
@@ -19199,6 +19533,10 @@ def _cmd_record(
             result, observer = _run_forward_static(
                 config, events, True, max_record_work
             )
+        elif mode == "forward_capacity":
+            result, observer = _run_forward_capacity(
+                config, events, True, max_record_work
+            )
         elif mode == "forward_stp":
             result, observer = _run_forward_stp(
                 config, events, True, max_record_work
@@ -19302,6 +19640,7 @@ def _cmd_record(
         LoopWorkLimit,
         FdbWorkLimit,
         ForwardWorkLimit,
+        FdbCapacityWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
@@ -19401,6 +19740,10 @@ def _cmd_replay(
             )
         elif mode == "forward_static":
             result, observer = _run_forward_static(
+                config, events, True, max_replay_work
+            )
+        elif mode == "forward_capacity":
+            result, observer = _run_forward_capacity(
                 config, events, True, max_replay_work
             )
         elif mode == "forward_stp":
@@ -19506,6 +19849,7 @@ def _cmd_replay(
         LoopWorkLimit,
         FdbWorkLimit,
         ForwardWorkLimit,
+        FdbCapacityWorkLimit,
         ForwardStpWorkLimit,
         LinkForwardWorkLimit,
         LinkWorkLimit,
@@ -22701,6 +23045,7 @@ SUBCOMMANDS = frozenset((
     "fdb",
     "forward",
     "forward-static",
+    "forward-capacity",
     "stp",
     "loop-detect",
     "forward-stp",
@@ -23449,11 +23794,12 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_qos_decode(args[1], args[2], *limits)
-    # stp/fdb/forward/forward-static/forward-stp/stp-check/forward-stp-storm/
-    # storm-check/lag/lag-check/mirror/mirror-check/acl/acl-check/qos/qos-check/
-    # port-security/security-check/reload/reload-rollback 额外允许 5 项
-    # 上限（末尾分别为 MAX_STP_WORK/MAX_FDB_WORK/MAX_FORWARD_WORK/
-    # MAX_FORWARD_WORK(forward-static)/MAX_FORWARD_STP_WORK/
+    # stp/fdb/forward/forward-static/forward-capacity/forward-stp/stp-check/
+    # forward-stp-storm/storm-check/lag/lag-check/mirror/mirror-check/acl/
+    # acl-check/qos/qos-check/port-security/security-check/reload/
+    # reload-rollback 额外允许 5 项上限（末尾分别为 MAX_STP_WORK/
+    # MAX_FDB_WORK/MAX_FORWARD_WORK/MAX_FORWARD_WORK(forward-static)/
+    # MAX_FORWARD_WORK(forward-capacity)/MAX_FORWARD_STP_WORK/
     # MAX_FORWARD_STP_WORK(stp-check)/MAX_STORM_WORK/MAX_STORM_WORK/
     # MAX_LAG_WORK/MAX_LAG_WORK/MAX_MIRROR_WORK/MAX_MIRROR_WORK/
     # MAX_ACL_WORK/MAX_ACL_WORK/MAX_QOS_WORK/MAX_QOS_WORK(qos-check)/
@@ -23464,6 +23810,7 @@ def main(argv):
     is_fdb = args[:1] == ["fdb"]
     is_forward = args[:1] == ["forward"]
     is_forward_static = args[:1] == ["forward-static"]
+    is_forward_capacity = args[:1] == ["forward-capacity"]
     is_forward_stp = args[:1] == ["forward-stp"]
     is_stp_check = args[:1] == ["stp-check"]
     is_forward_stp_storm = args[:1] == ["forward-stp-storm"]
@@ -23483,7 +23830,7 @@ def main(argv):
     allowed_counts = (
         (3, 5, 7, 8)
         if is_stp or is_loop_detect or is_fdb or is_forward
-        or is_forward_static
+        or is_forward_static or is_forward_capacity
         or is_forward_stp
         or is_stp_check
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
@@ -23497,6 +23844,7 @@ def main(argv):
         "fdb",
         "forward",
         "forward-static",
+        "forward-capacity",
         "stp",
         "loop-detect",
         "forward-stp",
@@ -23591,6 +23939,21 @@ def main(argv):
         ) = parsed + forward_static_limits[len(parsed):]
         max_stp_work = None
         max_fdb_work = None
+        max_forward_stp_work = None
+    elif is_forward_capacity:
+        # forward-capacity 沿用 forward-static 的双文件与资源参数，
+        # 工作量公式相同但超限错误名为 fdb_capacity_work_limit
+        forward_capacity_limits = limits + (DEFAULT_MAX_FORWARD_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_fdb_capacity_work,
+        ) = parsed + forward_capacity_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
         max_forward_stp_work = None
     elif is_forward_stp:
         forward_stp_limits = limits + (DEFAULT_MAX_FORWARD_STP_WORK,)
@@ -24454,6 +24817,21 @@ def main(argv):
             # 预演（K 含全部表项）；超限时不得正式转发
             forward_static_work(frames, ports, age, static, max_forward_work)
             result = forward_static(frames, ports, age, static)
+        elif mode == "forward-capacity":
+            (
+                ports, age, static, cap_global, cap_vlans
+            ) = validate_forward_capacity_config(config)
+            frames = validate_frames_v2(data, ports)
+            # 两文件解析及全量语义校验后，用独立预置静态项并复演容量
+            # 学习/驱逐的 FDB 无副作用预演（K 含全部表项）；超限时不得
+            # 正式转发
+            forward_capacity_work(
+                frames, ports, age, static, cap_global, cap_vlans,
+                max_fdb_capacity_work,
+            )
+            result = forward_capacity(
+                frames, ports, age, static, cap_global, cap_vlans
+            )
         else:
             if is_v2_config(config):
                 ports, age = validate_forward_config_v2(config)
@@ -24481,6 +24859,9 @@ def main(argv):
         return 5
     except ForwardWorkLimit:
         _fail("forward_work_limit")
+        return 5
+    except FdbCapacityWorkLimit:
+        _fail("fdb_capacity_work_limit")
         return 5
     except ForwardStpWorkLimit:
         _fail("forward_stp_work_limit")
