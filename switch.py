@@ -17430,7 +17430,8 @@ def _log_mode(config, events=None):
     mirror-check、lag-check、storm-check、port-security，或 link-wire/
     link-wire-decode（共享含 queue_bytes 配置，按事件帧形状区分），或
     link-flow-decode（含 queue_bytes 与 flow_control 的端口配置，事件为
-    原始帧形状）。
+    原始帧形状），或 qos-wire-decode/qos-pfc-decode（共享含 queue_bytes、
+    flow_control 与 qos 的五键配置，按每口是否均带 pfc 区分）。
 
     events 非 None 时用于区分共享配置形状的两种模式：三键配置的非空帧
     数组含 src（八键）按 forward-check，含 data（t/port/data 原始帧）按
@@ -17448,6 +17449,20 @@ def _log_mode(config, events=None):
     """
     if isinstance(config, dict):
         keys = frozenset(config)
+        # qos-wire-decode 与 qos-pfc-decode 共享五键配置（link-flow-decode
+        # 四键加 qos）：所有端口均不含 pfc 按 qos-wire-decode，均含 pfc 按
+        # qos-pfc-decode；混合或端口形状不完整一律 InvalidInput（pfc 值域
+        # 等全量合法性仍由对应入口校验负责）。
+        if keys == QOS_WIRE_CONFIG_KEYS:
+            ports_doc = config.get("ports")
+            if not isinstance(ports_doc, list) or not ports_doc or not all(
+                isinstance(p, dict) for p in ports_doc
+            ):
+                raise InvalidInput("bad config")
+            has_pfc = ["pfc" in p for p in ports_doc]
+            if not all(has_pfc) and any(has_pfc):
+                raise InvalidInput("bad config")
+            return "qos_pfc_decode" if all(has_pfc) else "qos_wire_decode"
         # 恰含 ports,age 且 ports 为字符串数组时为 fdb 模式（forward 旧
         # 入口的 ports 为对象数组，形状不重叠）
         if keys == CONFIG_KEYS and isinstance(
@@ -17865,6 +17880,80 @@ def _run_link_flow_decode(config, events, observe, max_work=None):
         # 排列仅取决于各事件 kind/t/port，解码前后一一对应且三者不变，故
         # 以解码事件求处理序、回取原始（未解码）输入事件供日志构建/核对。
         indexed = _link_wire_indexed(fwd_ports, flow_events)
+        observer["events"] = [events[ix] for ix, _ in indexed]
+    return result, observer
+
+
+def _run_qos_wire_decode(config, events, observe, max_work=None):
+    """record/replay qos-wire-decode 模式：校验含 queue_bytes、flow_control
+    与 qos 的配置及 link/advance/{t,port,data} 原始帧混合事件并执行四队列
+    线速仿真。
+
+    输入、全量校验、同一时刻排序、工作量计费与仿真语义完全沿用
+    qos-wire-decode 入口；max_work 非 None 时（record/replay）全量语义
+    校验后先按 qos-wire 公式无副作用预演，首次超过即抛 QosWireWorkLimit，
+    不正式仿真。日志记录的 applied/output 口径与 link-wire 相同（frame 恒
+    applied，link 仅状态实际改变时 applied，advance 仅实际完成到期协商或
+    发送时 applied；output 为连续结果数组）。返回 (结果 dict, observer 或
+    None)。
+    """
+    (
+        fwd_ports, caps, queues, flows, qos, age, max_frame, delay,
+    ) = validate_qos_wire_config(config)
+    raw_events = validate_qos_wire_events(events, fwd_ports)
+    decoded_events = _decode_qos_wire_events(raw_events)
+    if max_work is not None:
+        # 与 qos-wire-decode 入口同一公式：解码为纯函数，独立状态跑同一
+        # 仿真，无副作用
+        qos_wire_work(
+            fwd_ports, caps, queues, flows, qos, age, max_frame, delay,
+            decoded_events, max_work,
+        )
+    observer = {} if observe else None
+    result = qos_wire(
+        fwd_ports, caps, queues, flows, qos, age, max_frame, delay,
+        decoded_events, observer=observer,
+    )
+    if observer is not None:
+        # 排列仅取决于各事件 kind/t/port，解码前后一一对应且三者不变，故
+        # 以解码事件求处理序、回取原始（未解码）输入事件供日志构建/核对。
+        indexed = _link_wire_indexed(fwd_ports, decoded_events)
+        observer["events"] = [events[ix] for ix, _ in indexed]
+    return result, observer
+
+
+def _run_qos_pfc_decode(config, events, observe, max_work=None):
+    """record/replay qos-pfc-decode 模式：校验每口带 pfc 的 qos-wire 配置
+    与 link/advance/原始帧混合事件并执行 802.1Qbb 门控的四队列线速仿真。
+
+    输入、全量校验、同一时刻排序、工作量计费与仿真语义完全沿用
+    qos-pfc-decode 入口；max_work 非 None 时（record/replay）全量语义
+    校验后先按 qos-pfc 公式无副作用预演，首次超过即抛 QosPfcWorkLimit，
+    不正式仿真。日志记录的 applied/output 口径同 qos-wire-decode。返回
+    (结果 dict, observer 或 None)。
+    """
+    (
+        fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+        delay,
+    ) = validate_qos_pfc_config(config)
+    raw_events = validate_qos_pfc_events(events, fwd_ports)
+    decoded_events = _decode_qos_pfc_events(raw_events)
+    if max_work is not None:
+        # 与 qos-pfc-decode 入口同一公式：解码为纯函数，独立状态跑同一
+        # 仿真，无副作用
+        qos_pfc_work(
+            fwd_ports, caps, queues, flows, qos, pfc_allowed, age,
+            max_frame, delay, decoded_events, max_work,
+        )
+    observer = {} if observe else None
+    result = qos_pfc(
+        fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+        delay, decoded_events, observer=observer,
+    )
+    if observer is not None:
+        # 排列仅取决于各事件 kind/t/port，解码前后一一对应且三者不变，故
+        # 以解码事件求处理序、回取原始（未解码）输入事件供日志构建/核对。
+        indexed = _link_wire_indexed(fwd_ports, decoded_events)
         observer["events"] = [events[ix] for ix, _ in indexed]
     return result, observer
 
@@ -18816,7 +18905,8 @@ def _build_log_doc(config, events, items):
                 version += 1
         elif mode in (
             "link_forward", "link_wire", "link_wire_decode",
-            "link_flow_decode", "forward_stp",
+            "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
+            "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
@@ -18954,7 +19044,8 @@ def _verify_records(log, events, items):
                 version += 1
         elif mode in (
             "link_forward", "link_wire", "link_wire_decode",
-            "link_flow_decode", "forward_stp",
+            "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
+            "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm"
         ):
             if kind == "link" and observed["applied"]:
@@ -19077,6 +19168,14 @@ def _cmd_record(
             result, observer = _run_link_flow_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "qos_wire_decode":
+            result, observer = _run_qos_wire_decode(
+                config, events, True, max_record_work
+            )
+        elif mode == "qos_pfc_decode":
+            result, observer = _run_qos_pfc_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "forward":
             result, observer = _run_forward(
                 config, events, True, max_record_work
@@ -19189,6 +19288,8 @@ def _cmd_record(
         LinkWorkLimit,
         LinkWireWorkLimit,
         LinkFlowWorkLimit,
+        QosWireWorkLimit,
+        QosPfcWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
         AclWorkLimit,
@@ -19269,6 +19370,14 @@ def _cmd_replay(
             )
         elif mode == "link_flow_decode":
             result, observer = _run_link_flow_decode(
+                config, events, True, max_replay_work
+            )
+        elif mode == "qos_wire_decode":
+            result, observer = _run_qos_wire_decode(
+                config, events, True, max_replay_work
+            )
+        elif mode == "qos_pfc_decode":
+            result, observer = _run_qos_pfc_decode(
                 config, events, True, max_replay_work
             )
         elif mode == "forward":
@@ -19383,6 +19492,8 @@ def _cmd_replay(
         LinkWorkLimit,
         LinkWireWorkLimit,
         LinkFlowWorkLimit,
+        QosWireWorkLimit,
+        QosPfcWorkLimit,
         SecurityWorkLimit,
         QosWorkLimit,
         AclWorkLimit,
