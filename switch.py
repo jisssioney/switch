@@ -84,9 +84,12 @@ SECURITY_ACTIONS = ("drop", "shutdown")
 SECURITY_STATIC_KEYS = frozenset(("mac", "vlan"))
 RELOAD_EVENT_KEYS = frozenset(("t", "config"))
 ROLLBACK_EVENT_KEYS = frozenset(("t", "rollback"))
+# 热加载可变键，亦为 changes 的固定输出次序；ports 仅开放现有端口的
+# mode/pvid/allowed/untagged（名称、顺序、up 不可变）
 RELOAD_MUTABLE_KEYS = (
-    "age", "storm", "mirror", "acl", "qos", "security"
+    "age", "ports", "storm", "mirror", "acl", "qos", "security"
 )
+PORT_VLAN_KEYS = ("mode", "pvid", "allowed", "untagged")
 
 
 class InvalidInput(Exception):
@@ -2283,6 +2286,32 @@ def _qos_queues_fit(counts, qos):
     return all(counts[i] <= quotas[i] for i in range(4))
 
 
+def _reload_vlan_plan(ports, new_ports, lags):
+    """端口 VLAN 热变更迁移计划（名称/顺序/up 已由事件校验保证不变）。
+
+    返回 (new_allowed, lag_allowed, changed)：new_allowed 为物理口名到
+    新 allowed 集合；lag_allowed 为 LAG 名到其成员的新 allowed 集合
+    （LAG 成员共享 VLAN 配置，已由全量校验保证）；changed 表示是否
+    至少有一个端口的 mode/pvid/allowed/untagged 实际变化。
+    """
+    new_allowed = {port["name"]: set(port["allowed"]) for port in new_ports}
+    lag_allowed = {
+        lag["name"]: new_allowed[lag["members"][0]] for lag in lags
+    }
+    changed = any(
+        any(old[key] != new[key] for key in PORT_VLAN_KEYS)
+        for old, new in zip(ports, new_ports)
+    )
+    return new_allowed, lag_allowed, changed
+
+
+def _fdb_entry_vlan_allowed(logical_port, vlan, new_allowed, lag_allowed):
+    """FDB 项的逻辑口（物理口或 LAG）在新配置下是否仍允许该 VLAN。"""
+    if logical_port in lag_allowed:  # 逻辑口为 LAG
+        return vlan in lag_allowed[logical_port]
+    return vlan in new_allowed[logical_port]
+
+
 class _TsQueue:
     """单调时间戳队列：逻辑视图为 items[head:]，支持按窗口 O(log n) 计数。
 
@@ -2827,13 +2856,40 @@ def validate_security_check_events(events, ports, link_ids, lags):
     return validate_qos_check_events(events, ports, link_ids, lags)
 
 
+def _reload_port_identity_ok(current_ports, new_ports):
+    """热加载端口身份不可变：名称与顺序、up 状态逐位置一致。
+
+    仅 mode/pvid/allowed/untagged 允许热变更；端口增删、重排或 up 变化
+    均拒绝。
+    """
+    if len(current_ports) != len(new_ports):
+        return False
+    for old, new in zip(current_ports, new_ports):
+        if old["name"] != new["name"] or old["up"] != new["up"]:
+            return False
+    return True
+
+
+def _reload_changes(current, new_config):
+    """按 RELOAD_MUTABLE_KEYS 固定次序列出实际变化项。"""
+    return [
+        {
+            "key": key,
+            "before": _canonical(current[key]),
+            "after": _canonical(new_config[key]),
+        }
+        for key in RELOAD_MUTABLE_KEYS
+        if new_config[key] != current[key]
+    ]
+
+
 def validate_reload_events(events, ports, link_ids, lags, config,
                            allow_rollback=False):
     """reload 子命令事件：普通事件沿用 qos，另含 {t, config} 重载事件。
 
     返回 (事件序列, 末态原始配置)；重载事件的 config 须为完整有效配置，
-    且仅 age/storm/mirror/acl/qos/security 可与当时配置不同。全部校验
-    先于执行。
+    且仅 age/ports（限 mode/pvid/allowed/untagged）/storm/mirror/acl/qos/
+    security 可与当时配置不同。全部校验先于执行。
     allow_rollback 时另含 {t, rollback} 事件（rollback 只能为 true）：
     reload 前压入当前配置，rollback 弹栈恢复，空栈为 invalid_input。
     """
@@ -2929,7 +2985,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _links,
                 _delay,
                 _bridge,
-                _ports,
+                new_ports,
                 new_age,
                 new_storm,
                 _lags,
@@ -2945,18 +3001,16 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 ):
                     raise InvalidInput(
                         "reload may only change "
-                        "age/storm/mirror/acl/qos/security"
+                        "age/ports/storm/mirror/acl/qos/security"
                     )
-            changes = []
-            for key in RELOAD_MUTABLE_KEYS:
-                if new_config[key] != current[key]:
-                    changes.append(
-                        {
-                            "key": key,
-                            "before": _canonical(current[key]),
-                            "after": _canonical(new_config[key]),
-                        }
-                    )
+            if not _reload_port_identity_ok(
+                current["ports"], new_config["ports"]
+            ):
+                raise InvalidInput(
+                    "reload may only change port "
+                    "mode/pvid/allowed/untagged"
+                )
+            changes = _reload_changes(current, new_config)
             if allow_rollback:
                 stack.append(current)  # reload 前压入当前配置
             current = new_config
@@ -2965,6 +3019,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                     "reload",
                     t,
                     new_age,
+                    new_ports,
                     new_storm,
                     new_mirror,
                     new_acl,
@@ -2989,7 +3044,7 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 _links,
                 _delay,
                 _bridge,
-                _ports,
+                new_ports,
                 new_age,
                 new_storm,
                 _lags,
@@ -2998,22 +3053,14 @@ def validate_reload_events(events, ports, link_ids, lags, config,
                 new_qos,
                 new_security,
             ) = validate_security_config(new_config)
-            changes = []
-            for key in RELOAD_MUTABLE_KEYS:
-                if new_config[key] != current[key]:
-                    changes.append(
-                        {
-                            "key": key,
-                            "before": _canonical(current[key]),
-                            "after": _canonical(new_config[key]),
-                        }
-                    )
+            changes = _reload_changes(current, new_config)
             current = new_config
             result.append(
                 (
                     "rollback",
                     t,
                     new_age,
+                    new_ports,
                     new_storm,
                     new_mirror,
                     new_acl,
@@ -9820,9 +9867,12 @@ def reload_work(
     幂等计 X+1；成员 down 计 X+S+1、up 计 X+1；服务计 X+S+1；重载令
     A/T 为新 ACL 规则数/新静态绑定数，计 X+D+P+A+T+1，qos 变化分支
     另计 N+5；重载与回滚再各加 H（当时保留的风暴/MAC 迁移时间记录与
-    封锁项总数，与 X 同点取、老化解封前的原始计数），再采用新
-    age/storm/ACL/qos/security（队列超新 qos 边界整批无效）。风暴
-    时间记录按历代最大 window 保留，缩短当前窗口暂无关记录不清除，
+    封锁项总数，与 X 同点取、老化解封前的原始计数）；端口 VLAN 属性
+    实际变化时再各加 P 及当时 FDB 项数、动态绑定数与全部排队副本数
+    （每项检查一个工作单位），再采用新
+    age/ports/storm/ACL/qos/security（按新 allowed 清理后动态绑定超
+    新 security 上限/入新 static，或队列超新 qos 边界均整批无效）。
+    风暴时间记录按历代最大 window 保留，缩短当前窗口暂无关记录不清除，
     判定只计当前 window 内记录。再按既有队列、调度、清队与安全规则
     处理并更新预演状态。
     累计等于上限合法，首次超过即抛 ReloadWorkLimit。
@@ -9876,8 +9926,10 @@ def reload_work(
     move_queues = {}  # (vlan, src) -> 迁移时刻 deque
     last_learn = {}  # (vlan, src) -> 最后学习逻辑口
     blocked = {}  # (入端口, vlan) -> 封锁截止时刻
-    # 出口队列预演仅跟踪各端口 4 个优先级队列的长度
-    egress_queues = {port["name"]: [0, 0, 0, 0] for port in ports}
+    # 出口队列预演：各端口 4 个优先级 FIFO，存排队副本的 VLAN
+    egress_queues = {
+        port["name"]: [deque() for _ in range(4)] for port in ports
+    }
     # 每物理出口持久 WRR 状态 (当前队, 剩余配额)；初始服务 3 队
     wrr_state = {port["name"]: [3, weights[3]] for port in ports}
 
@@ -10038,12 +10090,28 @@ def reload_work(
                 return rule["action"], rule["to_vlan"]
         return "allow", None
 
+    def port_queued(name):
+        """某物理口四个队列的排队副本总数。"""
+        return sum(len(q) for q in egress_queues[name])
+
+    def queued_total():
+        """全部物理口排队副本总数。"""
+        return sum(
+            sum(len(q) for q in queues) for queues in egress_queues.values()
+        )
+
+    def clear_egress(name):
+        """清队：重建四个空 FIFO（离开 forwarding 时）。"""
+        egress_queues[name] = [deque() for _ in range(4)]
+
     def admit(name, queue_idx):
         """tail：总数达 cap 即拒；weighted：任一队列配额满即拒。"""
-        counts = egress_queues[name]
+        queues = egress_queues[name]
         if drop_mode == "tail":
-            return sum(counts) < cap
-        return all(counts[q] < quotas[q] for q in range(4))
+            return port_queued(name) < cap
+        return all(
+            len(queues[q]) < quotas[q] for q in range(4)
+        )
 
     def security_check(port_name, vlan, src):
         """端口安全：返回 True 表示违例（shutdown 另永久禁口并清队）。"""
@@ -10067,7 +10135,7 @@ def reload_work(
             for old in dynamic[port_name]:  # 清动态绑定
                 del bound[old]
             dynamic[port_name].clear()
-            egress_queues[port_name] = [0, 0, 0, 0]  # 离开 forwarding：清队
+            clear_egress(port_name)  # 离开 forwarding：清队
         return True
 
     U = sum(1 for link in sim_links if link["up"])
@@ -10086,12 +10154,17 @@ def reload_work(
         )
         D = len(bound)
         kind = item[0]
+        # 端口 VLAN 迁移计划仅在 reload/rollback 计费分支设置
+        new_allowed = None
+        keep_fdb = None
+        kept_bound = None
+        ports_changed = False
         if kind == "link":
             up = item[3]
             changed = by_id[item[2]]["up"] != up
             if changed:  # 先应用 up，再以新 U 计
                 U += 1 if up else -1
-                N = sum(sum(counts) for counts in egress_queues.values())
+                N = queued_total()
                 work += X + N + (B + L + 2 * U) + 2 * P + 1
             else:
                 work += X + 1
@@ -10099,19 +10172,50 @@ def reload_work(
             if item[3]:
                 work += X + 1
             else:
-                work += X + sum(egress_queues[item[2]]) + 1
+                work += X + port_queued(item[2]) + 1
         elif kind == "service":
-            work += X + sum(egress_queues[item[2]]) + 1
+            work += X + port_queued(item[2]) + 1
         elif kind in ("reload", "rollback"):
             # 动态绑定数超新 limit、动态 (vlan, mac) 入新 static 或既有出口
             # 队列超新 qos 边界的整批无效判定先于工作量累加与超限判断：
             # record/replay 按 invalid_input 退出 4，且绝不触碰 LOG；
             # rollback 按 reload 分支计费，A/T 取恢复配置的 ACL 规则数/
-            # 静态绑定数
-            new_storm = item[3]
-            new_acl = item[5]
-            new_qos = item[6]
-            new_security = item[7]
+            # 静态绑定数。端口 VLAN 迁移：先求保留集合并清理动态绑定，
+            # 再以清理后状态重校验新 security 端口上限与静态归属（静态
+            # 自身全局唯一由全量配置校验保证）；队列先按新 allowed 剔除，
+            # 再做新 qos 边界检查
+            new_ports = item[3]
+            new_storm = item[4]
+            new_acl = item[6]
+            new_qos = item[7]
+            new_security = item[8]
+            (
+                new_allowed,
+                new_lag_allowed,
+                ports_changed,
+            ) = _reload_vlan_plan(ports, new_ports, lags)
+            keep_fdb = None
+            kept_bound = None
+            mig_charge = 0
+            if ports_changed:
+                # 迁移计费：每检查一个端口、FDB 项、动态绑定、排队副本
+                # 各一工作单位；保留集合供应用阶段执行同一迁移
+                mig_charge += P
+                keep_fdb = {
+                    key
+                    for key, (port_name, _seen) in fdb.items()
+                    if _fdb_entry_vlan_allowed(
+                        port_name, key[0], new_allowed, new_lag_allowed
+                    )
+                }
+                mig_charge += len(fdb)
+                kept_bound = {
+                    key
+                    for key, port_name in bound.items()
+                    if key[0] in new_allowed[port_name]
+                }
+                mig_charge += D
+                mig_charge += queued_total()
             reload_by_port = {entry["port"]: entry for entry in new_security}
             reload_static_owner = {}
             for entry in new_security:
@@ -10119,17 +10223,32 @@ def reload_work(
                     reload_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
+            # 动态绑定按新 allowed 清理后重校验端口上限
             for name, macs in dynamic.items():
-                if len(macs) > reload_by_port[name]["limit"]:
+                if ports_changed:
+                    remaining = sum(1 for key in macs if key in kept_bound)
+                else:
+                    remaining = len(macs)
+                if remaining > reload_by_port[name]["limit"]:
                     raise InvalidInput("dynamic bindings exceed new limit")
-            for key in bound:
+            # 清理后的动态 (vlan, mac) 不得入新 static
+            check_bound = kept_bound if ports_changed else bound
+            for key in check_bound:
                 if key in reload_static_owner:
                     raise InvalidInput("dynamic binding in new static")
-            for counts in egress_queues.values():
+            # 新 qos 边界检查以按新 allowed 剔除后的队列为准
+            for name, queues in egress_queues.items():
+                if ports_changed:
+                    counts = [
+                        sum(1 for vlan in q if vlan in new_allowed[name])
+                        for q in queues
+                    ]
+                else:
+                    counts = [len(q) for q in queues]
                 if not _qos_queues_fit(counts, new_qos):
                     raise InvalidInput("queued frames exceed new qos bounds")
             # A/T 为新 ACL 规则数/新静态绑定数；qos 变化分支另计 N+5，
-            # N 为变更前全部出口排队帧总数；H 为当时保留的风暴/MAC 迁移
+            # N 为迁移前全部出口排队帧总数；H 为当时保留的风暴/MAC 迁移
             # 时间记录（缩短窗口暂无关者亦计）与封锁项总数
             H = (
                 len(blocked)
@@ -10144,14 +10263,13 @@ def reload_work(
                 + sum(len(entry["static"]) for entry in new_security)
                 + 1
                 + H
+                + mig_charge
             )
             if new_qos != qos:
-                charge += sum(
-                    sum(counts) for counts in egress_queues.values()
-                ) + 5
+                charge += queued_total() + 5
             work += charge
         else:  # 帧：S 取入端口排队帧数
-            work += X + 3 * P + M + R + D + sum(egress_queues[item[2]]) + 1
+            work += X + 3 * P + M + R + D + port_queued(item[2]) + 1
         if work > limit:
             raise ReloadWorkLimit
         # 以下按既有规则处理并更新预演状态
@@ -10167,39 +10285,39 @@ def reload_work(
                 for name in old_forwarding - forwarding_ports(t):
                     for key in [k for k, (p, _) in fdb.items() if p == name]:
                         del fdb[key]
-                    egress_queues[name] = [0, 0, 0, 0]  # 离开 forwarding：清队
+                    clear_egress(name)  # 离开 forwarding：清队
             continue
         if kind == "member":
             member_up[item[2]] = item[3]  # 幂等无作用；可用性变化不清 FDB
             if not item[3]:  # 成员下线即非 forwarding：清队
-                egress_queues[item[2]] = [0, 0, 0, 0]
+                clear_egress(item[2])
             continue
         if kind == "service":
             _, _, port_name, count = item
-            counts = egress_queues[port_name]
+            queues = egress_queues[port_name]
             if not is_forwarding(port_name, t):  # 非 forwarding：清队不服务
-                egress_queues[port_name] = [0, 0, 0, 0]
+                clear_egress(port_name)
             elif sched_mode == "sp":
                 served = 0
                 while served < count:
-                    q = next((q for q in (3, 2, 1, 0) if counts[q]), None)
+                    q = next((q for q in (3, 2, 1, 0) if queues[q]), None)
                     if q is None:
                         break
-                    counts[q] -= 1
+                    queues[q].popleft()
                     served += 1
             else:  # wrr：持久状态 (q, rem)
                 served = 0
                 while served < count:
                     q, rem = wrr_state[port_name]
-                    if not any(counts):  # 四队全空：停止且状态不变
+                    if not any(queues):  # 四队全空：停止且状态不变
                         break
-                    while not counts[q]:  # 当前队空：推进并重置配额
+                    while not queues[q]:  # 当前队空：推进并重置配额
                         q = (q - 1) % 4
                         rem = weights[q]
-                    counts[q] -= 1
+                    queues[q].popleft()
                     served += 1
                     rem -= 1  # 每发一帧 rem 减 1
-                    if rem == 0 or not counts[q]:
+                    if rem == 0 or not queues[q]:
                         # rem 用尽或当前队变空：推进并重置配额；
                         # count 用尽而 rem 未尽且队非空：状态保留续用
                         q = (q - 1) % 4
@@ -10207,8 +10325,8 @@ def reload_work(
                     wrr_state[port_name] = [q, rem]
             continue
         if kind in ("reload", "rollback"):
-            _, _, new_age, new_storm, _new_mirror, new_acl, new_qos, \
-                new_security, _ = item
+            _, _, new_age, new_ports, new_storm, _new_mirror, new_acl, \
+                new_qos, new_security, _ = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
             for entry in new_security:
@@ -10216,11 +10334,28 @@ def reload_work(
                     new_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
-            # 原子替换 age/storm/acl/qos/security；FDB、绑定、安全状态、
-            # 队列内容、调度、风暴记录全部保留，新规则自下一事件生效；
-            # 已有封锁沿用原解除时刻，新封锁使用当时 hold；缩短窗口暂
-            # 无关的时间记录按历代最大 window 保留；qos 变化时 WRR 重置
-            # 为 q=3,rem=weights[3]
+            # 端口 VLAN 迁移：保留计划与 security 重校验已在计费前完成。
+            # FDB 项仅在逻辑口仍允许该 VLAN 时保留；动态绑定同理清理；
+            # 出端口不再允许其 VLAN 的排队副本剔除（预演不计计数）；
+            # 其余动态状态保持不变
+            if ports_changed:
+                for key in [k for k in fdb if k not in keep_fdb]:
+                    del fdb[key]
+                for name in new_allowed:
+                    for q in range(4):
+                        old_queue = egress_queues[name][q]
+                        egress_queues[name][q] = deque(
+                            vlan for vlan in old_queue
+                            if vlan in new_allowed[name]
+                        )
+                for key in [k for k in bound if k not in kept_bound]:
+                    owner = bound.pop(key)
+                    dynamic[owner].discard(key)
+            # 原子替换 age/ports/storm/acl/qos/security；风暴记录、封锁、
+            # 安全状态、保留的队列内容与调度位置全部保留，新规则自下一
+            # 事件生效；已有封锁沿用原解除时刻，新封锁使用当时 hold；
+            # 缩短窗口暂无关的时间记录按历代最大 window 保留；qos 变化
+            # 时 WRR 重置为 q=3,rem=weights[3]
             if new_qos != qos:
                 qos = new_qos
                 qos_map = new_qos["map"]
@@ -10232,6 +10367,8 @@ def reload_work(
                 for name in wrr_state:
                     wrr_state[name] = [3, weights[3]]
             age = new_age
+            ports = new_ports  # 名称/顺序/up 不变；闭包自下一事件见新值
+            by_name = {port["name"]: port for port in ports}
             window = new_storm["window"]
             limits = new_storm["limits"]
             move_limit = new_storm["move_limit"]
@@ -10331,7 +10468,7 @@ def reload_work(
         queue_idx = qos_map[priority]
         for name in egress:  # 按 egress 序逐口入队；镜像不随之产生
             if admit(name, queue_idx):
-                egress_queues[name][queue_idx] += 1
+                egress_queues[name][queue_idx].append(vlan)
 
 
 def forward_security(
@@ -10739,8 +10876,8 @@ def forward_security(
             continue
         if item[0] in ("reload", "rollback"):
             (
-                _, t, new_age, new_storm, new_mirror, new_acl, new_qos,
-                new_security, changes,
+                _, t, new_age, new_ports, new_storm, new_mirror, new_acl,
+                new_qos, new_security, changes,
             ) = item
             new_by_port = {entry["port"]: entry for entry in new_security}
             new_static_owner = {}
@@ -10749,32 +10886,97 @@ def forward_security(
                     new_static_owner[(static["vlan"], static["mac"])] = (
                         entry["port"]
                     )
-            # 动态绑定数超新 limit 或动态 (vlan, mac) 入新 static：整批无效
+            # 端口 VLAN 迁移：先按新 allowed 求保留集合（FDB 项的逻辑口
+            # 可为物理口或 LAG；动态绑定以入物理口为准），校验通过后才
+            # 变更状态，保证整批失败无部分生效
+            (
+                new_allowed,
+                new_lag_allowed,
+                ports_changed,
+            ) = _reload_vlan_plan(ports, new_ports, lags)
+            if ports_changed:
+                keep_fdb = {
+                    key
+                    for key, (port_name, _seen) in fdb.items()
+                    if _fdb_entry_vlan_allowed(
+                        port_name, key[0], new_allowed, new_lag_allowed
+                    )
+                }
+                kept_bound = {
+                    key
+                    for key, port_name in bound.items()
+                    if key[0] in new_allowed[port_name]
+                }
+            else:
+                keep_fdb = None
+                kept_bound = set(bound)
+            # 动态绑定按新 allowed 清理后重校验：端口上限与新 static 归属
+            # （静态自身全局唯一已由全量配置校验保证）
             for name, macs in dynamic.items():
-                if len(macs) > new_by_port[name]["limit"]:
+                remaining = sum(1 for key in macs if key in kept_bound)
+                if remaining > new_by_port[name]["limit"]:
                     raise InvalidInput("dynamic bindings exceed new limit")
-            for key in bound:
+            for key in kept_bound:
                 if key in new_static_owner:
                     raise InvalidInput("dynamic binding in new static")
-            # 取新配置后检查既有出口四队列：tail 下总数不得超新 cap，
-            # weighted 下各队列不得超新配额；违例整批无效
+            # 出端口不再允许其 VLAN 的排队副本将在迁移时丢弃；先以剔除后
+            # 的四队列长度做新 qos 边界检查（tail 总数、weighted 各配额）
             for name in by_name:
-                counts = [len(q) for q in egress_queues[name]]
+                if ports_changed:
+                    counts = [
+                        sum(
+                            1 for frame in q
+                            if frame["vlan"] in new_allowed[name]
+                        )
+                        for q in egress_queues[name]
+                    ]
+                else:
+                    counts = [len(q) for q in egress_queues[name]]
                 if not _qos_queues_fit(counts, new_qos):
                     raise InvalidInput("queued frames exceed new qos bounds")
-            # 原子替换 age/storm/mirror/acl/qos/security；FDB、绑定、安全
-            # 状态、队列内容、调度、风暴时间记录与计数全部保留，新规则自
-            # 下一事件生效；已排队帧保留帧号、VLAN、队列号，不重分类、
-            # 不丢弃。storm：window/limits/move_limit/hold 自下一帧参与
-            # 判定，已有封锁沿用原解除时刻（不解除、不重计时），新封锁
-            # 使用当时 hold；缩短窗口暂时无关的记录仍按历代最大 window
-            # 保留，使回滚到较长窗口后恢复影响，阈值低于现存计数亦合法。
-            # mirror：sources/target/direction 自下一帧决定镜像副本，不
-            # 追溯已处理或已入队帧（已入队帧在入队时固定出口镜像判定与
-            # 目标口）。qos 变化时各端口 WRR 重置为 q=3,rem=weights[3]，
-            # 否则保留游标
+            # 迁移执行：FDB 删除逻辑口不再允许该 VLAN 的表项；动态绑定
+            # 同步清理；不合法排队副本逐帧丢弃并计入口/VLAN 既有 drop
+            # 计数，合法副本保留原出站标签、队列、帧号与调度位置；
+            # STP、链路、风暴、镜像、LAG、安全违例计数及其余动态状态不变
+            if ports_changed:
+                for key in [k for k in fdb if k not in keep_fdb]:
+                    del fdb[key]
+                for name in by_name:
+                    allowed = new_allowed[name]
+                    for q in range(4):
+                        old_queue = egress_queues[name][q]
+                        kept = deque()
+                        for frame in old_queue:
+                            if frame["vlan"] in allowed:
+                                kept.append(frame)
+                            else:
+                                port_stats[name]["drop"] += 1
+                                vlan_stats[frame["vlan"]]["drop"] += 1
+                        egress_queues[name][q] = kept
+                for key in [k for k in bound if k not in kept_bound]:
+                    owner = bound.pop(key)
+                    dynamic[owner].discard(key)
+                # 新增 VLAN 的计数桶预建（移除的 VLAN 计数保留不动）
+                for port in new_ports:
+                    for vlan in port["allowed"]:
+                        vlan_stats.setdefault(
+                            vlan, {"rx": 0, "tx": 0, "drop": 0}
+                        )
+            # 原子替换 age/ports/storm/mirror/acl/qos/security；未受影响的
+            # FDB、绑定、安全状态、队列内容、调度、风暴时间记录与计数全部
+            # 保留，新规则自下一事件生效；已排队帧保留帧号、VLAN、队列号、
+            # 出站标签与调度位置，不重分类、不再丢弃。storm：
+            # window/limits/move_limit/hold 自下一帧参与判定，已有封锁沿
+            # 用原解除时刻（不解除、不重计时），新封锁使用当时 hold；缩短
+            # 窗口暂时无关的记录仍按历代最大 window 保留，使回滚到较长窗口
+            # 后恢复影响，阈值低于现存计数亦合法。mirror：sources/target/
+            # direction 自下一帧决定镜像副本，不追溯已处理或已入队帧
+            # （已入队帧在入队时固定出口镜像判定与目标口）。qos 变化时各
+            # 端口 WRR 重置为 q=3,rem=weights[3]，否则保留游标
             qos_changed = new_qos != qos
             age = new_age
+            ports = new_ports  # 名称/顺序/up 不变
+            by_name = {port["name"]: port for port in ports}
             window = new_storm["window"]
             limits = new_storm["limits"]
             move_limit = new_storm["move_limit"]
