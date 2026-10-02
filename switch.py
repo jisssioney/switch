@@ -168,6 +168,10 @@ class QosWireWorkLimit(Exception):
     pass
 
 
+class QosPfcWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -15239,6 +15243,940 @@ def qos_wire_work(fwd_ports, caps, queues, flows, qos, age, max_frame, delay,
     )
 
 
+# ---------------------------------------------------------------------------
+# qos-pfc-decode：在 qos-wire-decode（四队列、SP/WRR、802.3x 全局 PAUSE）
+# 之上新增 802.1Qbb 优先级流控。CONFIG 每口再加 pfc：严格递增的 0..7 子序
+# （空数组表示该口不支持 PFC）。事件仍仅 link/advance/原始帧。除全局 PAUSE
+# 外，未标记、目的 01:80:c2:00:00:01、以太类型 0x8808、操作码 0x0101、恰
+# 64 字节的好帧按 PFC 处理：两字节 class-enable 后按优先级 0..7 排八个两
+# 字节 quanta，其余字节全零，否则 malformed_pfc（计时器不变）。链路须 up
+# 且全双工，且 enable 置位的全部优先级均在入端口 pfc 允许集合内，否则
+# pfc_unsupported 且任何项都不生效。置位项非零 quanta 把该优先级截止时刻
+# 设为 t+ceil(quanta*512000/rate)，零值清除，未置位项保持不变。PFC 帧不
+# 学习、转发或入队。数据帧仍按 qos.map 入四队列；队列暂停到全局 PAUSE 与
+# “映射到该队列且在允许集合内”的有效 PFC 截止时刻的最大值。pfc_duration
+# 仅累计各优先级实际阻塞其映射队列的显式时钟区间。其余语义（坏帧分类、
+# 半双工碰撞、协商、SP/WRR、不自动排空）同 qos-wire-decode。
+# ---------------------------------------------------------------------------
+
+QOS_PFC_OPCODE = 0x0101
+
+
+def validate_qos_pfc_config(config):
+    """qos-pfc-decode 配置：qos-wire-decode 每口再加 pfc 字段。"""
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != QOS_WIRE_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    ports_doc = config["ports"]
+    if not isinstance(ports_doc, list) or not ports_doc:
+        raise InvalidInput("ports must be a non-empty list")
+    pfc_by_name = {}
+    stripped_ports = []
+    for port in ports_doc:
+        if not isinstance(port, dict) or "pfc" not in port:
+            raise InvalidInput("bad port")
+        name = port.get("name")
+        pfc = port["pfc"]
+        # pfc：列表，元素为 0..7 整数，严格递增（空数组表示不支持）
+        if (
+            not isinstance(pfc, list)
+            or not all(_is_int(p) and 0 <= p <= 7 for p in pfc)
+            or any(pfc[i] >= pfc[i + 1] for i in range(len(pfc) - 1))
+        ):
+            raise InvalidInput("bad pfc")
+        if isinstance(name, str):
+            pfc_by_name[name] = frozenset(pfc)
+        rest = {key: value for key, value in port.items() if key != "pfc"}
+        stripped_ports.append(rest)
+    # ports/age/max_frame/delay（含 rates/modes/queue_bytes/flow_control）与
+    # qos 子文档全量校验同 qos-wire-decode（剥去每口 pfc 键后逐字复用）
+    stripped = dict(config)
+    stripped["ports"] = stripped_ports
+    fwd_ports, caps, queues, flows, qos, age, max_frame, delay = (
+        validate_qos_wire_config(stripped)
+    )
+    pfc_allowed = {port["name"]: pfc_by_name[port["name"]] for port in fwd_ports}
+    return (
+        fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+        delay,
+    )
+
+
+def validate_qos_pfc_events(events, fwd_ports):
+    """qos-pfc-decode 事件：形状同 qos-wire-decode（PFC 合法性是运行期
+    结果而非输入错误）。"""
+    return validate_qos_wire_events(events, fwd_ports)
+
+
+def _decode_qos_pfc_events(events):
+    """校验后的 qos-pfc 事件对：与 qos-wire 同一纯函数解码。"""
+    return _decode_qos_wire_events(events)
+
+
+def qos_pfc(
+    fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame, delay,
+    events, work_limit=None, observer=None,
+):
+    """qos-pfc-decode 仿真：qos-wire 四队列模型加 802.1Qbb 逐优先级门控。
+
+    work_limit 非 None 时按计费点累计 W（初值 P），首次超过即抛
+    QosPfcWorkLimit；预演与正式仿真共用本函数。
+    """
+    order = {port["name"]: i for i, port in enumerate(fwd_ports)}
+    by_name = {port["name"]: port for port in fwd_ports}
+    qos_map = qos["map"]
+    cap = qos["cap"]
+    sched_mode = qos["mode"]
+    weights = qos["weights"]
+    drop_mode = qos["drop"]
+    weight_total = sum(weights)
+    queue_limits = [-(-(cap * w) // weight_total) for w in weights]
+    # qi -> 映射到该队列的 802.1Q 优先级集合
+    queue_prios = [frozenset(p for p in range(8) if qos_map[p] == qi)
+                   for qi in range(4)]
+    committed = {name: ("down",) for name in by_name}
+    pending = {}
+    fdb = {}
+    waitq = {
+        name: [deque(), deque(), deque(), deque()] for name in by_name
+    }
+    head = {name: None for name in by_name}
+    qframes = {name: [0, 0, 0, 0] for name in by_name}
+    qbytes = {name: [0, 0, 0, 0] for name in by_name}
+    txq = {name: [0, 0, 0, 0] for name in by_name}
+    dropq = {name: [0, 0, 0, 0] for name in by_name}
+    occupied = {name: 0 for name in by_name}
+    wrr_state = {name: [3, weights[3]] for name in by_name}
+    # 全局 PAUSE（802.3x）：墙钟区间模型与 qos-wire-decode 逐字一致。
+    pause_until = {name: None for name in by_name}
+    hold_began = {name: None for name in by_name}
+    pause_ns = {name: 0 for name in by_name}
+    # PFC 截止时刻仅用于门控；各优先级实际阻塞时长在末态由 gate_log（门控
+    # 状态变更点）与实际发送区间离线扫描：显式门控区间减去在发不抢占帧的
+    # 占用区间，避免跨事件区间边界误差。
+    pfc_until = {name: [None] * 8 for name in by_name}
+    gate_log = {name: [(0, None, (None,) * 8)] for name in by_name}
+    # 每次有效非零 PFC 置位记录 (到达时刻, 在发帧完成基准, 截止时刻)，供
+    # 末态扫描把“在发不抢占帧占用”锚到该优先级自身的激活点。
+    pfc_activations = {name: [] for name in by_name}
+    pfc_ns = {name: [0] * 8 for name in by_name}
+    stats = {
+        name: {
+            "rx_frames": 0,
+            "rx_bytes": 0,
+            "tx_frames": 0,
+            "tx_bytes": 0,
+            "collision_frames": 0,
+            "collision_bytes": 0,
+            "queue_full_frames": 0,
+            "queue_full_bytes": 0,
+            "quota_full_frames": 0,
+            "quota_full_bytes": 0,
+            "link_down_frames": 0,
+            "link_down_bytes": 0,
+            "pause_frames": 0,
+            "pause_unsupported_frames": 0,
+            "pause_duration_ns": 0,
+            "pfc_frames": 0,
+            "pfc_unsupported_frames": 0,
+            "pfc_duration_ns": [0] * 8,
+        }
+        for name in by_name
+    }
+    results = []
+    if observer is not None:
+        observer["items"] = []
+    work = len(fwd_ports)
+    if work_limit is not None and work > work_limit:
+        raise QosPfcWorkLimit()
+
+    def charge(n=1):
+        nonlocal work
+        work += n
+        if work_limit is not None and work > work_limit:
+            raise QosPfcWorkLimit()
+
+    def is_up(name):
+        return name not in pending and committed[name][0] == "up"
+
+    def queue_gate(name, qi, now):
+        """队列 qi 在 now 的暂停截止：全局 PAUSE 与有效 PFC 最大值。
+
+        有效 PFC 截止仅计入映射到 qi 且在该口 pfc 允许集合内的优先级；
+        已到期（<= now）的截止视为 None。
+        """
+        gate = pause_until[name]
+        if gate is not None and gate <= now:
+            gate = None
+        allowed = pfc_allowed[name]
+        for prio in queue_prios[qi]:
+            if prio not in allowed:
+                continue
+            until = pfc_until[name][prio]
+            if until is not None and until > now and (
+                gate is None or until > gate
+            ):
+                gate = until
+        return gate
+
+    def log_gate(name, t):
+        # 仅在门控状态（全局截止或任一 PFC 截止）实际变化时记录快照；截止
+        # 到期点另行并入末态扫描断点，故恒定状态期间无需逐事件记录。
+        snapshot = (t, pause_until[name], tuple(pfc_until[name]))
+        log = gate_log[name]
+        if log[-1][0] == t:
+            if (log[-1][1], log[-1][2]) != (snapshot[1], snapshot[2]):
+                log[-1] = snapshot
+        elif (log[-1][1], log[-1][2]) != (snapshot[1], snapshot[2]):
+            log.append(snapshot)
+
+    def accrue_pause(name, now):
+        # 全局 PAUSE 墙钟区间，口径同 qos-wire-decode 的 accrue_hold
+        began = hold_began[name]
+        until = pause_until[name]
+        if until is not None and now >= until:
+            if began is not None and until > began:
+                pause_ns[name] += until - began
+            hold_began[name] = None
+            pause_until[name] = None
+            log_gate(name, until)  # 到期清除也是门控变更点
+            return
+        if began is None or now <= began:
+            return
+        pause_ns[name] += now - began
+        hold_began[name] = now if until is not None else None
+
+    def settle_negotiations(t):
+        settled = 0
+        for port in fwd_ports:
+            name = port["name"]
+            if name in pending and pending[name][2] <= t:
+                rate, mode, _ = pending.pop(name)
+                committed[name] = ("up", rate, mode)
+                settled += 1
+        return settled
+
+    def pick_waiting(name, now):
+        """发送器空闲时按 sp/wrr 选下一副本并置为队头；无等待副本 False。
+
+        开始时刻不早于副本锚点、所属队列的全局 PAUSE/PFC 门控时刻。
+        """
+        if sched_mode == "sp":
+            q = next((q for q in (3, 2, 1, 0) if waitq[name][q]), None)
+            if q is None:
+                return False
+            copy = waitq[name][q].popleft()
+        else:
+            q, rem = wrr_state[name]
+            if not any(waitq[name][q0] for q0 in range(4)):
+                return False
+            while not waitq[name][q]:
+                q = (q - 1) % 4
+                rem = weights[q]
+            copy = waitq[name][q].popleft()
+            rem -= 1
+            if rem == 0 or not waitq[name][q]:
+                q = (q - 1) % 4
+                rem = weights[q]
+            wrr_state[name] = [q, rem]
+        start = max(now, copy["ready"])
+        gate = queue_gate(name, copy["queue"], now)
+        if gate is not None and start < gate:
+            start = gate
+        copy["start"] = start
+        copy["end"] = start + copy["duration"]
+        head[name] = copy
+        return True
+
+    def settle_transmissions(t):
+        while True:
+            best = None
+            for name in by_name:
+                copy = head[name]
+                if copy is not None and copy["end"] <= t:
+                    cand = (copy["end"], order[name], name)
+                    if best is None or cand < best:
+                        best = cand
+            if best is None:
+                return
+            name = best[2]
+            copy = head[name]
+            qi = copy["queue"]
+            head[name] = None
+            occupied[name] -= copy["bytes"]
+            qframes[name][qi] -= 1
+            qbytes[name][qi] -= copy["bytes"]
+            txq[name][qi] += 1
+            stats[name]["tx_frames"] += 1
+            stats[name]["tx_bytes"] += copy["bytes"]
+            results.append(
+                {"t": copy["end"], "port": name,
+                 "start": copy["start"], "bytes": copy["bytes"],
+                 "queue": qi}
+            )
+            charge()
+            pick_waiting(name, copy["end"])
+
+    def settle(t):
+        negotiated = settle_negotiations(t)
+        settle_transmissions(t)
+        for name in by_name:
+            accrue_pause(name, t)
+            log_gate(name, t)
+        return negotiated
+
+    def apply_link(t, port, admin, peer, rates, modes):
+        if not admin or not peer:
+            target = ("down",)
+        else:
+            local_rates, local_modes = caps[port]
+            common_rates = [r for r in local_rates if r in rates]
+            common_modes = [m for m in local_modes if m in modes]
+            if not common_rates or not common_modes:
+                target = ("bad",)
+            else:
+                target = (
+                    "up",
+                    max(common_rates),
+                    "full" if "full" in common_modes else "half",
+                )
+        before_up = port not in pending and committed[port][0] == "up"
+        current = pending.get(port)
+        effective = (
+            ("up", current[0], current[1])
+            if current is not None
+            else committed[port]
+        )
+        if target == effective:
+            applied = False
+        elif target[0] == "up":
+            pending[port] = (target[1], target[2], t + delay)
+            applied = True
+        else:
+            pending.pop(port, None)
+            committed[port] = target
+            applied = True
+        current = pending.get(port)
+        if current is not None:
+            state, rate, mode = "wait", None, None
+            now_up = False
+        else:
+            now = committed[port]
+            if now[0] == "up":
+                state, rate, mode = "up", now[1], now[2]
+                now_up = True
+            else:
+                state, rate, mode = now[0], None, None
+                now_up = False
+        left_up = before_up and not now_up
+        if left_up:
+            for key in [k for k, (p, _) in fdb.items() if p == port]:
+                del fdb[key]
+            pause_until[port] = None
+            hold_began[port] = None
+            for prio in range(8):  # 离 up 清全部 PFC 截止
+                pfc_until[port][prio] = None
+            log_gate(port, t)
+            dropped = []
+            if head[port] is not None:
+                dropped.append(head[port])
+                head[port] = None
+            for qi in range(4):
+                dq = waitq[port][qi]
+                while dq:
+                    dropped.append(dq.popleft())
+            for copy in dropped:
+                qi = copy["queue"]
+                occupied[port] -= copy["bytes"]
+                qframes[port][qi] -= 1
+                qbytes[port][qi] -= copy["bytes"]
+                dropq[port][qi] += 1
+                stats[port]["link_down_frames"] += 1
+                stats[port]["link_down_bytes"] += copy["bytes"]
+                results.append(
+                    {
+                        "t": t,
+                        "port": port,
+                        "start": copy.get("start", copy["ready"]),
+                        "bytes": copy["bytes"],
+                        "queue": qi,
+                        "reason": "link_down",
+                    }
+                )
+                charge()
+        results.append(
+            {"t": t, "port": port, "state": state, "rate": rate, "mode": mode}
+        )
+        charge()
+        return state, rate, mode, applied
+
+    def reschedule(port, ct):
+        for qi in range(4):
+            for copy in waitq[port][qi]:
+                copy["ready"] = ct
+                charge()
+
+    def tx_base(port, t):
+        # 在发帧（已开始）完成时刻；无在发帧或未开始队头时为 t
+        inflight = head[port]
+        if inflight is not None and inflight["start"] <= t:
+            return inflight["end"]
+        return t
+
+    def reanchor(port, t):
+        """门控变更后按各队列当前门控（全局 PAUSE 与有效 PFC 最大值）重锚
+        未开始副本；在发帧不动，仅实际后移计费。无门控时锚点为在发帧完成
+        时刻（同 qos-wire-decode 零值恢复），同队列副本共锚保 FIFO 串行。
+        """
+        base = tx_base(port, t)
+        hp = head[port]
+        if hp is not None and hp["start"] > t:  # 未开始队头同等待副本处理
+            gate = queue_gate(port, hp["queue"], t)
+            anchor = base if gate is None else max(base, gate)
+            if anchor > hp["start"]:
+                charge()
+            hp["start"] = anchor
+            hp["end"] = anchor + hp["duration"]
+        for qi in range(4):
+            gate = queue_gate(port, qi, t)
+            anchor = base if gate is None else max(base, gate)
+            for copy in waitq[port][qi]:
+                if anchor > copy["ready"]:
+                    charge()
+                copy["ready"] = anchor
+        return base
+
+    indexed = _link_wire_indexed(fwd_ports, events)
+
+    def note_frame(begin):
+        if observer is not None:
+            observer["items"].append(
+                {
+                    "kind": "frame",
+                    "t": t,
+                    "applied": True,
+                    "output": list(results[begin:]),
+                }
+            )
+
+    for _, item in indexed:
+        t = item[1]
+        begin = len(results)
+        negotiated = settle(t)
+        charge()
+        kind = item[0]
+        if kind == "advance":
+            applied = negotiated > 0 or len(results) > begin
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "advance",
+                        "t": t,
+                        "applied": applied,
+                        "output": list(results[begin:]),
+                    }
+                )
+            continue
+        if kind == "link":
+            _, t, port, admin, peer, rates, modes = item
+            _, _, _, applied = apply_link(t, port, admin, peer, rates, modes)
+            if observer is not None:
+                observer["items"].append(
+                    {
+                        "kind": "link",
+                        "t": t,
+                        "applied": applied,
+                        "output": list(results[begin:]),
+                    }
+                )
+            continue
+        (
+            _,
+            t,
+            port_name,
+            raw,
+            (_, _, src, dst, tag, length, fcs, alignment),
+        ) = item
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        ingress = by_name[port_name]
+        inbound_wire = length + LINK_WIRE_OVERHEAD
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif not alignment:
+            cls = "alignment"
+        elif not fcs:
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        # MAC 控制帧身份（未标记 + 慢协议组播 + 0x8808）先于半双工碰撞；
+        # 操作码区分全局 PAUSE（0x0001）与 PFC（0x0101）
+        is_mac_control = (
+            cls == "good"
+            and tag is None
+            and dst == LINK_FLOW_PAUSE_DST
+            and len(raw) >= 16
+            and (raw[12] << 8 | raw[13]) == LINK_FLOW_PAUSE_ETHERTYPE
+        )
+        opcode = (
+            ((raw[14] << 8) | raw[15]) if is_mac_control else None
+        )
+        is_pause_shape = is_mac_control and opcode == LINK_FLOW_PAUSE_OPCODE
+        is_pfc_shape = is_mac_control and opcode == QOS_PFC_OPCODE
+        hp = head[port_name]
+        colliding = (
+            not is_mac_control
+            and hp is not None
+            and is_up(port_name)
+            and committed[port_name][2] == "half"
+            and hp["start"] <= t < hp["end"]
+        )
+        if colliding:
+            copy = head[port_name]
+            qi = copy["queue"]
+            head[port_name] = None
+            occupied[port_name] -= copy["bytes"]
+            qframes[port_name][qi] -= 1
+            qbytes[port_name][qi] -= copy["bytes"]
+            dropq[port_name][qi] += 1
+            key = (copy["fvlan"], copy["fsrc"])
+            if fdb.get(key) == [copy["fing"], copy["fseen"]]:
+                del fdb[key]
+            stats[port_name]["collision_frames"] += 2
+            stats[port_name]["collision_bytes"] += (
+                inbound_wire + copy["bytes"]
+            )
+            results.append(
+                {
+                    "t": t,
+                    "port": port_name,
+                    "start": copy["start"],
+                    "bytes": copy["bytes"],
+                    "queue": qi,
+                    "inbound": inbound_wire,
+                    "reason": "collision",
+                }
+            )
+            charge()
+            reschedule(port_name, t)
+            pick_waiting(port_name, t)
+            note_frame(begin)
+            continue
+        stats[port_name]["rx_frames"] += 1
+        stats[port_name]["rx_bytes"] += inbound_wire
+        if cls != "good":
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if is_pause_shape:
+            reserved_ok = (
+                length == FRAME_CHECK_RUNT_LENGTH
+                and len(raw) >= 60
+                and not any(raw[18:length - 4])
+            )
+            if length != FRAME_CHECK_RUNT_LENGTH or not reserved_ok:
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "malformed_pause"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            stats[port_name]["pause_frames"] += 1
+            quanta = (raw[16] << 8) | raw[17]
+            if not (
+                is_up(port_name)
+                and committed[port_name][2] == "full"
+                and flows[port_name]
+            ):
+                stats[port_name]["pause_unsupported_frames"] += 1
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "pause_unsupported"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            if quanta == 0:
+                # 零值：旧全局暂停区间已在 settle(t) 累计到 t；清除后 PFC
+                # 门控可能继续生效，故按当前门控重锚并记录门控变更点。
+                pause_until[port_name] = None
+                hold_began[port_name] = None
+                reanchor(port_name, t)
+                log_gate(port_name, t)
+                results.append(
+                    {"t": t, "port": port_name, "action": "pause",
+                     "quanta": 0, "until": None}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            rate = committed[port_name][1]
+            until = t + (
+                quanta * LINK_FLOW_PAUSE_QUANTA_TICKS + rate - 1
+            ) // rate
+            pause_until[port_name] = until
+            base = reanchor(port_name, t)
+            hold_began[port_name] = base if until > base else None
+            log_gate(port_name, t)
+            results.append(
+                {"t": t, "port": port_name, "action": "pause",
+                 "quanta": quanta, "until": until}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if is_pfc_shape:
+            # PFC 帧本地终止：恰 64 字节；16..17 class-enable，18..33 为按
+            # 优先级 0..7 排列的八个两字节 quanta，34..length-4 全零。
+            enable = (raw[16] << 8) | raw[17]
+            pquanta = [
+                (raw[18 + 2 * p] << 8) | raw[18 + 2 * p + 1]
+                for p in range(8)
+            ]
+            body_ok = (
+                length == FRAME_CHECK_RUNT_LENGTH
+                and not any(raw[34:length - 4])
+            )
+            if not body_ok:
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "malformed_pfc"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            enabled = [p for p in range(8) if (enable >> (7 - p)) & 1]
+            stats[port_name]["pfc_frames"] += 1
+            allowed = pfc_allowed[port_name]
+            if not (
+                is_up(port_name)
+                and committed[port_name][2] == "full"
+                and all(p in allowed for p in enabled)
+            ):
+                # down/wait/bad/half 或含未允许优先级：消费但任何项不生效
+                stats[port_name]["pfc_unsupported_frames"] += 1
+                results.append(
+                    {"t": t, "port": port_name,
+                     "action": "pfc_unsupported"}
+                )
+                charge()
+                note_frame(begin)
+                continue
+            rate = committed[port_name][1]
+            base = tx_base(port_name, t)
+            for prio in enabled:
+                pq = pquanta[prio]
+                if pq == 0:
+                    pfc_until[port_name][prio] = None
+                else:
+                    until = t + (
+                        pq * LINK_FLOW_PAUSE_QUANTA_TICKS + rate - 1
+                    ) // rate
+                    pfc_until[port_name][prio] = until
+                    pfc_activations[port_name].append(
+                        (prio, t, base, until)
+                    )
+            reanchor(port_name, t)
+            log_gate(port_name, t)
+            items = []
+            for prio in enabled:  # 按优先级升序输出
+                items.append(
+                    {
+                        "priority": prio,
+                        "quanta": pquanta[prio],
+                        "until": pfc_until[port_name][prio],
+                    }
+                )
+            results.append(
+                {"t": t, "port": port_name, "action": "pfc",
+                 "items": items}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if is_mac_control:
+            # 慢协议组播 + 0x8808 但操作码既非 PAUSE 也非 PFC：口径同
+            # qos-wire-decode，按 malformed_pause 本地终止，不学习/转发。
+            results.append(
+                {"t": t, "port": port_name, "action": "malformed_pause"}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        if tag is None:
+            vlan = ingress["pvid"]
+            rejected = False
+            tagged_ingress = False
+        else:
+            vlan = tag
+            tagged_ingress = True
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:
+            results.append(
+                {"t": t, "class": cls, "action": "drop", "ports": []}
+            )
+            charge()
+            note_frame(begin)
+            continue
+        egress = []
+        action = "drop"
+        if is_up(port_name):
+            fdb[(vlan, src)] = [port_name, t]
+            hit = None if dst == BROADCAST_MAC else fdb.get((vlan, dst))
+            if hit is not None and hit[0] != port_name:
+                target_name = hit[0]
+                if (
+                    is_up(target_name)
+                    and vlan in by_name[target_name]["allowed"]
+                ):
+                    egress = [target_name]
+                    action = "unicast"
+            elif hit is None:
+                egress = [
+                    port["name"]
+                    for port in fwd_ports
+                    if vlan in port["allowed"]
+                    and is_up(port["name"])
+                    and port["name"] != port_name
+                ]
+                if egress:
+                    action = "flood"
+        out_ports = []
+        copies = []
+        for name in egress:
+            out_vlan = None if vlan in by_name[name]["untagged"] else vlan
+            out_ports.append({"name": name, "vlan": out_vlan})
+            frame_len = length + (
+                4 if not tagged_ingress and out_vlan is not None else
+                -4 if tagged_ingress and out_vlan is None else 0
+            )
+            wire_bytes = frame_len + LINK_WIRE_OVERHEAD
+            copies.append((name, out_vlan, wire_bytes))
+        results.append(
+            {"t": t, "class": cls, "action": action, "ports": out_ports}
+        )
+        charge()
+        qi = qos_map[_qos_wire_priority(raw)]
+        qlimit = cap if drop_mode == "tail" else queue_limits[qi]
+        for name, out_vlan, wire_bytes in copies:
+            egr_rate = committed[name][1]
+            duration = (wire_bytes * 8000 + egr_rate - 1) // egr_rate
+            if occupied[name] + wire_bytes > queues[name]:
+                stats[name]["queue_full_frames"] += 1
+                stats[name]["queue_full_bytes"] += wire_bytes
+                dropq[name][qi] += 1
+                results.append(
+                    {
+                        "t": t,
+                        "port": name,
+                        "vlan": out_vlan,
+                        "bytes": wire_bytes,
+                        "queue": qi,
+                        "reason": "queue_full",
+                    }
+                )
+                charge()
+                continue
+            if qbytes[name][qi] + wire_bytes > qlimit:
+                stats[name]["quota_full_frames"] += 1
+                stats[name]["quota_full_bytes"] += wire_bytes
+                dropq[name][qi] += 1
+                results.append(
+                    {
+                        "t": t,
+                        "port": name,
+                        "vlan": out_vlan,
+                        "bytes": wire_bytes,
+                        "queue": qi,
+                        "reason": "quota_full",
+                    }
+                )
+                charge()
+                continue
+            hp = head[name]
+            ready = t if hp is None else max(t, hp["end"])
+            same_tail = waitq[name][qi][-1] if waitq[name][qi] else None
+            if same_tail is not None:
+                ready = max(ready, same_tail["ready"] + same_tail["duration"])
+            gate = queue_gate(name, qi, t)
+            if gate is not None and ready < gate:
+                ready = gate
+            copy = {
+                "egress": name,
+                "vlan": out_vlan,
+                "bytes": wire_bytes,
+                "duration": duration,
+                "ready": ready,
+                "start": None,
+                "end": 0,
+                "queue": qi,
+                "fvlan": vlan,
+                "fsrc": src,
+                "fing": port_name,
+                "fseen": t,
+            }
+            waitq[name][qi].append(copy)
+            qframes[name][qi] += 1
+            qbytes[name][qi] += wire_bytes
+            occupied[name] += wire_bytes
+            results.append(
+                {"t": t, "port": name, "vlan": out_vlan,
+                 "bytes": wire_bytes, "queue": qi}
+            )
+            charge()
+            if head[name] is None:
+                pick_waiting(name, t)
+        note_frame(begin)
+    # ------------------------------------------------------------------
+    # 末态离线扫描各优先级实际阻塞时长。对每口每队列，在门控状态恒定的时间
+    # 段上求门控决定者（全局 PAUSE 或某个允许的 PFC 优先级）；仅决定者为
+    # PFC 的连续显式区间计入对应优先级。区间起点若落在该优先级激活时刻仍在
+    # 发（不抢占）帧的 [t0, base) 内，减去相应交叠。
+    # ------------------------------------------------------------------
+    horizon = max((item[1] for item in events), default=0)
+    for name in by_name:
+        log = [(ts, g, tuple(pf)) for ts, g, pf in gate_log[name]
+               if ts <= horizon]
+        # 末态快照：最后事件后仍存活的截止计入到 horizon
+        log.append((
+            horizon,
+            pause_until[name],
+            tuple(pfc_until[name]),
+        ))
+        log.sort(key=lambda e: e[0])
+        # 合并同时刻快照（保留最后的状态）
+        merged = []
+        for entry in log:
+            if merged and merged[-1][0] == entry[0]:
+                merged[-1] = entry
+            else:
+                merged.append(entry)
+        log = merged
+        # 断点：门控快照点与各存活截止的到期时刻
+        breaks = {0, horizon}
+        for ts, g, pf in log:
+            breaks.add(ts)
+            if g is not None:
+                breaks.add(g)
+            for prio in pfc_allowed[name]:
+                if pf[prio] is not None:
+                    breaks.add(pf[prio])
+        breaks = sorted(x for x in breaks if 0 <= x <= horizon)
+
+        for qi in range(4):
+            periods = []  # [(prio, a, b)]，相邻同决定者段
+            current = None  # [prio, a, b]
+            state_index = 0
+            for idx in range(len(breaks) - 1):
+                a, b = breaks[idx], breaks[idx + 1]
+                if a == b:
+                    continue
+                while (
+                    state_index + 1 < len(log)
+                    and log[state_index + 1][0] <= a
+                ):
+                    state_index += 1
+                _, g, pf = log[state_index]
+                gate = g if g is not None and g > a else None
+                decider = None
+                best = gate
+                for prio in queue_prios[qi]:
+                    if prio not in pfc_allowed[name]:
+                        continue
+                    dline = pf[prio]
+                    if dline is not None and dline > a and (
+                        best is None or dline > best
+                    ):
+                        best = dline
+                        decider = prio
+                if decider is None:
+                    if current is not None:
+                        periods.append(tuple(current))
+                        current = None
+                elif current is not None and current[0] == decider:
+                    current[2] = b
+                else:
+                    if current is not None:
+                        periods.append(tuple(current))
+                    current = [decider, a, b]
+            if current is not None:
+                periods.append(tuple(current))
+            for prio, a, b in periods:
+                blocked = b - a
+                # 在发不抢占帧的占用：减去该优先级自身激活点 [t0,base) 与
+                # 本决定区间的交叠（交接点处的在发帧不计入本优先级）。
+                for pr, t0, abase, _dl in pfc_activations[name]:
+                    if pr == prio:
+                        lo = max(a, t0)
+                        hi = min(b, abase)
+                        if hi > lo:
+                            blocked -= hi - lo
+                if blocked > 0:
+                    pfc_ns[name][prio] += blocked
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": name,
+                "queues": [
+                    {
+                        "frames": qframes[name][qi],
+                        "bytes": qbytes[name][qi],
+                        "sent": txq[name][qi],
+                        "dropped": dropq[name][qi],
+                    }
+                    for qi in range(4)
+                ],
+                "rx_frames": stats[name]["rx_frames"],
+                "rx_bytes": stats[name]["rx_bytes"],
+                "tx_frames": stats[name]["tx_frames"],
+                "tx_bytes": stats[name]["tx_bytes"],
+                "collision_frames": stats[name]["collision_frames"],
+                "collision_bytes": stats[name]["collision_bytes"],
+                "queue_full_frames": stats[name]["queue_full_frames"],
+                "queue_full_bytes": stats[name]["queue_full_bytes"],
+                "quota_full_frames": stats[name]["quota_full_frames"],
+                "quota_full_bytes": stats[name]["quota_full_bytes"],
+                "link_down_frames": stats[name]["link_down_frames"],
+                "link_down_bytes": stats[name]["link_down_bytes"],
+                "pause_frames": stats[name]["pause_frames"],
+                "pause_unsupported_frames":
+                    stats[name]["pause_unsupported_frames"],
+                "pause_duration_ns": pause_ns[name],
+                "pfc_frames": stats[name]["pfc_frames"],
+                "pfc_unsupported_frames":
+                    stats[name]["pfc_unsupported_frames"],
+                "pfc_duration_ns": list(pfc_ns[name]),
+            }
+            for name in by_name
+        ],
+    }
+
+
+def qos_pfc_work(fwd_ports, caps, queues, flows, qos, pfc_allowed, age,
+                 max_frame, delay, events, limit):
+    """qos-pfc-decode 工作量预演：独立状态跑同一仿真，无副作用、不产出。
+
+    与 qos_pfc 同一计费公式（W 初值 P，每输入事件、每条 results 记录、
+    碰撞/PAUSE/PFC 后每个实际后移副本各计 1），等于上限合法，首次超过即
+    抛 QosPfcWorkLimit。
+    """
+    qos_pfc(
+        fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+        delay, events, work_limit=limit,
+    )
+
+
 STP_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "max_frame")
 )
@@ -16392,6 +17330,7 @@ DEFAULT_MAX_LINK_FORWARD_WORK = 10000000
 DEFAULT_MAX_LINK_WIRE_WORK = 10000000
 DEFAULT_MAX_LINK_FLOW_WORK = 10000000
 DEFAULT_MAX_QOS_WIRE_WORK = 10000000
+DEFAULT_MAX_QOS_PFC_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -21530,6 +22469,70 @@ def _cmd_qos_wire_decode(
     return 0
 
 
+def _cmd_qos_pfc_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_qos_pfc_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # CONFIG 在 qos-wire-decode 基础上每口再加 pfc；EVENTS 形状不变；
+        # 先全量校验与解码，再以独立状态无副作用工作量预演，最后正式仿真
+        # （无部分输出）
+        (
+            fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+            delay,
+        ) = validate_qos_pfc_config(config)
+        raw_events = validate_qos_pfc_events(events_doc, fwd_ports)
+        events = _decode_qos_pfc_events(raw_events)
+        qos_pfc_work(
+            fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+            delay, events, max_qos_pfc_work,
+        )
+        result = qos_pfc(
+            fwd_ports, caps, queues, flows, qos, pfc_allowed, age, max_frame,
+            delay, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except QosPfcWorkLimit:
+        _fail("qos_pfc_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 SUBCOMMANDS = frozenset((
     "record",
     "replay",
@@ -21564,6 +22567,7 @@ SUBCOMMANDS = frozenset((
     "link-wire-decode",
     "link-flow-decode",
     "qos-wire-decode",
+    "qos-pfc-decode",
     "fdb",
     "forward",
     "forward-static",
@@ -22270,6 +23274,29 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_qos_wire_decode(args[1], args[2], *limits)
+    if args[:1] == ["qos-pfc-decode"]:
+        # qos-pfc-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_QOS_PFC_WORK]]]：
+        #   参数、资源与错误契约沿用 qos-wire-decode，可选上限仅 0、2、4、5
+        #   项；工作量超限错误名为 qos_pfc_work_limit
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_QOS_PFC_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_qos_pfc_decode(args[1], args[2], *limits)
     if args[:1] == ["qos-decode"]:
         # qos-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_QOS_WORK]]]：
