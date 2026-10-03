@@ -18104,6 +18104,9 @@ def stp_decode(
 # igmp-snoop-decode：在 stp-decode（stp-check 七键）配置上追加 igmp 对象
 IGMP_SNOOP_CONFIG_KEYS = STP_CHECK_CONFIG_KEYS | frozenset(("igmp",))
 IGMP_KEYS = frozenset(("membership_age", "router_ports"))
+IGMP_ENHANCED_KEYS = frozenset(
+    ("membership_age", "router_ports", "router_age")
+)
 IPV4_ETHER_TYPE = 0x0800
 IP_PROTOCOL_IGMP = 2
 IGMP_TYPE_QUERY_V2 = 0x11
@@ -18139,7 +18142,11 @@ def validate_igmp_snoop_config(config):
         )
     )
     igmp = config["igmp"]
-    if not isinstance(igmp, dict) or frozenset(igmp) != IGMP_KEYS:
+    if not isinstance(igmp, dict) or frozenset(igmp) not in (
+        IGMP_KEYS, IGMP_ENHANCED_KEYS
+    ):
+        # 两键对象为兼容模式（校验与行为不变）；三键对象启用按 VLAN
+        # 动态发现组播路由端口；其余形状（含未知键）即非法
         raise InvalidInput("bad igmp")
     membership_age = igmp["membership_age"]
     if not _is_int(membership_age) or membership_age <= 0:
@@ -18153,9 +18160,16 @@ def validate_igmp_snoop_config(config):
             raise InvalidInput("bad igmp router port")
     if len(set(router_ports)) != len(router_ports):  # 端口名不重复
         raise InvalidInput("bad igmp router_ports")
+    # 两键对象缺省为兼容模式（router_age 缺省 None）；三键对象启用增强，
+    # router_age 必须为非布尔正整数（null/布尔/非正整数即非法）
+    router_age = igmp.get("router_age") if "router_age" in igmp else None
+    if "router_age" in igmp and (
+        not _is_int(router_age) or router_age <= 0
+    ):
+        raise InvalidInput("bad igmp router_age")
     return (
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, tuple(router_ports),
+        membership_age, tuple(router_ports), router_age,
     )
 
 
@@ -18407,7 +18421,7 @@ def igmp_snoop_work(bridges, links, ports, events, limit):
 
 def igmp_snoop_decode(
     bridges, links, delay, bridge_name, ports, age, max_frame,
-    membership_age, router_ports, events, observer=None,
+    membership_age, router_ports, events, router_age=None, observer=None,
 ):
     """在 stp-decode 转发/学习/统计语义上增加 IGMPv2/v3 snooping。
 
@@ -18424,6 +18438,16 @@ def igmp_snoop_decode(
     一致且有成员匹配源过滤条件时仅发往匹配成员与路由端口；其余组播沿用
     泛洪。协议号 2 但 IGMP 非法的帧固定 igmp_invalid、空 ports、计 drop
     且不改任何状态。observer 语义同 stp-check。
+
+    router_age 非 None 时为增强模式：通过长度、FCS、协议报文、VLAN 准入与
+    STP forwarding 全部检查的合法 IGMP Query 把入端口登记为该帧 VLAN 的
+    动态路由端口，过期时刻 t+router_age，同 VLAN 同端口再收有效 Query 时
+    仅刷新该 VLAN 项；静态 router_ports 收到 Query 不产生重复动态项。
+    每个事件前删除 expires<=t 的动态项；链路断开或端口退出 forwarding 时
+    立即清除该端口全部动态项；坏帧、非法查询、准入拒绝及 discarding/
+    learning 端口均不改变该状态。Report、Leave 与源过滤组播数据的路由目标
+    取静态项与当前 VLAN 未过期动态项的并集；兼容模式（router_age 为
+    None）行为与输出保持不变，routers 恒为空数组。
     """
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
@@ -18436,6 +18460,8 @@ def igmp_snoop_decode(
     # (vlan, group) -> {port_name: int 过期时刻或 v3 过滤 dict}
     membership = {}
     router_set = set(router_ports)
+    # 增强模式动态路由端口：vlan -> {port_name: expires}；兼容模式恒为空
+    dynamic_routers = {}
     port_stats = {
         port["name"]: {
             "rx": 0,
@@ -18592,12 +18618,32 @@ def igmp_snoop_decode(
             if not table:
                 del membership[key]
 
+    def purge_dynamic_routers(t):
+        """每个事件前删除 expires<=t 的动态路由端口项。"""
+        for vlan in [
+            vlan
+            for vlan, table in dynamic_routers.items()
+            if any(expires <= t for expires in table.values())
+        ]:
+            table = dynamic_routers[vlan]
+            for port_name in [
+                name for name, expires in table.items() if expires <= t
+            ]:
+                del table[port_name]
+            if not table:
+                del dynamic_routers[vlan]
+
+    def router_targets(vlan):
+        """静态 router_ports 与该 VLAN 未过期动态项的并集。"""
+        return router_set | set(dynamic_routers.get(vlan, ()))
+
     converge(0)
     for item in events:
         t = item[1]
         for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
             del fdb[key]
         purge_expired(t)  # 每个事件前删除 expires<=t 的成员
+        purge_dynamic_routers(t)
         if item[0] == "link":
             _, t, lid, up = item
             applied = by_id[lid]["up"] != up  # up 实际改变才 applied
@@ -18617,6 +18663,15 @@ def igmp_snoop_decode(
                         del table[name]
                         if not table:
                             del membership[key]
+                # 立即清除该端口在全部 VLAN 的动态路由端口项
+                for vlan in [
+                    vlan
+                    for vlan, table in dynamic_routers.items()
+                    if name in table
+                ]:
+                    del dynamic_routers[vlan][name]
+                    if not dynamic_routers[vlan]:
+                        del dynamic_routers[vlan]
             if observer is not None:  # 链路项：output 恒 None
                 observer["items"].append(
                     {"kind": "link", "t": t, "applied": applied,
@@ -18723,7 +18778,9 @@ def igmp_snoop_decode(
                     if not table:
                         del membership[(vlan, group)]
                 routers = [
-                    name for name in eligible if name in router_set
+                    name
+                    for name in eligible
+                    if name in router_targets(vlan)
                 ]
                 egress = routers if routers else eligible
                 action = "igmpv3_report"
@@ -18734,7 +18791,9 @@ def igmp_snoop_decode(
                         t + membership_age
                     )
                     routers = [
-                        name for name in eligible if name in router_set
+                        name
+                        for name in eligible
+                        if name in router_targets(vlan)
                     ]
                     egress = routers if routers else eligible
                     action = "igmp_report"
@@ -18745,11 +18804,20 @@ def igmp_snoop_decode(
                         if not table:
                             del membership[(vlan, group)]
                     routers = [
-                        name for name in eligible if name in router_set
+                        name
+                        for name in eligible
+                        if name in router_targets(vlan)
                     ]
                     egress = routers if routers else eligible
                     action = "igmp_leave"
                 else:  # Query：始终泛洪，不改成员状态
+                    # 增强模式：有效 Query（已过长度/FCS/协议/VLAN/STP 检查）
+                    # 把入端口登记为该 VLAN 动态路由端口；静态端口不产生
+                    # 重复动态项；同 VLAN 同端口再次收到仅刷新过期时刻
+                    if router_age is not None and port_name not in router_set:
+                        dynamic_routers.setdefault(vlan, {})[port_name] = (
+                            t + router_age
+                        )
                     egress = eligible
                     action = "igmp_query"
             elif is_group:
@@ -18771,7 +18839,7 @@ def igmp_snoop_decode(
                         for name, entry in table.items()
                         if member_matches(entry, source)
                     }
-                    targets = matching | router_set
+                    targets = matching | router_targets(vlan)
                     egress = [
                         name for name in eligible if name in targets
                     ]
@@ -18845,7 +18913,19 @@ def igmp_snoop_decode(
             else:
                 members.append({"name": name, "expires": entry})
         groups.append({"vlan": vlan, "group": group, "members": members})
-    return {
+    # routers 只列动态项：VLAN 升序、同 VLAN 按端口配置顺序；每项固定键序
+    # vlan/name/expires。仅增强（三键）配置输出该键；兼容模式输出与旧版
+    # 逐字节一致，增强模式无动态项时为空数组
+    routers = []
+    for vlan in sorted(dynamic_routers):
+        for name in sorted(
+            dynamic_routers[vlan], key=lambda value: port_order[value]
+        ):
+            routers.append(
+                {"vlan": vlan, "name": name,
+                 "expires": dynamic_routers[vlan][name]}
+            )
+    output = {
         "results": results,
         "ports": [
             {
@@ -18872,6 +18952,9 @@ def igmp_snoop_decode(
         ],
         "groups": groups,
     }
+    if router_age is not None:
+        output["routers"] = routers
+    return output
 
 
 # mld-snoop-decode：与 igmp-snoop-decode 同构，在 stp-decode（stp-check
@@ -18879,6 +18962,9 @@ def igmp_snoop_decode(
 # MLDv2 Membership Report
 MLD_SNOOP_CONFIG_KEYS = STP_CHECK_CONFIG_KEYS | frozenset(("mld",))
 MLD_KEYS = frozenset(("membership_age", "router_ports"))
+MLD_ENHANCED_KEYS = frozenset(
+    ("membership_age", "router_ports", "router_age")
+)
 IPV6_ETHER_TYPE = 0x86DD
 IP_PROTOCOL_HOPOPT = 0
 IP_PROTOCOL_ICMPV6 = 58
@@ -18917,7 +19003,11 @@ def validate_mld_snoop_config(config):
         )
     )
     mld = config["mld"]
-    if not isinstance(mld, dict) or frozenset(mld) != MLD_KEYS:
+    if not isinstance(mld, dict) or frozenset(mld) not in (
+        MLD_KEYS, MLD_ENHANCED_KEYS
+    ):
+        # 两键对象为兼容模式（校验与行为不变）；三键对象启用按 VLAN
+        # 动态发现组播路由端口；其余形状（含未知键）即非法
         raise InvalidInput("bad mld")
     membership_age = mld["membership_age"]
     if not _is_int(membership_age) or membership_age <= 0:
@@ -18931,9 +19021,16 @@ def validate_mld_snoop_config(config):
             raise InvalidInput("bad mld router port")
     if len(set(router_ports)) != len(router_ports):  # 端口名不重复
         raise InvalidInput("bad mld router_ports")
+    # 两键对象缺省为兼容模式（router_age 缺省 None）；三键对象启用增强，
+    # router_age 必须为非布尔正整数（null/布尔/非正整数即非法）
+    router_age = mld.get("router_age") if "router_age" in mld else None
+    if "router_age" in mld and (
+        not _is_int(router_age) or router_age <= 0
+    ):
+        raise InvalidInput("bad mld router_age")
     return (
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, tuple(router_ports),
+        membership_age, tuple(router_ports), router_age,
     )
 
 
@@ -19189,7 +19286,7 @@ def mld_snoop_work(bridges, links, ports, events, limit):
 
 def mld_snoop_decode(
     bridges, links, delay, bridge_name, ports, age, max_frame,
-    membership_age, router_ports, events, observer=None,
+    membership_age, router_ports, events, router_age=None, observer=None,
 ):
     """在 stp-decode 转发/学习/统计语义上增加 MLDv1/v2 snooping。
 
@@ -19207,6 +19304,16 @@ def mld_snoop_decode(
     其余组播沿用泛洪。携带 Router Alert 的 ICMPv6 但 MLD 非法的帧固定
     mld_invalid、空 ports、计 drop 且不改任何状态（含不学习 MAC）。
     observer 语义同 stp-check。
+
+    router_age 非 None 时为增强模式：通过长度、FCS、协议报文、VLAN 准入与
+    STP forwarding 全部检查的合法 MLD Query 把入端口登记为该帧 VLAN 的
+    动态路由端口，过期时刻 t+router_age，同 VLAN 同端口再收有效 Query 时
+    仅刷新该 VLAN 项；静态 router_ports 收到 Query 不产生重复动态项。
+    每个事件前删除 expires<=t 的动态项；链路断开或端口退出 forwarding 时
+    立即清除该端口全部动态项；坏帧、非法查询、准入拒绝及 discarding/
+    learning 端口均不改变该状态。Report、Done 与源过滤组播数据的路由目标
+    取静态项与当前 VLAN 未过期动态项的并集；兼容模式（router_age 为
+    None）行为与输出保持不变，routers 恒为空数组。
     """
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
@@ -19219,6 +19326,8 @@ def mld_snoop_decode(
     # (vlan, group_bytes) -> {port_name: int 过期时刻或 v2 过滤 dict}
     membership = {}
     router_set = set(router_ports)
+    # 增强模式动态路由端口：vlan -> {port_name: expires}；兼容模式恒为空
+    dynamic_routers = {}
     port_stats = {
         port["name"]: {
             "rx": 0,
@@ -19375,12 +19484,32 @@ def mld_snoop_decode(
             if not table:
                 del membership[key]
 
+    def purge_dynamic_routers(t):
+        """每个事件前删除 expires<=t 的动态路由端口项。"""
+        for vlan in [
+            vlan
+            for vlan, table in dynamic_routers.items()
+            if any(expires <= t for expires in table.values())
+        ]:
+            table = dynamic_routers[vlan]
+            for port_name in [
+                name for name, expires in table.items() if expires <= t
+            ]:
+                del table[port_name]
+            if not table:
+                del dynamic_routers[vlan]
+
+    def router_targets(vlan):
+        """静态 router_ports 与该 VLAN 未过期动态项的并集。"""
+        return router_set | set(dynamic_routers.get(vlan, ()))
+
     converge(0)
     for item in events:
         t = item[1]
         for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
             del fdb[key]
         purge_expired(t)  # 每个事件前删除 expires<=t 的成员
+        purge_dynamic_routers(t)
         if item[0] == "link":
             _, t, lid, up = item
             applied = by_id[lid]["up"] != up  # up 实际改变才 applied
@@ -19400,6 +19529,15 @@ def mld_snoop_decode(
                         del table[name]
                         if not table:
                             del membership[key]
+                # 立即清除该端口在全部 VLAN 的动态路由端口项
+                for vlan in [
+                    vlan
+                    for vlan, table in dynamic_routers.items()
+                    if name in table
+                ]:
+                    del dynamic_routers[vlan][name]
+                    if not dynamic_routers[vlan]:
+                        del dynamic_routers[vlan]
             if observer is not None:  # 链路项：output 恒 None
                 observer["items"].append(
                     {"kind": "link", "t": t, "applied": applied,
@@ -19507,7 +19645,9 @@ def mld_snoop_decode(
                     if not table:
                         del membership[(vlan, group)]
                 routers = [
-                    name for name in eligible if name in router_set
+                    name
+                    for name in eligible
+                    if name in router_targets(vlan)
                 ]
                 egress = routers if routers else eligible
                 action = "mldv2_report"
@@ -19518,7 +19658,9 @@ def mld_snoop_decode(
                         t + membership_age
                     )
                     routers = [
-                        name for name in eligible if name in router_set
+                        name
+                        for name in eligible
+                        if name in router_targets(vlan)
                     ]
                     egress = routers if routers else eligible
                     action = "mld_report"
@@ -19529,11 +19671,20 @@ def mld_snoop_decode(
                         if not table:
                             del membership[(vlan, group)]
                     routers = [
-                        name for name in eligible if name in router_set
+                        name
+                        for name in eligible
+                        if name in router_targets(vlan)
                     ]
                     egress = routers if routers else eligible
                     action = "mld_done"
                 else:  # Query：始终泛洪，不改成员状态
+                    # 增强模式：有效 Query（已过长度/FCS/协议/VLAN/STP 检查）
+                    # 把入端口登记为该 VLAN 动态路由端口；静态端口不产生
+                    # 重复动态项；同 VLAN 同端口再次收到仅刷新过期时刻
+                    if router_age is not None and port_name not in router_set:
+                        dynamic_routers.setdefault(vlan, {})[port_name] = (
+                            t + router_age
+                        )
                     egress = eligible
                     action = "mld_query"
             elif is_group:
@@ -19555,7 +19706,7 @@ def mld_snoop_decode(
                         for name, entry in table.items()
                         if member_matches(entry, source)
                     }
-                    targets = matching | router_set
+                    targets = matching | router_targets(vlan)
                     egress = [
                         name for name in eligible if name in targets
                     ]
@@ -19631,7 +19782,19 @@ def mld_snoop_decode(
         groups.append(
             {"vlan": vlan, "group": _format_ipv6(group), "members": members}
         )
-    return {
+    # routers 只列动态项：VLAN 升序、同 VLAN 按端口配置顺序；每项固定键序
+    # vlan/name/expires。仅增强（三键）配置输出该键；兼容模式输出与旧版
+    # 逐字节一致，增强模式无动态项时为空数组
+    routers = []
+    for vlan in sorted(dynamic_routers):
+        for name in sorted(
+            dynamic_routers[vlan], key=lambda value: port_order[value]
+        ):
+            routers.append(
+                {"vlan": vlan, "name": name,
+                 "expires": dynamic_routers[vlan][name]}
+            )
+    output = {
         "results": results,
         "ports": [
             {
@@ -19658,6 +19821,9 @@ def mld_snoop_decode(
         ],
         "groups": groups,
     }
+    if router_age is not None:
+        output["routers"] = routers
+    return output
 
 
 STORM_CHECK_CONFIG_KEYS = frozenset(
@@ -21345,7 +21511,7 @@ def _run_igmp_snoop_decode(config, events, observe, max_work=None):
     """
     (
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, router_ports,
+        membership_age, router_ports, router_age,
     ) = validate_igmp_snoop_config(config)
     link_ids = {link["id"] for link in links}
     igmp_events = validate_stp_decode_events(events, ports, link_ids)
@@ -21358,7 +21524,8 @@ def _run_igmp_snoop_decode(config, events, observe, max_work=None):
     observer = {} if observe else None
     result = igmp_snoop_decode(
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, router_ports, igmp_events, observer=observer,
+        membership_age, router_ports, igmp_events,
+        router_age=router_age, observer=observer,
     )
     return result, observer
 
@@ -21378,7 +21545,7 @@ def _run_mld_snoop_decode(config, events, observe, max_work=None):
     """
     (
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, router_ports,
+        membership_age, router_ports, router_age,
     ) = validate_mld_snoop_config(config)
     link_ids = {link["id"] for link in links}
     mld_events = validate_stp_decode_events(events, ports, link_ids)
@@ -21391,7 +21558,8 @@ def _run_mld_snoop_decode(config, events, observe, max_work=None):
     observer = {} if observe else None
     result = mld_snoop_decode(
         bridges, links, delay, bridge, ports, age, max_frame,
-        membership_age, router_ports, mld_events, observer=observer,
+        membership_age, router_ports, mld_events,
+        router_age=router_age, observer=observer,
     )
     return result, observer
 
@@ -25501,7 +25669,7 @@ def _cmd_igmp_snoop_decode(
         # 事件外壳与 stp-decode 完全一致
         (
             bridges, links, delay, bridge, ports, age, max_frame,
-            membership_age, router_ports,
+            membership_age, router_ports, router_age,
         ) = validate_igmp_snoop_config(config)
         link_ids = {link["id"] for link in links}
         events = validate_stp_decode_events(events_doc, ports, link_ids)
@@ -25510,7 +25678,7 @@ def _cmd_igmp_snoop_decode(
         igmp_snoop_work(bridges, links, ports, events, max_igmp_work)
         result = igmp_snoop_decode(
             bridges, links, delay, bridge, ports, age, max_frame,
-            membership_age, router_ports, events
+            membership_age, router_ports, events, router_age=router_age
         )
     except InvalidInput:
         _fail("invalid_input")
@@ -25563,7 +25731,7 @@ def _cmd_mld_snoop_decode(
         # 事件外壳与 stp-decode 完全一致
         (
             bridges, links, delay, bridge, ports, age, max_frame,
-            membership_age, router_ports,
+            membership_age, router_ports, router_age,
         ) = validate_mld_snoop_config(config)
         link_ids = {link["id"] for link in links}
         events = validate_stp_decode_events(events_doc, ports, link_ids)
@@ -25572,7 +25740,7 @@ def _cmd_mld_snoop_decode(
         mld_snoop_work(bridges, links, ports, events, max_mld_work)
         result = mld_snoop_decode(
             bridges, links, delay, bridge, ports, age, max_frame,
-            membership_age, router_ports, events
+            membership_age, router_ports, events, router_age=router_age
         )
     except InvalidInput:
         _fail("invalid_input")
