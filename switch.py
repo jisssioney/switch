@@ -5,6 +5,7 @@ from collections import deque
 import bisect
 import hashlib
 import heapq
+import ipaddress
 import json
 import os
 import re
@@ -212,6 +213,10 @@ class QosPfcWorkLimit(Exception):
 
 
 class IgmpWorkLimit(Exception):
+    pass
+
+
+class MldWorkLimit(Exception):
     pass
 
 
@@ -18869,6 +18874,792 @@ def igmp_snoop_decode(
     }
 
 
+# mld-snoop-decode：与 igmp-snoop-decode 同构，在 stp-decode（stp-check
+# 七键）配置上追加 mld 对象，处理 IPv6 上的 MLDv1 Query/Report/Done 与
+# MLDv2 Membership Report
+MLD_SNOOP_CONFIG_KEYS = STP_CHECK_CONFIG_KEYS | frozenset(("mld",))
+MLD_KEYS = frozenset(("membership_age", "router_ports"))
+IPV6_ETHER_TYPE = 0x86DD
+IP_PROTOCOL_HOPOPT = 0
+IP_PROTOCOL_ICMPV6 = 58
+IPV6_ROUTER_ALERT_OPTION = 5
+IPV6_ROUTER_ALERT_MLD = b"\x00\x00"
+MLD_TYPE_QUERY_V1 = 130
+MLD_TYPE_REPORT_V1 = 131
+MLD_TYPE_DONE_V1 = 132
+MLD_TYPE_REPORT_V2 = 143
+MLD_CONTROL_ACTIONS = {
+    MLD_TYPE_QUERY_V1: "mld_query",
+    MLD_TYPE_REPORT_V1: "mld_report",
+    MLD_TYPE_DONE_V1: "mld_done",
+}
+# MLDv2 Membership Report 组记录类型
+MLDV2_MODE_IS_INCLUDE = 1
+MLDV2_MODE_IS_EXCLUDE = 2
+MLDV2_CHANGE_TO_INCLUDE = 3
+MLDV2_CHANGE_TO_EXCLUDE = 4
+MLDV2_ALLOW_NEW_SOURCES = 5
+MLDV2_BLOCK_OLD_SOURCES = 6
+MLDV2_RECORD_TYPES = frozenset(range(1, 7))
+IPV6_MC_MAC_PREFIX = b"\x33\x33"
+
+
+def validate_mld_snoop_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != MLD_SNOOP_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    # 七键与 stp-decode（stp-check）完全一致，复用其全量校验
+    bridges, links, delay, bridge, ports, age, max_frame = (
+        validate_stp_check_config(
+            {key: config[key] for key in STP_CHECK_CONFIG_KEYS}
+        )
+    )
+    mld = config["mld"]
+    if not isinstance(mld, dict) or frozenset(mld) != MLD_KEYS:
+        raise InvalidInput("bad mld")
+    membership_age = mld["membership_age"]
+    if not _is_int(membership_age) or membership_age <= 0:
+        raise InvalidInput("bad mld membership_age")
+    router_ports = mld["router_ports"]
+    if not isinstance(router_ports, list):
+        raise InvalidInput("bad mld router_ports")
+    name_set = {port["name"] for port in ports}
+    for name in router_ports:
+        if not isinstance(name, str) or name not in name_set:
+            raise InvalidInput("bad mld router port")
+    if len(set(router_ports)) != len(router_ports):  # 端口名不重复
+        raise InvalidInput("bad mld router_ports")
+    return (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, tuple(router_ports),
+    )
+
+
+def _format_ipv6(octets):
+    """确定的小写压缩 IPv6 形式。"""
+    return str(ipaddress.IPv6Address(bytes(octets)))
+
+
+def _ipv6_group_valid(octets):
+    """MLD 组地址：ff00::/8。"""
+    return octets[0] == 0xFF
+
+
+def _ipv6_source_valid(octets):
+    """MLDv2 记录源地址：非未指定 :: 且非组播 ff00::/8（链路本地等合法）。"""
+    return octets[0] != 0xFF and any(octets)
+
+
+def _icmpv6_checksum(src, dst, body):
+    """ICMPv6 伪首部反码求和：src/dst 各 16 字节、上层长度 4 字节、
+    下一首部 58（4 字节零填充）加报文本体；校验时整段求和须为 0。"""
+    pseudo = (
+        bytes(src) + bytes(dst)
+        + len(body).to_bytes(4, "big")
+        + b"\x00\x00\x00" + bytes([IP_PROTOCOL_ICMPV6])
+    )
+    data = pseudo + body
+    if len(data) % 2:
+        data = data + b"\x00"
+    total = 0
+    for index in range(0, len(data), 2):
+        total += (data[index] << 8) | data[index + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _router_alert_value(options):
+    """从 Hop-by-Hop 选项区查找 Router Alert 选项值。
+
+    选项区畸形（长度不闭合）或不含类型 5 选项返回 None；类型 5 长度须恰为
+    2，值原样返回（调用方判定是否为 MLD 的 0x0000）。
+    """
+    index = 0
+    while index < len(options):
+        otype = options[index]
+        if otype == 0:  # Pad1
+            index += 1
+            continue
+        if index + 1 >= len(options):
+            return None
+        olen = options[index + 1]
+        if index + 2 + olen > len(options):  # 选项长度不闭合
+            return None
+        if otype == IPV6_ROUTER_ALERT_OPTION:
+            if olen != 2:
+                return None
+            return bytes(options[index + 2:index + 4])
+        index += 2 + olen
+    return None
+
+
+def _parse_mld_outer(raw, ethertype_offset):
+    """解析 IPv6 外层并定位携带 Router Alert 的 ICMPv6（MLD）报文。
+
+    - 返回 None：非 IPv6、无 Hop-by-Hop Router Alert、封装的下一首部不是
+      ICMPv6、或任何扩展头/分片（不重组，调用方按普通 IPv6 帧处理）；
+    - 返回 ("invalid",)：已凭 Router Alert+ICMPv6 识别为 MLD 候选，但
+      IPv6 外层边界、Hop Limit 或报文长度不合法，调用方固定输出 mld_invalid；
+    - 返回 ("ok", src, dst, body)：外层校验通过，body 为按 Payload Length
+      截取的完整 MLD 报文（调用方按类型继续校验）。
+    """
+    payload = raw[ethertype_offset + 2:-4]
+    if len(payload) < 40:
+        return None
+    if payload[0] >> 4 != 6:
+        return None
+    next_header = payload[6]
+    if next_header != IP_PROTOCOL_HOPOPT:
+        # MLD 必须携带 Router Alert；其他下一首部（含分片）一律不识别
+        return None
+    if len(payload) < 48:
+        return None
+    ext_len = (payload[41] + 1) * 8
+    if ext_len < 8 or 40 + ext_len > len(payload):
+        return None  # 扩展头畸形：不识别，按普通 IPv6 帧处理
+    ra = _router_alert_value(payload[42:40 + ext_len])
+    if ra is None or ra != IPV6_ROUTER_ALERT_MLD:
+        # 无 Router Alert 或值非 MLD(0)：不识别为 MLD
+        return None
+    next_header = payload[40]
+    if next_header != IP_PROTOCOL_ICMPV6:
+        return None
+    # 已识别为 MLD 候选：以下外层语义失败固定 mld_invalid
+    payload_length = int.from_bytes(payload[4:6], "big")
+    if payload_length > len(payload) - 40:  # IPv6 外层边界不闭合
+        return ("invalid",)
+    if payload[7] != 1:  # Hop Limit 须为 1
+        return ("invalid",)
+    body_end = 40 + payload_length
+    if 40 + ext_len > body_end:  # 扩展头越出声明载荷
+        return ("invalid",)
+    body = payload[40 + ext_len:body_end]
+    if len(body) < 8:  # MLD 报文最短为 24 字节，8 字节尚容纳不了
+        return ("invalid",)
+    return ("ok", bytes(payload[8:24]), bytes(payload[24:40]), body)
+
+
+def _mld_v1_from_msg(src, dst, body):
+    """对已截取的 MLD 报文做 MLDv1 Query/Report/Done 校验。
+
+    三类报文恰为 24 字节、Code 须为 0、伪首部校验和为 0；外层源地址须非
+    ::/非组播，外层目的须为组播。Query 组地址允许 ::（通用查询）或
+    ff00::/8，Report/Done 组地址须为 ff00::/8。
+    """
+    mtype = body[0]
+    if mtype not in MLD_CONTROL_ACTIONS:
+        return ("invalid",)  # 类型非法（含 MLDv2 Report 等）
+    if len(body) != 24 or body[1] != 0:
+        return ("invalid",)
+    if not _ipv6_source_valid(src) or not _ipv6_group_valid(dst):
+        return ("invalid",)
+    if _icmpv6_checksum(src, dst, body) != 0:
+        return ("invalid",)
+    group = bytes(body[8:24])
+    if mtype in (MLD_TYPE_REPORT_V1, MLD_TYPE_DONE_V1):
+        if not _ipv6_group_valid(group):
+            return ("invalid",)
+    elif not (_ipv6_group_valid(group) or not any(group)):
+        # Query：通用查询组地址 :: 合法，组特定查询须为 ff00::/8
+        return ("invalid",)
+    return ("ok", mtype, group)
+
+
+def _parse_mld_v2_report(src, dst, body):
+    """校验并解析 MLDv2 Membership Report（类型 143）。
+
+    返回 ("invalid",) 或 ("v2", records)；records 为
+    (rtype, group_bytes, [source_bytes, ...]) 列表。
+    校验：类型 143、恰 8 字节定长头、整报伪首部校验和为 0、组记录数与
+    内容一致且长度闭合、记录类型在 1 至 6、组地址为 ff00::/8、源地址非
+    ::/非组播、外层源非 ::/非组播且外层目的为组播。
+    """
+    if len(body) < 8 or body[0] != MLD_TYPE_REPORT_V2:
+        return ("invalid",)
+    if not _ipv6_source_valid(src) or not _ipv6_group_valid(dst):
+        return ("invalid",)
+    if _icmpv6_checksum(src, dst, body) != 0:
+        return ("invalid",)
+    record_count = int.from_bytes(body[6:8], "big")
+    offset = 8
+    records = []
+    for _ in range(record_count):
+        if len(body) - offset < 20:  # 记录定长头 20 字节
+            return ("invalid",)
+        rtype = body[offset]
+        aux_len = body[offset + 1]
+        source_count = int.from_bytes(body[offset + 2:offset + 4], "big")
+        group = bytes(body[offset + 4:offset + 20])
+        if rtype not in MLDV2_RECORD_TYPES:
+            return ("invalid",)
+        if not _ipv6_group_valid(group):  # 组地址须为 ff00::/8
+            return ("invalid",)
+        body_end = offset + 20 + 16 * source_count
+        record_end = body_end + 4 * aux_len
+        if record_end > len(body):  # 源数组或辅助数据长度不闭合
+            return ("invalid",)
+        sources = []
+        for source_index in range(source_count):
+            start = offset + 20 + 16 * source_index
+            source = bytes(body[start:start + 16])
+            if not _ipv6_source_valid(source):  # 源地址须合法
+                return ("invalid",)
+            sources.append(source)
+        records.append((rtype, group, sources))
+        offset = record_end
+    if offset != len(body):  # 记录数与内容不符（有剩余字节）
+        return ("invalid",)
+    return ("v2", records)
+
+
+def _parse_mld(raw, ethertype_offset):
+    """MLD 统一解析：在外层校验基础上区分 MLDv1 三类与 MLDv2 Report。
+
+    返回 None（不识别为 MLD）、("invalid",)（外层识别但 MLD 非法）、
+    ("ok", mtype, group_bytes)（MLDv1）或 ("v2", records)（MLDv2 Report）。
+    """
+    outer = _parse_mld_outer(raw, ethertype_offset)
+    if outer is None:
+        return None
+    if outer[0] == "invalid":
+        return ("invalid",)
+    _, src, dst, body = outer
+    if body[0] == MLD_TYPE_REPORT_V2:
+        return _parse_mld_v2_report(src, dst, body)
+    return _mld_v1_from_msg(src, dst, body)
+
+
+def _ipv6_multicast_data(raw, ethertype_offset):
+    """IPv6 组播数据帧：目的地址为 ff00::/8 且与目的 MAC 的 33:33 映射
+    一致时返回 (src_bytes, dst_bytes)，否则返回 None（调用方沿用泛洪）。"""
+    payload = raw[ethertype_offset + 2:-4]
+    if len(payload) < 40:
+        return None
+    dst = bytes(payload[24:40])
+    if not _ipv6_group_valid(dst):
+        return None
+    if raw[0:6] != IPV6_MC_MAC_PREFIX + dst[12:16]:
+        return None
+    return bytes(payload[8:24]), dst
+
+
+def _mld_v2_work_units(events):
+    """统计帧序列中合法 MLDv2 Report 的组记录数与源地址数之和。
+
+    仅依据原始帧外层与报文解析（与帧分类、VLAN 准入、STP 状态无关，预演
+    无副作用）：每个完整解析成功的 v2 组记录计 1，其每个源地址再计 1。
+    """
+    units = 0
+    for item in events:
+        if item[0] != "frame":
+            continue
+        raw = item[3]
+        ethertype_offset = 16 if raw[12:14] == FRAME_DECODE_TAG else 12
+        ethertype = (
+            (raw[ethertype_offset] << 8) | raw[ethertype_offset + 1]
+        )
+        if ethertype != IPV6_ETHER_TYPE:
+            continue
+        mld_info = _parse_mld(raw, ethertype_offset)
+        if mld_info is not None and mld_info[0] == "v2":
+            records = mld_info[1]
+            units += len(records) + sum(
+                len(sources) for _, _, sources in records
+            )
+    return units
+
+
+def mld_snoop_work(bridges, links, ports, events, limit):
+    """mld-snoop-decode 工作量预演：现有 stp-decode（forward-stp）工作量
+    再加 N*(N+P+1)，N 为事件数（链路与帧合计）、P 为端口数；MLDv2
+    Report 每个组记录及每个源地址各再加一个单位。等于上限合法，超过即
+    抛 MldWorkLimit。
+    """
+    N = len(events)
+    P = len(ports)
+    work = _forward_stp_work_total(bridges, links, ports, events)
+    work += N * (N + P + 1)
+    work += _mld_v2_work_units(events)
+    if work > limit:
+        raise MldWorkLimit
+
+
+def mld_snoop_decode(
+    bridges, links, delay, bridge_name, ports, age, max_frame,
+    membership_age, router_ports, events, observer=None,
+):
+    """在 stp-decode 转发/学习/统计语义上增加 MLDv1/v2 snooping。
+
+    成员表 membership：(vlan, group_bytes) -> {port: member}。MLDv1 成员为
+    expires（绝对时刻）整数，键形保持 name/expires；经 MLDv2 Report 更新
+    的成员为 {"expires": expires, "mode": "include"/"exclude",
+    "sources": set(16 字节源地址)}。
+    每个事件前删除 expires<=t 的成员；MLDv1 Report 建立或刷新至
+    t+membership_age，Done 立即删除入端口成员；MLDv2 Report 按组记录
+    顺序在暂存表上修改过滤状态，整帧校验成功后一次提交，受影响成员
+    expires 统一为 t+membership_age；链路断开或端口退出 forwarding 时清除
+    该端口全部成员。Report/Done 仅发往同 VLAN 可转发的 router_ports，无
+    合格路由端口时泛洪；Query 始终泛洪；其他 IPv6 组播在 MAC/组地址
+    33:33 映射一致且有成员匹配源过滤条件时仅发往匹配成员与路由端口；
+    其余组播沿用泛洪。携带 Router Alert 的 ICMPv6 但 MLD 非法的帧固定
+    mld_invalid、空 ports、计 drop 且不改任何状态（含不学习 MAC）。
+    observer 语义同 stp-check。
+    """
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    # (vlan, group_bytes) -> {port_name: int 过期时刻或 v2 过滤 dict}
+    membership = {}
+    router_set = set(router_ports)
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def eligible_names(t, vlan, ingress):
+        """同 VLAN 可转发（物理 up、STP forwarding、VLAN 准入）且排除入
+        端口的端口名，按配置端口序。"""
+        return [
+            port["name"]
+            for port in ports
+            if vlan in port["allowed"]
+            and port["name"] != ingress
+            and port_status(port["name"], t) == (True, "forwarding")
+        ]
+
+    def member_expires(entry):
+        """v1 成员为过期时刻整数；v2 成员为含 expires 的过滤 dict。"""
+        return entry if isinstance(entry, int) else entry["expires"]
+
+    def apply_v2_record(table, port_name, rtype, sources, expiry):
+        """按单条 v2 组记录修改入端口在本组的暂存过滤状态。
+
+        无记录或 v1 成员按 EXCLUDE、空源集合处理；INCLUDE 空集合删除
+        成员，EXCLUDE 空集合表示接收全部源。
+        """
+        sources = set(sources)
+        current = table.get(port_name)
+        if isinstance(current, dict):
+            mode, current_sources = current["mode"], set(current["sources"])
+        elif isinstance(current, int):
+            # MLDv1 成员接收全部源，按 EXCLUDE、空集合处理
+            mode, current_sources = "exclude", set()
+        else:
+            # 无既有成员等价于 INCLUDE、空集合：ALLOW 建立成员，
+            # BLOCK 仍为空集合删除
+            mode, current_sources = "include", set()
+        if rtype in (MLDV2_MODE_IS_INCLUDE, MLDV2_CHANGE_TO_INCLUDE):
+            new_mode, new_sources = "include", sources
+        elif rtype in (MLDV2_MODE_IS_EXCLUDE, MLDV2_CHANGE_TO_EXCLUDE):
+            new_mode, new_sources = "exclude", sources
+        elif rtype == MLDV2_ALLOW_NEW_SOURCES:
+            if mode == "include":  # INCLUDE 取并集
+                new_mode, new_sources = "include", current_sources | sources
+            else:  # EXCLUDE 做差集
+                new_mode, new_sources = "exclude", current_sources - sources
+        else:  # BLOCK_OLD_SOURCES：INCLUDE 做差集，EXCLUDE 取并集
+            if mode == "include":
+                new_mode, new_sources = "include", current_sources - sources
+            else:
+                new_mode, new_sources = "exclude", current_sources | sources
+        if new_mode == "include" and not new_sources:
+            table.pop(port_name, None)  # INCLUDE 空集合：删除成员
+        else:
+            table[port_name] = {
+                "expires": expiry,
+                "mode": new_mode,
+                "sources": new_sources,
+            }
+
+    def member_matches(entry, source):
+        """组播数据源过滤：v1 成员接收全部源；v2 成员按 INCLUDE/EXCLUDE。"""
+        if not isinstance(entry, dict):
+            return True
+        if entry["mode"] == "include":
+            return source in entry["sources"]
+        return source not in entry["sources"]
+
+    def purge_expired(t):
+        for key, table in [
+            (key, table) for key, table in membership.items()
+        ]:
+            for port_name in [
+                name
+                for name, entry in table.items()
+                if member_expires(entry) <= t
+            ]:
+                del table[port_name]
+            if not table:
+                del membership[key]
+
+    converge(0)
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        purge_expired(t)  # 每个事件前删除 expires<=t 的成员
+        if item[0] == "link":
+            _, t, lid, up = item
+            applied = by_id[lid]["up"] != up  # up 实际改变才 applied
+            old_forwarding = forwarding_ports(t)
+            by_id[lid]["up"] = up
+            converge(t)
+            left_forwarding = old_forwarding - forwarding_ports(t)
+            for name in left_forwarding:
+                # 端口退出 forwarding：清 FDB（同 stp-decode）与该端口全部
+                # 组成员（链路断开同理，断口必退出 forwarding）
+                for key in [k for k, (p, _) in fdb.items() if p == name]:
+                    del fdb[key]
+                for key, table in [
+                    (key, table) for key, table in membership.items()
+                ]:
+                    if name in table:
+                        del table[name]
+                        if not table:
+                            del membership[key]
+            if observer is not None:  # 链路项：output 恒 None
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
+            continue
+        _, t, port_name, raw = item
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            tag = tci & 0x0FFF
+            ethertype_offset = 16
+        else:
+            tag = None
+            ethertype_offset = 12
+        ethertype = (
+            (raw[ethertype_offset] << 8) | raw[ethertype_offset + 1]
+        )
+        length = len(raw)
+        port_stats[port_name]["rx"] += 1
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (
+            zlib.crc32(raw[:-4]) & 0xFFFFFFFF
+        ).to_bytes(4, "little"):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        port_stats[port_name][cls] += 1
+        if cls != "good":  # 非 good 丢弃且不学习、不转发、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
+            continue
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:  # 准入拒绝也逐帧记录
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        _, state = port_status(port_name, t)
+        egress = []
+        action = "drop"
+        if state == "learning":
+            fdb[(vlan, src)] = [port_name, t]
+        elif state == "forwarding":
+            mld_info = (
+                _parse_mld(raw, ethertype_offset)
+                if ethertype == IPV6_ETHER_TYPE
+                else None
+            )
+            if mld_info is not None and mld_info[0] == "invalid":
+                # 携带 Router Alert 的 ICMPv6 帧但 MLD 非法：不改任何状态
+                # （不学习 MAC、不改成员），action 固定 mld_invalid、
+                # ports 为空并计入丢弃
+                port_stats[port_name]["drop"] += 1
+                vlan_stats[vlan]["drop"] += 1
+                entry = {
+                    "t": t, "class": cls, "action": "mld_invalid",
+                    "ports": [],
+                }
+                results.append(entry)
+                if observer is not None:
+                    observer["items"].append(
+                        {"kind": "frame", "t": t, "applied": True,
+                         "output": entry}
+                    )
+                continue
+            fdb[(vlan, src)] = [port_name, t]
+            is_group = int(dst[:2], 16) & 1
+            eligible = eligible_names(t, vlan, port_name)
+            if mld_info is not None and mld_info[0] == "v2":
+                # MLDv2 Membership Report：解析已对整帧校验成功，此处一次
+                # 提交；组记录按报文顺序作用，受影响成员 expires 统一为
+                # t+membership_age
+                _, records = mld_info
+                expiry = t + membership_age
+                for rtype, group, sources in records:
+                    table = membership.setdefault((vlan, group), {})
+                    apply_v2_record(
+                        table, port_name, rtype, sources, expiry
+                    )
+                    if not table:
+                        del membership[(vlan, group)]
+                routers = [
+                    name for name in eligible if name in router_set
+                ]
+                egress = routers if routers else eligible
+                action = "mldv2_report"
+            elif mld_info is not None:  # 合法 MLDv1 控制帧
+                _, mtype, group = mld_info
+                if mtype == MLD_TYPE_REPORT_V1:
+                    membership.setdefault((vlan, group), {})[port_name] = (
+                        t + membership_age
+                    )
+                    routers = [
+                        name for name in eligible if name in router_set
+                    ]
+                    egress = routers if routers else eligible
+                    action = "mld_report"
+                elif mtype == MLD_TYPE_DONE_V1:
+                    table = membership.get((vlan, group))
+                    if table is not None:  # Done 立即删除入端口成员
+                        table.pop(port_name, None)
+                        if not table:
+                            del membership[(vlan, group)]
+                    routers = [
+                        name for name in eligible if name in router_set
+                    ]
+                    egress = routers if routers else eligible
+                    action = "mld_done"
+                else:  # Query：始终泛洪，不改成员状态
+                    egress = eligible
+                    action = "mld_query"
+            elif is_group:
+                multicast = (
+                    _ipv6_multicast_data(raw, ethertype_offset)
+                    if ethertype == IPV6_ETHER_TYPE
+                    else None
+                )
+                group = multicast[1] if multicast is not None else None
+                table = (
+                    membership.get((vlan, group))
+                    if group is not None
+                    else None
+                )
+                if table:  # 命中成员表：匹配源过滤的成员加路由端口
+                    source = multicast[0]
+                    matching = {
+                        name
+                        for name, entry in table.items()
+                        if member_matches(entry, source)
+                    }
+                    targets = matching | router_set
+                    egress = [
+                        name for name in eligible if name in targets
+                    ]
+                    action = "multicast"
+                else:  # 其余组播（含广播、非 IPv6、映射不一致、无成员）泛洪
+                    egress = eligible
+                    action = "flood"
+            else:
+                hit = fdb.get((vlan, dst))
+                if hit is not None and hit[0] != port_name:
+                    target = hit[0]
+                    target_up, target_state = port_status(target, t)
+                    if (
+                        target_up
+                        and target_state == "forwarding"
+                        and vlan in by_name[target]["allowed"]
+                    ):
+                        egress = [target]
+                        action = "unicast"
+                elif hit is None:
+                    egress = eligible
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        entry = {"t": t, "class": cls, "action": action, "ports": out_ports}
+        results.append(entry)
+        if observer is not None:  # 帧项恒 applied，output 为对应结果项
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
+    port_order = {port["name"]: index for index, port in enumerate(ports)}
+    groups = []
+    # groups 按 VLAN 与 128 位组地址数值排序；成员按配置端口序；v1 成员
+    # 保持 name/expires 键形，v2 成员按 name/expires/mode/sources 固定键序，
+    # 源地址按 128 位数值升序，IPv6 地址使用确定的小写压缩形式
+    for vlan, group in sorted(
+        membership,
+        key=lambda key: (key[0], int.from_bytes(key[1], "big")),
+    ):
+        table = membership[(vlan, group)]
+        members = []
+        for name in sorted(table, key=lambda value: port_order[value]):
+            entry = table[name]
+            if isinstance(entry, dict):
+                sources = [
+                    _format_ipv6(source)
+                    for source in sorted(
+                        entry["sources"],
+                        key=lambda value: int.from_bytes(value, "big"),
+                    )
+                ]
+                members.append(
+                    {
+                        "name": name,
+                        "expires": entry["expires"],
+                        "mode": entry["mode"],
+                        "sources": sources,
+                    }
+                )
+            else:
+                members.append({"name": name, "expires": entry})
+        groups.append(
+            {"vlan": vlan, "group": _format_ipv6(group), "members": members}
+        )
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "groups": groups,
+    }
+
+
 STORM_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm",
      "max_frame")
@@ -19623,6 +20414,7 @@ DEFAULT_MAX_LINK_FLOW_WORK = 10000000
 DEFAULT_MAX_QOS_WIRE_WORK = 10000000
 DEFAULT_MAX_QOS_PFC_WORK = 10000000
 DEFAULT_MAX_IGMP_WORK = 10000000
+DEFAULT_MAX_MLD_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -19733,7 +20525,8 @@ def _log_mode(config, events=None):
     src（九键）按 stp-check，含 data（t/port/data 原始帧）按 stp-decode；
     两种帧形状混用报 InvalidInput；仅链路项或空事件沿用既有 stp-decode
     路由（既有日志字节不变）。stp 七键加 igmp 的配置按 igmp-snoop-decode
-    （事件仅链路项与 t/port/data 原始帧）。qos 十二键配置的帧项含 src（十键）按
+    （事件仅链路项与 t/port/data 原始帧）；stp 七键加 mld 的配置按
+    mld-snoop-decode（事件外壳相同）。qos 十二键配置的帧项含 src（十键）按
     qos-check，含 data（t/port/data 原始帧）按 qos-decode，两种帧形状
     混用报 InvalidInput；仅链路/成员/service 项或空事件沿用既有
     qos-check 路由（既有日志字节不变）。link-wire 含 queue_bytes 配置的
@@ -19863,6 +20656,16 @@ def _log_mode(config, events=None):
                 if ekeys not in (STP_EVENT_KEYS, FRAME_DECODE_FRAME_KEYS):
                     raise InvalidInput("bad log event")
             return "igmp_snoop_decode"
+        if keys == MLD_SNOOP_CONFIG_KEYS:
+            # mld-snoop-decode：stp-check 七键加 mld；事件外壳与
+            # igmp-snoop-decode 完全一致，仅链路项与 t/port/data 原始帧
+            for event in events if isinstance(events, list) else ():
+                if not isinstance(event, dict):
+                    raise InvalidInput("bad log event")
+                ekeys = frozenset(event)
+                if ekeys not in (STP_EVENT_KEYS, FRAME_DECODE_FRAME_KEYS):
+                    raise InvalidInput("bad log event")
+            return "mld_snoop_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
             # stp-check 与 stp-decode 共享七键配置：非链路帧含 src 按
             # stp-check，含 data 按 stp-decode，两种帧形状混用即非法输入
@@ -20556,6 +21359,39 @@ def _run_igmp_snoop_decode(config, events, observe, max_work=None):
     result = igmp_snoop_decode(
         bridges, links, delay, bridge, ports, age, max_frame,
         membership_age, router_ports, igmp_events, observer=observer,
+    )
+    return result, observer
+
+
+def _run_mld_snoop_decode(config, events, observe, max_work=None):
+    """record/replay mld-snoop-decode 模式：校验 stp 七键加 mld 配置与
+    混合事件并执行仿真。
+
+    事件外壳、全量校验与执行语义完全沿用 mld-snoop-decode 入口；
+    max_work 非 None 时（record/replay）全量语义校验后先按 mld 公式
+    （forward-stp 工作量加 N*(N+P+1)，v2 组记录与源地址各再加一单位）
+    无副作用预演（坏帧、准入拒绝、幂等链路均计费），首次超过即抛
+    MldWorkLimit，不正式仿真。返回
+    (mld-snoop-decode 结果 dict, observer 或 None)；帧项恒 applied 且
+    output 为对应 t,class,action,ports 结果项，链路项仅 up 实际改变时
+    applied，output 恒 None。
+    """
+    (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, router_ports,
+    ) = validate_mld_snoop_config(config)
+    link_ids = {link["id"] for link in links}
+    mld_events = validate_stp_decode_events(events, ports, link_ids)
+    if max_work is not None:
+        # 与 mld-snoop-decode 入口同一公式：forward-stp 工作量加
+        # N*(N+P+1)
+        mld_snoop_work(
+            bridges, links, ports, mld_events, max_work
+        )
+    observer = {} if observe else None
+    result = mld_snoop_decode(
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, router_ports, mld_events, observer=observer,
     )
     return result, observer
 
@@ -21304,7 +22140,7 @@ def _build_log_doc(config, events, items):
             "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
             "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm",
-            "igmp_snoop_decode",
+            "igmp_snoop_decode", "mld_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -21444,7 +22280,7 @@ def _verify_records(log, events, items):
             "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
             "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm",
-            "igmp_snoop_decode",
+            "igmp_snoop_decode", "mld_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -21602,6 +22438,10 @@ def _cmd_record(
             result, observer = _run_igmp_snoop_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "mld_snoop_decode":
+            result, observer = _run_mld_snoop_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_record_work
@@ -21700,6 +22540,7 @@ def _cmd_record(
         QosWireWorkLimit,
         QosPfcWorkLimit,
         IgmpWorkLimit,
+        MldWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -21816,6 +22657,10 @@ def _cmd_replay(
             result, observer = _run_igmp_snoop_decode(
                 config, events, True, max_replay_work
             )
+        elif mode == "mld_snoop_decode":
+            result, observer = _run_mld_snoop_decode(
+                config, events, True, max_replay_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_replay_work
@@ -21914,6 +22759,7 @@ def _cmd_replay(
         QosWireWorkLimit,
         QosPfcWorkLimit,
         IgmpWorkLimit,
+        MldWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -24681,6 +25527,68 @@ def _cmd_igmp_snoop_decode(
     return 0
 
 
+def _cmd_mld_snoop_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_mld_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 全量输入先校验再仿真；mld 配置为 stp-check 七键加 mld 对象，
+        # 事件外壳与 stp-decode 完全一致
+        (
+            bridges, links, delay, bridge, ports, age, max_frame,
+            membership_age, router_ports,
+        ) = validate_mld_snoop_config(config)
+        link_ids = {link["id"] for link in links}
+        events = validate_stp_decode_events(events_doc, ports, link_ids)
+        # 资源、工作量契约：全量校验后无副作用预演，超限不正式仿真；
+        # 公式为现有 stp-decode 工作量加 N*(N+P+1)
+        mld_snoop_work(bridges, links, ports, events, max_mld_work)
+        result = mld_snoop_decode(
+            bridges, links, delay, bridge, ports, age, max_frame,
+            membership_age, router_ports, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except MldWorkLimit:
+        _fail("mld_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_qos_decode(
     config_path,
     events_path,
@@ -25154,6 +26062,7 @@ SUBCOMMANDS = frozenset((
     "forward-decode",
     "stp-decode",
     "igmp-snoop-decode",
+    "mld-snoop-decode",
     "link-forward",
     "link-wire",
     "link-wire-decode",
@@ -25779,6 +26688,29 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_igmp_snoop_decode(args[1], args[2], *limits)
+    if args[:1] == ["mld-snoop-decode"]:
+        # mld-snoop-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_MLD_WORK]]]：
+        #   签名、四项资源上限与错误契约同 stp-decode，工作量为 stp-decode
+        #   公式加 N*(N+P+1)，超限错误名 mld_work_limit；可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_MLD_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_mld_snoop_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
