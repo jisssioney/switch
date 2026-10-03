@@ -20581,6 +20581,9 @@ DEFAULT_MAX_QOS_WIRE_WORK = 10000000
 DEFAULT_MAX_QOS_PFC_WORK = 10000000
 DEFAULT_MAX_IGMP_WORK = 10000000
 DEFAULT_MAX_MLD_WORK = 10000000
+# log-multicast 前缀重演工作量上限：数值与 igmp/mld 两口径默认值相同，
+# 实际计费按 LOG 模式选择 igmp_snoop_work 或 mld_snoop_work
+DEFAULT_MAX_MULTICAST_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -24889,6 +24892,151 @@ def _cmd_log_mirror(log_path, cursor_token, max_work):
     return 0
 
 
+MULTICAST_DIGEST_KEYS = (
+    "schema", "source_sha256", "offset", "family", "groups", "routers",
+)
+
+
+def _multicast_prefix_bytes(doc):
+    """log-multicast 末项摘要文本：前六键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in MULTICAST_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _multicast_bytes(doc):
+    """log-multicast stdout 载荷：七键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in MULTICAST_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_multicast(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-page：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），但 * 表示 records 长度（重演全部）；offset 为不限长非负
+    # 十进制且不得越界。输入/输出上限固定各 16777216 字节，分块读取与
+    # 字节边界沿用 log-page，等于上限合法。仅接受 igmp-snoop-decode 与
+    # mld-snoop-decode 两种日志模式，其余模式 invalid_input/4。
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            # * 表示 records 长度：offset 取记录数，即重演全部记录
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受两种 snooping 配置形状，其他
+        # 模式一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        mode = _log_mode(config, events)
+        if mode == "igmp_snoop_decode":
+            run_mode = _run_igmp_snoop_decode
+            family = "ipv4"
+        elif mode == "mld_snoop_decode":
+            run_mode = _run_mld_snoop_decode
+            family = "ipv6"
+        else:
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重演完全沿用 replay 的 snooping 路径：
+        # 逐项核对 t/version/applied/output，重建 LOG 须与原文件逐字节
+        # 一致（max_work=None：全量记录核对不设工作量上限）
+        _, observer = run_mode(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条记录求组播控制面状态：独立校验副本与空状态、
+        # 无副作用。先按所选 snooping 模式的工作量公式预演前 offset 项
+        # （igmp：forward-stp 工作量加 N*(N+P+1) 再加 v3 组记录与源地址
+        # 单位；mld 同构），等于上限合法，首次超过即抛对应 WorkLimit，
+        # 再正式重演。groups 与对应 snooping 入口处理同一前缀后的最终
+        # groups 完全一致（成员过期时刻、过滤模式、源地址、排序与键序）；
+        # routers 只列当前未过期动态路由端口，兼容模式（未配置
+        # router_age）恒为空数组
+        if mode == "igmp_snoop_decode":
+            (
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, router_age,
+            ) = validate_igmp_snoop_config(config)
+            link_ids = {link["id"] for link in links}
+            snoop_events = validate_stp_decode_events(events, ports, link_ids)
+            prefix_events = snoop_events[:offset]
+            igmp_snoop_work(bridges, links, ports, prefix_events, max_work)
+            prefix_result = igmp_snoop_decode(
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, prefix_events,
+                router_age=router_age,
+            )
+        else:
+            (
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, router_age,
+            ) = validate_mld_snoop_config(config)
+            link_ids = {link["id"] for link in links}
+            snoop_events = validate_stp_decode_events(events, ports, link_ids)
+            prefix_events = snoop_events[:offset]
+            mld_snoop_work(bridges, links, ports, prefix_events, max_work)
+            prefix_result = mld_snoop_decode(
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, prefix_events,
+                router_age=router_age,
+            )
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "family": family,
+            "groups": prefix_result["groups"],
+            # 未配置 router_age（兼容模式）时入口结果无 routers 键
+            "routers": prefix_result.get("routers", []),
+        }
+        doc["sha256"] = hashlib.sha256(
+            _multicast_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _multicast_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except (IgmpWorkLimit, MldWorkLimit):
+        _fail("multicast_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_log_diff(
     left_path,
     right_path,
@@ -26218,6 +26366,7 @@ SUBCOMMANDS = frozenset((
     "log-stp",
     "log-lag",
     "log-storm",
+    "log-multicast",
     "log-diff",
     "config-diff",
     "config-export",
@@ -26606,6 +26755,26 @@ def main(argv):
             else DEFAULT_MAX_STORM_WORK
         )
         return _cmd_log_storm(args[1], args[2], max_work)
+    if args[:1] == ["log-multicast"]:
+        # log-multicast LOG CURSOR [MAX_WORK]：CURSOR 沿用 log-page（* 或
+        # <sha256>:<offset>，* 表示全部记录），MAX_WORK 为不限长正十进制，
+        # 默认 10000000；个数或格式非法按 usage 退出 2（在打开文件前判
+        # 定）。输入/输出各限 16777216 字节（固定默认值）；仅接受
+        # igmp-snoop-decode 与 mld-snoop-decode 两种日志模式。
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_MULTICAST_WORK
+        )
+        return _cmd_log_multicast(args[1], args[2], max_work)
     if args[:1] == ["log-diff"]:
         # log-diff LEFT RIGHT [MAX_LOG_BYTES MAX_OUTPUT_BYTES MAX_DIFF_WORK]：
         # 三上限可省略或全给（0 或 3 个），格式沿用 config-diff（均须匹配
