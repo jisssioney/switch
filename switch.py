@@ -17750,12 +17750,27 @@ IP_PROTOCOL_IGMP = 2
 IGMP_TYPE_QUERY_V2 = 0x11
 IGMP_TYPE_REPORT_V2 = 0x16
 IGMP_TYPE_LEAVE_V2 = 0x17
+IGMP_TYPE_REPORT_V3 = 0x22
+# IGMPv3 Membership Report 组记录类型
+IGMPV3_MODE_IS_INCLUDE = 1
+IGMPV3_MODE_IS_EXCLUDE = 2
+IGMPV3_CHANGE_TO_INCLUDE = 3
+IGMPV3_CHANGE_TO_EXCLUDE = 4
+IGMPV3_ALLOW_NEW_SOURCES = 5
+IGMPV3_BLOCK_OLD_SOURCES = 6
+IGMPV3_RECORD_TYPES = frozenset(range(1, 7))
 IGMP_CONTROL_ACTIONS = {
     IGMP_TYPE_QUERY_V2: "igmp_query",
     IGMP_TYPE_REPORT_V2: "igmp_report",
     IGMP_TYPE_LEAVE_V2: "igmp_leave",
 }
 IPV4_MC_MAC_PREFIX = b"\x01\x00\x5e"
+
+
+def _ipv4_unicast(octets):
+    """有效 IPv4 单播源：首字节 1..223（排除 0.0.0.0/8、D 类组播、
+    E 类保留与 255.255.255.255）。"""
+    return 1 <= octets[0] <= 223
 
 
 def validate_igmp_snoop_config(config):
@@ -17803,17 +17818,14 @@ def _internet_checksum(data):
     return (~total) & 0xFFFF
 
 
-def _parse_igmp_v2(raw, ethertype_offset):
-    """解析 IPv4 帧中的 IGMPv2 控制消息。
+def _parse_ipv4_igmp_envelope(raw, ethertype_offset):
+    """提取 IPv4 帧中未分片的 IGMP 报文。
 
-    仅在 ethertype 为 0x0800 时调用：
-
-    - 返回 None：非协议号 2、分片或 IPv4 头非法/校验失败，调用方按普通
-      IPv4 帧处理（组播沿用泛洪或成员投递）；
-    - 返回 ("invalid",)：IPv4 外层合法且为未分片协议号 2，但 IGMP 长度、
-      类型、组地址或校验非法，调用方固定输出 igmp_invalid 且不改状态；
-    - 返回 ("ok", mtype, group)：校验通过的 IGMPv2 Query/Report/Leave，
-      group 为点分十进制组地址（Query 不校验组地址）。
+    - 返回 None：非 IPv4、短于头长、版本/IHL 非法、IPv4 头校验失败、
+      任意分片或非协议号 2，调用方按普通帧处理；
+    - 返回 ("invalid",)：IPv4 外层合法且为未分片协议号 2，但总长度字段
+      无法容纳至少 8 字节 IGMP 或超过实际载荷；
+    - 返回 ("ok", igmp_msg)：待按版本解析的 IGMP 报文字节。
     """
     payload = raw[ethertype_offset + 2:-4]
     if len(payload) < 20:
@@ -17838,10 +17850,90 @@ def _parse_igmp_v2(raw, ethertype_offset):
     total_length = (payload[2] << 8) | payload[3]
     if total_length < header_len + 8 or total_length > len(payload):
         return ("invalid",)  # IGMP 长度非法（容纳不了 8 字节或超过实际载荷）
-    igmp_msg = payload[header_len:total_length]
+    return ("ok", payload[header_len:total_length])
+
+
+def _parse_igmp_v3_report(igmp_msg):
+    """解析 IGMPv3 Membership Report（类型 0x22）。
+
+    报文为 8 字节报告头加 ngroups 条组记录，每条组记录为 8 字节固定头
+    （类型/辅助数据字长/源数/组地址）加 4*nsrcs 源地址及辅助数据；校验
+    和错误、长度不闭合、记录类型不在 1..6、组地址非 D 类、源地址非有效
+    单播或记录数与内容不符即非法（报告头保留字段接收时忽略）。返回
+    (rtype, group, (src, ...)) 记录列表，group 为点分十进制、src 为
+    4 元组。
+    """
+    if _internet_checksum(igmp_msg) != 0:  # IGMP 校验
+        return ("invalid",)
+    if len(igmp_msg) < 8:
+        return ("invalid",)
+    # 报告头第 1、4..7 字节为保留字段，按 RFC 接收时忽略
+    ngroups = (igmp_msg[6] << 8) | igmp_msg[7]
+    offset = 8
+    records = []
+    for _ in range(ngroups):
+        if len(igmp_msg) - offset < 8:
+            return ("invalid",)  # 组记录固定头（8 字节含组地址）不闭合
+        rtype = igmp_msg[offset]
+        aux_len = igmp_msg[offset + 1]
+        if rtype not in IGMPV3_RECORD_TYPES:
+            return ("invalid",)  # 记录类型不在 1..6
+        nsrcs = (
+            (igmp_msg[offset + 2] << 8) | igmp_msg[offset + 3]
+        )
+        group_octets = igmp_msg[offset + 4:offset + 8]
+        if not 224 <= group_octets[0] <= 239:  # 组地址须为 D 类
+            return ("invalid",)
+        end = offset + 8 + 4 * nsrcs + 4 * aux_len
+        if end > len(igmp_msg):
+            return ("invalid",)  # 源地址数组（或辅助数据）不闭合
+        sources = []
+        for source_index in range(nsrcs):
+            source_octets = igmp_msg[
+                offset + 8 + 4 * source_index:
+                offset + 12 + 4 * source_index
+            ]
+            if not _ipv4_unicast(source_octets):
+                return ("invalid",)  # 源地址须为有效单播
+            sources.append(tuple(source_octets))
+        records.append(
+            (rtype, ".".join(str(value) for value in group_octets),
+             tuple(sources))
+        )
+        offset = end
+    if offset != len(igmp_msg):
+        return ("invalid",)  # 记录数与内容不符（多字节无法闭合）
+    return ("ok", records)
+
+
+def _parse_igmp(raw, ethertype_offset):
+    """解析 IPv4 帧中的 IGMP 控制消息（IGMPv2 与 IGMPv3 Report）。
+
+    仅在 ethertype 为 0x0800 时调用：
+
+    - 返回 None：非协议号 2、分片或 IPv4 头非法/校验失败，调用方按普通
+      IPv4 帧处理（组播沿用泛洪或成员投递）；
+    - 返回 ("invalid",)：IPv4 外层合法且为未分片协议号 2，但 IGMP 长度、
+      类型、组地址或校验非法，调用方固定输出 igmp_invalid 且不改状态；
+    - 返回 ("v2", mtype, group)：校验通过的 IGMPv2 Query/Report/Leave，
+      group 为点分十进制组地址（Query 不校验组地址）；
+    - 返回 ("v3", records)：校验通过的 IGMPv3 Membership Report，records
+      为 (rtype, group, sources) 列表。
+    """
+    envelope = _parse_ipv4_igmp_envelope(raw, ethertype_offset)
+    if envelope is None:
+        return None
+    if envelope[0] == "invalid":
+        return ("invalid",)
+    igmp_msg = envelope[1]
     mtype = igmp_msg[0]
+    if mtype == IGMP_TYPE_REPORT_V3:
+        parsed = _parse_igmp_v3_report(igmp_msg)
+        if parsed[0] == "invalid":
+            return ("invalid",)
+        return ("v3", parsed[1])
     if mtype not in IGMP_CONTROL_ACTIONS:
-        return ("invalid",)  # 类型非法（含 IGMPv3 等）
+        return ("invalid",)  # 类型非法（含 IGMPv1 0x12 等）
     if len(igmp_msg) != 8:
         return ("invalid",)  # IGMPv2 Query/Report/Leave 恰为 8 字节
     if _internet_checksum(igmp_msg) != 0:  # IGMP 校验
@@ -17856,12 +17948,13 @@ def _parse_igmp_v2(raw, ethertype_offset):
         # 其余组地址非法
         if tuple(octets) != (0, 0, 0, 0) and not 224 <= octets[0] <= 239:
             return ("invalid",)
-    return ("ok", mtype, group)
+    return ("v2", mtype, group)
 
 
 def _ipv4_multicast_group(raw, ethertype_offset):
-    """其他 IPv4 组播的数据帧：目的 MAC 与 D 类组地址映射一致时返回点分
-    十进制组地址，否则返回 None（调用方沿用泛洪）。"""
+    """其他 IPv4 组播的数据帧：目的 MAC 与 D 类组地址映射一致时返回
+    (点分十进制组地址, 源 IPv4 4 元组)，否则返回 None（调用方沿用泛洪）。
+    源地址供 IGMPv3 INCLUDE/EXCLUDE 成员过滤使用。"""
     payload = raw[ethertype_offset + 2:-4]
     if len(payload) < 20:
         return None
@@ -17873,7 +17966,7 @@ def _ipv4_multicast_group(raw, ethertype_offset):
     )
     if raw[0:6] != expected_mac:
         return None
-    return ".".join(str(value) for value in octets)
+    return ".".join(str(value) for value in octets), tuple(payload[12:16])
 
 
 def _forward_stp_work_total(bridges, links, ports, events):
@@ -17911,15 +18004,48 @@ def forward_stp_work(bridges, links, ports, events, limit):
         raise ForwardStpWorkLimit
 
 
+def _igmp_v3_work(raw, ethertype_offset):
+    """单帧中 IGMPv3 组记录与源地址的工作量单位：每条组记录及其每个源
+    地址各计 1。以外层可识别的 0x22 报文头声明值计数（记录头不闭合即
+    止），与整帧是否最终校验失败无关。"""
+    envelope = _parse_ipv4_igmp_envelope(raw, ethertype_offset)
+    if envelope is None or envelope[0] == "invalid":
+        return 0
+    igmp_msg = envelope[1]
+    if len(igmp_msg) < 8 or igmp_msg[0] != IGMP_TYPE_REPORT_V3:
+        return 0
+    ngroups = (igmp_msg[6] << 8) | igmp_msg[7]
+    offset = 8
+    work = 0
+    for _ in range(ngroups):
+        if len(igmp_msg) - offset < 8:  # 记录固定头不闭合：无实际记录
+            break
+        nsrcs = (igmp_msg[offset + 2] << 8) | igmp_msg[offset + 3]
+        aux_len = igmp_msg[offset + 1]
+        end = offset + 8 + 4 * nsrcs + 4 * aux_len
+        if end > len(igmp_msg):  # 声明块不闭合：不为残缺记录计费
+            break
+        work += 1 + nsrcs
+        offset = end
+    return work
+
+
 def igmp_snoop_work(bridges, links, ports, events, limit):
     """igmp-snoop-decode 工作量预演：现有 stp-decode（forward-stp）工作量
-    再加 N*(N+P+1)，N 为事件数（链路与帧合计）、P 为端口数。等于上限
-    合法，超过即抛 IgmpWorkLimit。
+    再加 N*(N+P+1)，N 为事件数（链路与帧合计）、P 为端口数；此外每帧
+    IGMPv3 Membership Report 中的每条组记录与每个源地址各加 1。等于
+    上限合法，超过即抛 IgmpWorkLimit。
     """
     N = len(events)
     P = len(ports)
     work = _forward_stp_work_total(bridges, links, ports, events)
     work += N * (N + P + 1)
+    for item in events:
+        if item[0] != "frame":
+            continue
+        raw = item[3]
+        ethertype_offset = 16 if raw[12:14] == FRAME_DECODE_TAG else 12
+        work += _igmp_v3_work(raw, ethertype_offset)
     if work > limit:
         raise IgmpWorkLimit
 
@@ -17928,16 +18054,22 @@ def igmp_snoop_decode(
     bridges, links, delay, bridge_name, ports, age, max_frame,
     membership_age, router_ports, events, observer=None,
 ):
-    """在 stp-decode 转发/学习/统计语义上增加 IGMPv2 snooping。
+    """在 stp-decode 转发/学习/统计语义上增加 IGMPv2/v3 snooping。
 
-    成员表 membership：(vlan, group) -> {port: expires（绝对时刻）}。
-    每个事件前删除 expires<=t 的成员；Report 建立或刷新至
-    t+membership_age，Leave 立即删除入端口成员，链路断开或端口退出
-    forwarding 时清除该端口全部成员。Report/Leave 仅发往同 VLAN 可转发
-    的 router_ports，无合格路由端口时泛洪；Query 始终泛洪；其他 IPv4
-    组播在 MAC/组地址映射一致且有成员时仅发往成员与路由端口；其余
-    组播沿用泛洪。协议号 2 但 IGMP 非法的帧固定 igmp_invalid、空 ports、
-    计 drop 且不改任何状态。observer 语义同 stp-check。
+    成员表 membership：(vlan, group) -> {port: entry}，entry 为
+    {"expires": 绝对时刻}（仅由 IGMPv2 建立）或
+    {"expires": 绝对时刻, "mode": "include"/"exclude",
+     "sources": set(4 元组)}（经 IGMPv3 更新）。
+    每个事件前删除 expires<=t 的成员；v2 Report 建立或刷新至
+    t+membership_age，Leave 立即删除入端口成员；v3 Report 整帧解析成功
+    后按报文顺序依次应用组记录（空 INCLUDE 删除成员，空 EXCLUDE 表示
+    接收全部源），受影响成员 expires 统一为 t+membership_age；链路断开
+    或端口退出 forwarding 时清除该端口全部成员。Report/Leave 仅发往同
+    VLAN 可转发的 router_ports，无合格路由端口时泛洪；Query 始终泛洪；
+    其他 IPv4 组播在 MAC/组地址映射一致且有成员时，按各成员 INCLUDE/
+    EXCLUDE 源集合过滤后仅发往命中成员与路由端口；其余组播沿用泛洪。
+    协议号 2 但 IGMP 非法的帧固定 igmp_invalid、空 ports、计 drop 且不
+    改任何状态。observer 语义同 stp-check。
     """
     by_id = {link["id"]: link for link in links}
     by_name = {port["name"]: port for port in ports}
@@ -18045,11 +18177,73 @@ def igmp_snoop_decode(
             (key, table) for key, table in membership.items()
         ]:
             for port_name in [
-                name for name, expires in table.items() if expires <= t
+                name for name, entry in table.items()
+                if entry["expires"] <= t
             ]:
                 del table[port_name]
             if not table:
                 del membership[key]
+
+    def apply_v3_records(t, vlan, port_name, records):
+        """整帧 v3 报告解析成功后，按报文顺序依次作用于入端口成员。
+
+        每条记录都把对应成员的 expires 统一刷新为 t+membership_age。空
+        INCLUDE 删除成员；空 EXCLUDE 以空源集合表示接收全部源。
+        """
+        for rtype, group, sources in records:
+            key = (vlan, group)
+            table = membership.get(key)
+            source_set = set(sources)
+            delete = False
+            if rtype in (
+                IGMPV3_MODE_IS_INCLUDE, IGMPV3_CHANGE_TO_INCLUDE
+            ):
+                # 以新源集替换 INCLUDE；空集合删除成员
+                if source_set:
+                    new_mode, new_sources = "include", source_set
+                else:
+                    delete = True
+            elif rtype in (
+                IGMPV3_MODE_IS_EXCLUDE, IGMPV3_CHANGE_TO_EXCLUDE
+            ):
+                # 以新源集替换 EXCLUDE；空集合表示接收全部源
+                new_mode, new_sources = "exclude", source_set
+            else:
+                old = table.get(port_name) if table else None
+                if old is None:
+                    # 完全无成员：以 INCLUDE 空集为增量基线
+                    current_mode, current = "include", set()
+                elif "mode" not in old:
+                    # 仅经 IGMPv2 建立的成员：v2 加入等价 EXCLUDE 空集
+                    current_mode, current = "exclude", set()
+                else:
+                    current_mode, current = old["mode"], set(old["sources"])
+                if rtype == IGMPV3_ALLOW_NEW_SOURCES:
+                    if current_mode == "include":
+                        # INCLUDE 取并集
+                        new_mode, new_sources = "include", current | source_set
+                    else:
+                        # EXCLUDE 做差集；差空仍为 EXCLUDE {}（接收全部源）
+                        new_mode, new_sources = "exclude", current - source_set
+                else:  # BLOCK_OLD_SOURCES
+                    if current_mode == "include":
+                        # INCLUDE 做差集；差空删除成员
+                        new_mode, new_sources = "include", current - source_set
+                    else:
+                        # EXCLUDE 取并集
+                        new_mode, new_sources = "exclude", current | source_set
+                if new_mode == "include" and not new_sources:
+                    delete = True
+            if delete:
+                if table is not None:
+                    table.pop(port_name, None)
+                    if not table:
+                        del membership[key]
+            else:
+                membership.setdefault(key, {})[port_name] = {
+                    "expires": t + membership_age, "mode": new_mode,
+                    "sources": new_sources,
+                }
 
     converge(0)
     for item in events:
@@ -18145,13 +18339,13 @@ def igmp_snoop_decode(
             fdb[(vlan, src)] = [port_name, t]
         elif state == "forwarding":
             igmp_info = (
-                _parse_igmp_v2(raw, ethertype_offset)
+                _parse_igmp(raw, ethertype_offset)
                 if ethertype == IPV4_ETHER_TYPE
                 else None
             )
             if igmp_info is not None and igmp_info[0] == "invalid":
-                # 外层合法的协议号 2 帧但 IGMP 非法：不改任何状态，
-                # action 固定 igmp_invalid、ports 为空并计入丢弃
+                # 外层合法的协议号 2 帧但 IGMP 非法（含坏 v3 报告）：不改
+                # 任何状态，action 固定 igmp_invalid、ports 为空并计丢弃
                 port_stats[port_name]["drop"] += 1
                 vlan_stats[vlan]["drop"] += 1
                 entry = {
@@ -18168,11 +18362,20 @@ def igmp_snoop_decode(
             fdb[(vlan, src)] = [port_name, t]
             is_group = int(dst[:2], 16) & 1
             eligible = eligible_names(t, vlan, port_name)
-            if igmp_info is not None:  # 合法 IGMPv2 控制帧
+            if igmp_info is not None and igmp_info[0] == "v3":
+                # 整帧组记录与源数组已全部校验通过：按报文顺序一次提交
+                apply_v3_records(t, vlan, port_name, igmp_info[1])
+                routers = [
+                    name for name in eligible if name in router_set
+                ]
+                egress = routers if routers else eligible
+                action = "igmpv3_report"
+            elif igmp_info is not None:  # 合法 IGMPv2 控制帧
                 _, mtype, group = igmp_info
                 if mtype == IGMP_TYPE_REPORT_V2:
+                    # v2 加入不带源过滤：v2 形态条目（无 mode/sources）
                     membership.setdefault((vlan, group), {})[port_name] = (
-                        t + membership_age
+                        {"expires": t + membership_age}
                     )
                     routers = [
                         name for name in eligible if name in router_set
@@ -18194,18 +18397,37 @@ def igmp_snoop_decode(
                     egress = eligible
                     action = "igmp_query"
             elif is_group:
-                group = (
-                    _ipv4_multicast_group(raw, ethertype_offset)
-                    if ethertype == IPV4_ETHER_TYPE
-                    else None
-                )
+                if ethertype == IPV4_ETHER_TYPE:
+                    mc_info = _ipv4_multicast_group(raw, ethertype_offset)
+                else:
+                    mc_info = None
+                if mc_info is None:
+                    group, data_source = None, None
+                else:
+                    group, data_source = mc_info
                 table = (
                     membership.get((vlan, group))
                     if group is not None
                     else None
                 )
-                if table:  # 命中成员表：仅发往成员端口与路由端口
-                    targets = set(table) | router_set
+                if table:  # 命中成员表：按源过滤后发往命中成员与路由端口
+                    matching = {
+                        name
+                        for name, entry in table.items()
+                        if (
+                            "mode" not in entry
+                            or (
+                                entry["mode"] == "include"
+                                and data_source in entry["sources"]
+                            )
+                            or (
+                                entry["mode"] == "exclude"
+                                and data_source not in entry["sources"]
+                            )
+                        )
+                    }
+                    # v2 成员（无 mode）接收全部源；路由端口恒接收不过滤
+                    targets = matching | router_set
                     egress = [
                         name for name in eligible if name in targets
                     ]
@@ -18256,10 +18478,17 @@ def igmp_snoop_decode(
         ),
     ):
         table = membership[(vlan, group)]
-        members = [
-            {"name": name, "expires": table[name]}
-            for name in sorted(table, key=lambda value: port_order[value])
-        ]
+        members = []
+        for name in sorted(table, key=lambda value: port_order[value]):
+            entry = table[name]
+            member = {"name": name, "expires": entry["expires"]}
+            if "mode" in entry:  # 经 v3 更新的成员：固定键序追加 mode、sources
+                member["mode"] = entry["mode"]
+                member["sources"] = [
+                    ".".join(str(value) for value in octets)
+                    for octets in sorted(entry["sources"])
+                ]
+            members.append(member)
         groups.append({"vlan": vlan, "group": group, "members": members})
     return {
         "results": results,
