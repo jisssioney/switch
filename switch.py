@@ -55,6 +55,26 @@ LAG_CONFIG_KEYS = frozenset(
 LAG_KEYS = frozenset(("name", "members", "hash"))
 LAG_HASH_FIELDS = ("src", "dst", "vlan")
 MEMBER_EVENT_KEYS = frozenset(("t", "member", "up"))
+# lacp：在 lag 配置基础上新增系统级协商参数与逐成员 port_id/port_priority
+LACP_LAG_KEYS = frozenset(
+    ("name", "members", "hash", "system_id", "system_priority", "key",
+     "mode", "timeout", "min_links")
+)
+LACP_MEMBER_KEYS = frozenset(
+    ("name", "port_id", "port_priority")
+)
+LACP_MODES = ("active", "passive")
+LACP_TIMEOUTS = ("short", "long")
+# short：周期 1、超时 3；long：周期 30、超时 90
+LACP_PERIOD = {"short": 1, "long": 30}
+LACP_TIMEOUT = {"short": 3, "long": 90}
+TICK_EVENT_KEYS = frozenset(("t", "tick"))
+LACP_PEER_EVENT_KEYS = frozenset(
+    ("t", "member", "peer_system_id", "peer_system_priority", "peer_key",
+     "peer_port_id", "peer_port_priority", "aggregation", "synchronization",
+     "collecting", "distributing")
+)
+LACP_PEER_STATE_KEYS = ("synchronization", "collecting", "distributing")
 MIRROR_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm", "lags",
      "mirror")
@@ -130,6 +150,10 @@ class StormWorkLimit(Exception):
 
 
 class LagWorkLimit(Exception):
+    pass
+
+
+class LacpWorkLimit(Exception):
     pass
 
 
@@ -4632,6 +4656,871 @@ def lag_check_work(
         if usable:  # 不可用成员入帧丢弃且不学习
             learn_port = ingress_lag["name"] if ingress_lag else port_name
             suppress(t, port_name, vlan, src, dst, state, learn_port)
+
+
+def _lacp_lag_sort_key(member_state):
+    """候选成员的伙伴冲突全序键：对端 system_priority、system_id、本地
+    port_priority、port_id、配置顺序，全部升序。"""
+    partner = member_state["partner"]
+    cfg = member_state["cfg"]
+    return (
+        partner["peer_system_priority"],
+        partner["peer_system_id"],
+        cfg["port_priority"],
+        cfg["port_id"],
+        cfg["order"],
+    )
+
+
+def validate_lacp_config(config):
+    """lacp 配置：沿用 lag 全部键与语义，lags 项改带协商参数，members 由
+    字符串改为成员对象（name/port_id/port_priority）。"""
+    if not isinstance(config, dict) or frozenset(config) != LAG_CONFIG_KEYS:
+        raise InvalidInput("bad config")
+    bridges, links, delay, bridge, ports, age, storm = (
+        validate_forward_stp_storm_config(
+            {
+                "bridges": config["bridges"],
+                "links": config["links"],
+                "delay": config["delay"],
+                "bridge": config["bridge"],
+                "ports": config["ports"],
+                "age": config["age"],
+                "storm": config["storm"],
+            }
+        )
+    )
+    lags = config["lags"]
+    if not isinstance(lags, list) or not lags:
+        raise InvalidInput("bad lags")
+    by_name = {port["name"]: port for port in ports}
+    names = []
+    used = set()
+    parsed = []
+    for lag in lags:
+        if not isinstance(lag, dict) or frozenset(lag) != LACP_LAG_KEYS:
+            raise InvalidInput("bad lag")
+        name = lag["name"]
+        members = lag["members"]
+        hash_fields = lag["hash"]
+        system_id = lag["system_id"]
+        system_priority = lag["system_priority"]
+        key = lag["key"]
+        mode = lag["mode"]
+        timeout = lag["timeout"]
+        min_links = lag["min_links"]
+        if not isinstance(name, str) or not name or name in by_name:
+            raise InvalidInput("bad lag name")
+        if not isinstance(members, list) or len(members) < 2:
+            raise InvalidInput("bad lag members")
+        member_names = []
+        parsed_members = []
+        port_ids = set()
+        port_priorities = set()
+        first_port = None
+        for order, member in enumerate(members):
+            if not isinstance(member, dict) or frozenset(member) != LACP_MEMBER_KEYS:
+                raise InvalidInput("bad lag member")
+            mname = member["name"]
+            port_id = member["port_id"]
+            port_priority = member["port_priority"]
+            if not isinstance(mname, str) or mname not in by_name:
+                raise InvalidInput("bad lag member")
+            if mname in used or mname in member_names:
+                raise InvalidInput("lag members must be globally distinct")
+            if not _is_int(port_id) or not 1 <= port_id <= 65535:
+                raise InvalidInput("bad lacp port_id")
+            if not _is_int(port_priority) or not 0 <= port_priority <= 65535:
+                raise InvalidInput("bad lacp port_priority")
+            if port_id in port_ids or port_priority in port_priorities:
+                raise InvalidInput("lacp port_id/port_priority must be distinct")
+            port_ids.add(port_id)
+            port_priorities.add(port_priority)
+            port = by_name[mname]
+            if first_port is None:
+                first_port = port
+            elif (
+                port["mode"] != first_port["mode"]
+                or port["pvid"] != first_port["pvid"]
+                or port["allowed"] != first_port["allowed"]
+                or port["untagged"] != first_port["untagged"]
+            ):
+                raise InvalidInput("lag members must share vlan config")
+            member_names.append(mname)
+            parsed_members.append(
+                {
+                    "name": mname,
+                    "port_id": port_id,
+                    "port_priority": port_priority,
+                    "order": order,
+                }
+            )
+        used.update(member_names)
+        if not valid_mac(system_id):
+            raise InvalidInput("bad lacp system_id")
+        if not _is_int(system_priority) or not 0 <= system_priority <= 65535:
+            raise InvalidInput("bad lacp system_priority")
+        if not _is_int(key) or not 0 <= key <= 65535:
+            raise InvalidInput("bad lacp key")
+        if mode not in LACP_MODES:
+            raise InvalidInput("bad lacp mode")
+        if timeout not in LACP_TIMEOUTS:
+            raise InvalidInput("bad lacp timeout")
+        if not _is_int(min_links) or not 1 <= min_links <= len(members):
+            raise InvalidInput("bad lacp min_links")
+        if (
+            not isinstance(hash_fields, list)
+            or not hash_fields
+            or len(set(hash_fields)) != len(hash_fields)
+            or any(field not in LAG_HASH_FIELDS for field in hash_fields)
+            or [f for f in LAG_HASH_FIELDS if f in hash_fields] != hash_fields
+        ):
+            raise InvalidInput("bad lag hash")
+        names.append(name)
+        parsed.append(
+            {
+                "name": name,
+                "members": parsed_members,
+                "hash": list(hash_fields),
+                "system_id": system_id,
+                "system_priority": system_priority,
+                "key": key,
+                "mode": mode,
+                "timeout": timeout,
+                "min_links": min_links,
+            }
+        )
+    if len(set(names)) != len(names):
+        raise InvalidInput("lag names must be distinct")
+    return bridges, links, delay, bridge, ports, age, storm, parsed
+
+
+def validate_lacp_events(events, ports, link_ids, lags):
+    """lacp 事件：lag 的链路/成员/数据帧事件，外加对端 LACP 通告与 tick。"""
+    if not isinstance(events, list):
+        raise InvalidInput("events must be a list")
+    names = {port["name"] for port in ports}
+    member_set = {
+        member["name"] for lag in lags for member in lag["members"]
+    }
+    result = []
+    prev_t = None
+    for event in events:
+        if not isinstance(event, dict):
+            raise InvalidInput("bad event")
+        keys = frozenset(event)
+        t = event.get("t")
+        if not _is_int(t) or t < 0:
+            raise InvalidInput("bad t")
+        if prev_t is not None and t < prev_t:
+            raise InvalidInput("t not monotonic")
+        if keys == STP_EVENT_KEYS:
+            lid = event["id"]
+            up = event["up"]
+            if not isinstance(lid, str) or not lid or lid not in link_ids:
+                raise InvalidInput("bad event id")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("link", t, lid, up))
+        elif keys == MEMBER_EVENT_KEYS:
+            member = event["member"]
+            up = event["up"]
+            if not isinstance(member, str) or member not in member_set:
+                raise InvalidInput("bad event member")
+            if not isinstance(up, bool):
+                raise InvalidInput("bad up")
+            result.append(("member", t, member, up))
+        elif keys == FRAME_KEYS_V2:
+            port = event["port"]
+            src = event["src"]
+            dst = event["dst"]
+            vlan = event["vlan"]
+            if not isinstance(port, str) or port not in names:
+                raise InvalidInput("unknown port")
+            if not valid_mac(src):
+                raise InvalidInput("bad src")
+            if not valid_dst_mac(dst):
+                raise InvalidInput("bad dst")
+            if vlan is not None and not _valid_vlan_id(vlan):
+                raise InvalidInput("bad vlan")
+            result.append(("frame", t, port, src, dst, vlan))
+        elif keys == TICK_EVENT_KEYS:
+            if event["tick"] is not True:
+                raise InvalidInput("bad tick")
+            result.append(("tick", t))
+        elif keys == LACP_PEER_EVENT_KEYS:
+            member = event["member"]
+            if not isinstance(member, str) or member not in member_set:
+                raise InvalidInput("bad event member")
+            peer_system_id = event["peer_system_id"]
+            peer_system_priority = event["peer_system_priority"]
+            peer_key = event["peer_key"]
+            peer_port_id = event["peer_port_id"]
+            peer_port_priority = event["peer_port_priority"]
+            aggregation = event["aggregation"]
+            synchronization = event["synchronization"]
+            collecting = event["collecting"]
+            distributing = event["distributing"]
+            if not valid_mac(peer_system_id):
+                raise InvalidInput("bad peer_system_id")
+            if (
+                not _is_int(peer_system_priority)
+                or not 0 <= peer_system_priority <= 65535
+            ):
+                raise InvalidInput("bad peer_system_priority")
+            if not _is_int(peer_key) or not 0 <= peer_key <= 65535:
+                raise InvalidInput("bad peer_key")
+            if not _is_int(peer_port_id) or not 1 <= peer_port_id <= 65535:
+                raise InvalidInput("bad peer_port_id")
+            if (
+                not _is_int(peer_port_priority)
+                or not 0 <= peer_port_priority <= 65535
+            ):
+                raise InvalidInput("bad peer_port_priority")
+            if not all(
+                isinstance(flag, bool)
+                for flag in (
+                    aggregation, synchronization, collecting, distributing
+                )
+            ):
+                raise InvalidInput("bad peer state")
+            result.append(
+                (
+                    "peer", t, member,
+                    {
+                        "peer_system_id": peer_system_id,
+                        "peer_system_priority": peer_system_priority,
+                        "peer_key": peer_key,
+                        "peer_port_id": peer_port_id,
+                        "peer_port_priority": peer_port_priority,
+                        "aggregation": aggregation,
+                        "synchronization": synchronization,
+                        "collecting": collecting,
+                        "distributing": distributing,
+                    },
+                )
+            )
+        else:
+            raise InvalidInput("bad event")
+        prev_t = t
+    return result
+
+
+def lacp_work(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, events, limit
+):
+    """lacp 工作量预演：独立引擎实例无副作用运行完整协商与转发。
+
+    全量语义校验通过后调用；初始收敛计 B+L+2U。每个新时间点计
+    K+H+Q+1+M（老化/解封扫描、定时器推进与超时后候选重选），到期通告
+    每条 1；每个事件基础 1（含候选重选），链路实际改变再加
+    B+L+2U+2P，数据帧再加 P+M，passive 响应每条 1。累计等于上限合法，
+    首次超过即抛 LacpWorkLimit，不产生任何输出。
+    """
+    _lacp_run(
+        bridges, links, delay, bridge_name, ports, age, storm, lags, events,
+        limit=limit,
+    )
+
+
+def forward_lacp(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, events
+):
+    """lacp 公共入口：显式事件时钟驱动 LACP 协商，转发规则沿用 lag。"""
+    return _lacp_run(
+        bridges, links, delay, bridge_name, ports, age, storm, lags, events,
+        limit=None,
+    )
+
+
+def _lacp_run(
+    bridges, links, delay, bridge_name, ports, age, storm, lags, events,
+    limit=None,
+):
+    window = storm["window"]
+    limits = storm["limits"]
+    move_limit = storm["move_limit"]
+    hold = storm["hold"]
+    B = len(bridges)
+    L = len(links)
+    P = len(ports)
+    sim_links = [dict(link) for link in links]
+    by_id = {link["id"]: link for link in sim_links}
+    by_name = {port["name"]: port for port in ports}
+    lag_by_name = {lag["name"]: lag for lag in lags}
+    lag_of = {}
+    member_cfg = {}
+    member_names_all = []
+    for lag in lags:
+        for member in lag["members"]:
+            lag_of[member["name"]] = lag
+            member_cfg[member["name"]] = member
+            member_names_all.append(member["name"])
+    M = len(member_names_all)
+    port_link = {}
+    for link in sim_links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [逻辑口（物理口名或 lag 名）, seen]
+    port_stats = {
+        port["name"]: {"rx": 0, "tx": 0, "drop": 0} for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    rate_queues = {}
+    move_queues = {}
+    last_learn = {}
+    blocked = {}
+    results = []
+
+    # 逐成员 LACP 协商状态
+    mstate = {}
+    for lag in lags:
+        for member in lag["members"]:
+            mstate[member["name"]] = {
+                "cfg": member,
+                "lag": lag,
+                "enabled": True,  # 成员事件管理开关，初始可用
+                "partner": None,  # 最近对端 actor 通告
+                "seen": None,  # 最近对端通告时刻
+                "next_due": 0 if lag["mode"] == "active" else None,
+                "selected": False,
+                "synchronization": False,
+                "collecting": False,
+                "distributing": False,
+            }
+
+    previous = {}
+    since = {}
+    roles = {name: {} for name in bridges}
+    work_box = [0]
+
+    def charge(amount):
+        if limit is not None:
+            work_box[0] += amount
+            if work_box[0] > limit:
+                raise LacpWorkLimit
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, sim_links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"
+        return True, state
+
+    def phys_link_up(name):
+        """LACP 报文收发所需物理可用：管理 up、端口 up、链路 up（与 STP 无关）。"""
+        link = port_link.get(name)
+        return (
+            mstate[name]["enabled"]
+            and by_name[name]["up"]
+            and (link is None or link["up"])
+        )
+
+    def stp_forwarding(name, t):
+        return port_status(name, t) == (True, "forwarding")
+
+    def reselect(t):
+        """超时/事件后重算各聚合口候选选择与本端 actor 状态。
+
+        每个 lag 中物理可用、伙伴新鲜、key 相等且对端允许聚合的成员进入
+        候选；候选按伙伴冲突全序键排序，选中最低（system_priority,
+        system_id）伙伴系统，同一伙伴端口在多个本地成员上出现时仅保留
+        （port_priority, port_id, 配置顺序）最低者；其余成员保持
+        individual。对端 synchronization/collecting/distributing 全为
+        true 且 STP forwarding 时本端三态置位并可转发。
+        """
+        lag_up = {}
+        forwarding_members = set()
+        for lag in lags:
+            eligible = []
+            for member in lag["members"]:
+                st = mstate[member["name"]]
+                partner = st["partner"]
+                if (
+                    phys_link_up(member["name"])
+                    and partner is not None
+                    and partner["peer_key"] == lag["key"]
+                    and partner["aggregation"]
+                ):
+                    eligible.append(st)
+            chosen_ids = set()
+            if eligible:
+                ordered = sorted(eligible, key=_lacp_lag_sort_key)
+                win = ordered[0]
+                win_priority = win["partner"]["peer_system_priority"]
+                win_system = win["partner"]["peer_system_id"]
+                seen_peer_ports = {}
+                for st in ordered:
+                    partner = st["partner"]
+                    if (
+                        partner["peer_system_priority"] != win_priority
+                        or partner["peer_system_id"] != win_system
+                    ):
+                        continue
+                    peer_port = partner["peer_port_id"]
+                    if peer_port not in seen_peer_ports:
+                        seen_peer_ports[peer_port] = st
+                chosen_ids = {
+                    st["cfg"]["name"] for st in seen_peer_ports.values()
+                }
+            effective = 0
+            for member in lag["members"]:
+                name = member["name"]
+                st = mstate[name]
+                selected = name in chosen_ids
+                partner = st["partner"]
+                ready = (
+                    selected
+                    and partner is not None
+                    and partner["synchronization"]
+                    and partner["collecting"]
+                    and partner["distributing"]
+                )
+                st["selected"] = selected
+                st["synchronization"] = ready
+                st["collecting"] = ready
+                st["distributing"] = ready
+                if ready and stp_forwarding(name, t):
+                    forwarding_members.add(name)
+                    effective += 1
+            lag_up[lag["name"]] = effective >= lag["min_links"]
+        return lag_up, forwarding_members
+
+    def snapshot(lag_up):
+        parts = []
+        for lag in lags:
+            parts.append(("lag", lag["name"], lag_up[lag["name"]]))
+            for member in lag["members"]:
+                st = mstate[member["name"]]
+                partner = st["partner"]
+                parts.append(
+                    (
+                        "m",
+                        member["name"],
+                        st["enabled"],
+                        phys_link_up(member["name"]),
+                        st["selected"],
+                        st["synchronization"],
+                        None if partner is None else (
+                            partner["peer_system_priority"],
+                            partner["peer_system_id"],
+                            partner["peer_key"],
+                            partner["peer_port_id"],
+                            partner["peer_port_priority"],
+                            partner["aggregation"],
+                            partner["synchronization"],
+                            partner["collecting"],
+                            partner["distributing"],
+                        ),
+                    )
+                )
+        return tuple(parts)
+
+    def actor_ad(name):
+        st = mstate[name]
+        cfg = st["cfg"]
+        lag = st["lag"]
+        return {
+            "aggregation": st["selected"],
+            "collecting": st["collecting"],
+            "distributing": st["distributing"],
+            "key": lag["key"],
+            "member": name,
+            "port_id": cfg["port_id"],
+            "port_priority": cfg["port_priority"],
+            "synchronization": st["synchronization"],
+            "system_id": lag["system_id"],
+            "system_priority": lag["system_priority"],
+        }
+
+    def lag_snapshot(lag_up):
+        out_lags = []
+        for lag in lags:
+            out_members = []
+            for member in lag["members"]:
+                name = member["name"]
+                st = mstate[name]
+                out_members.append(
+                    {
+                        "collecting": st["collecting"],
+                        "distributing": st["distributing"],
+                        "individual": not st["selected"],
+                        "name": name,
+                        "synchronization": st["synchronization"],
+                        "up": st["enabled"],
+                    }
+                )
+            out_lags.append(
+                {"members": out_members, "name": lag["name"],
+                 "up": lag_up[lag["name"]]}
+            )
+        return out_lags
+
+    def member_forwarding(name, t, vlan, forwarding_members):
+        return (
+            name in forwarding_members
+            and vlan in by_name[name]["allowed"]
+        )
+
+    def lag_candidates(lag, vlan, forwarding_members):
+        return [
+            member["name"]
+            for member in lag["members"]
+            if member["name"] in forwarding_members
+            and vlan in by_name[member["name"]]["allowed"]
+        ]
+
+    def lag_pick(lag, candidates, src, dst, vlan):
+        parts = []
+        for field in lag["hash"]:
+            if field == "src":
+                parts.append(src)
+            elif field == "dst":
+                parts.append(dst)
+            else:
+                parts.append(str(vlan))
+        digest = zlib.crc32("|".join(parts).encode("utf-8")) & 0xFFFFFFFF
+        return candidates[digest % len(candidates)]
+
+    def suppress(t, port_name, vlan, src, dst, state, learn_port):
+        if (port_name, vlan) in blocked:
+            return True
+        if state not in ("learning", "forwarding"):
+            return False
+        is_group = int(dst[:2], 16) & 1
+        if dst == BROADCAST_MAC:
+            category = "broadcast"
+        elif is_group:
+            category = "multicast"
+        else:
+            category = None if fdb.get((vlan, dst)) else "unknown"
+        if category is not None:
+            queue = rate_queues.get((port_name, vlan, category))
+            if queue is None:
+                queue = deque(maxlen=limits[category])
+                rate_queues[(port_name, vlan, category)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            if len(queue) >= limits[category]:
+                return True
+        prev = last_learn.get((vlan, src))
+        if prev is not None and prev != learn_port:
+            queue = move_queues.get((vlan, src))
+            if queue is None:
+                queue = deque(maxlen=move_limit)
+                move_queues[(vlan, src)] = queue
+            while queue and t - queue[0] >= window:
+                queue.popleft()
+            queue.append(t)
+            if len(queue) >= move_limit:
+                blocked[(port_name, vlan)] = t + hold
+                return True
+        if category is not None:
+            rate_queues[(port_name, vlan, category)].append(t)
+        fdb[(vlan, src)] = [learn_port, t]
+        last_learn[(vlan, src)] = learn_port
+        return False
+
+    U = sum(1 for link in sim_links if link["up"])
+    if limit is not None:
+        work_box[0] = B + L + 2 * U
+        if work_box[0] > limit:
+            raise LacpWorkLimit
+    converge(0)
+    lag_up, forwarding_members = reselect(0)
+    last_t = None
+    last_snapshot = snapshot(lag_up)
+
+    phase_bucket = []
+    for item in events:
+        t = item[1]
+        phase = last_t is None or t != last_t
+        before = last_snapshot
+        if phase:
+            # 时间点先老化/解封，再处理到期发送，最后对端超时并重选；
+            # 计费覆盖老化扫描（K+H+Q）、定时器推进（1）与超时后候选
+            # 重选（M）
+            charge(
+                len(fdb)
+                + len(blocked)
+                + sum(len(q) for q in rate_queues.values())
+                + sum(len(q) for q in move_queues.values())
+                + 1
+                + M
+            )
+            for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+                del fdb[key]
+            for key in [k for k, until in blocked.items() if t >= until]:
+                del blocked[key]
+            # 到期发送先于超时判定：active 成员周期发送；时间跳跃期间
+            # 只发一条，next_due 顺延至下一周期
+            phase_bucket = []
+            for name in sorted(member_names_all):
+                st = mstate[name]
+                if st["next_due"] is None or not phys_link_up(name):
+                    continue
+                period = LACP_PERIOD[st["lag"]["timeout"]]
+                if st["next_due"] <= t:
+                    while st["next_due"] <= t:
+                        st["next_due"] += period
+                    phase_bucket.append(actor_ad(name))
+            for _ in phase_bucket:
+                charge(1)
+            for name in member_names_all:
+                st = mstate[name]
+                if st["partner"] is not None:
+                    timeout_units = LACP_TIMEOUT[st["lag"]["timeout"]]
+                    if t - st["seen"] >= timeout_units:
+                        st["partner"] = None
+                        st["seen"] = None
+            lag_up, forwarding_members = reselect(t)
+        kind = item[0]
+        # 每个事件基础计费 1（覆盖事件处理与候选重选）
+        charge(1)
+        frame_entry = None
+        if kind == "link":
+            _, _, lid, up = item
+            changed = by_id[lid]["up"] != up
+            if changed:
+                U += 1 if up else -1
+                charge(B + L + 2 * U + 2 * P)
+                old_forwarding = forwarding_ports(t)
+                by_id[lid]["up"] = up
+                converge(t)
+                for name in old_forwarding - forwarding_ports(t):
+                    for key in [k for k, (p, _) in fdb.items() if p == name]:
+                        del fdb[key]
+                lag_up, forwarding_members = reselect(t)
+        elif kind == "member":
+            _, _, member, up = item
+            mstate[member]["enabled"] = up
+            lag_up, forwarding_members = reselect(t)
+        elif kind == "peer":
+            _, _, member, partner = item
+            st = mstate[member]
+            st["partner"] = partner
+            st["seen"] = t
+            lag_up, forwarding_members = reselect(t)
+            # passive 成员每收到一条通告即响应一条；active 仅周期发送
+            if st["lag"]["mode"] == "passive" and phys_link_up(member):
+                charge(1)
+                phase_bucket.append(actor_ad(member))
+        elif kind == "frame":
+            _, _, port_name, src, dst, tag = item
+            charge(P + M)
+            port_stats[port_name]["rx"] += 1
+            if tag is None:
+                vlan = by_name[port_name]["pvid"]
+                rejected = False
+            else:
+                vlan = tag
+                ingress = by_name[port_name]
+                rejected = (
+                    ingress["mode"] == "access"
+                    or vlan not in ingress["allowed"]
+                )
+            if rejected:
+                port_stats[port_name]["drop"] += 1
+                frame_entry = {"t": t, "action": "drop", "ports": []}
+            else:
+                vlan_stats[vlan]["rx"] += 1
+                ingress_lag = lag_of.get(port_name)
+                if ingress_lag is not None:
+                    usable = member_forwarding(
+                        port_name, t, vlan, forwarding_members
+                    ) and lag_up[ingress_lag["name"]]
+                    state = "forwarding" if usable else None
+                else:
+                    usable = True
+                    _, state = port_status(port_name, t)
+                egress = []
+                action = "drop"
+                if usable:
+                    learn_port = (
+                        ingress_lag["name"] if ingress_lag else port_name
+                    )
+                    suppressed = suppress(
+                        t, port_name, vlan, src, dst, state, learn_port
+                    )
+                    if not suppressed and state == "forwarding":
+                        is_group = int(dst[:2], 16) & 1
+                        hit = None if is_group else fdb.get((vlan, dst))
+                        if hit is not None and hit[0] != learn_port:
+                            target = hit[0]
+                            target_lag = lag_by_name.get(target)
+                            if target_lag is not None:
+                                candidates = lag_candidates(
+                                    target_lag, vlan, forwarding_members
+                                )
+                                if (
+                                    candidates
+                                    and lag_up[target_lag["name"]]
+                                ):
+                                    egress = [
+                                        lag_pick(
+                                            target_lag, candidates, src, dst,
+                                            vlan
+                                        )
+                                    ]
+                                    action = "unicast"
+                            else:
+                                target_up, target_state = port_status(
+                                    target, t
+                                )
+                                if (
+                                    target_up
+                                    and target_state == "forwarding"
+                                    and vlan in by_name[target]["allowed"]
+                                ):
+                                    egress = [target]
+                                    action = "unicast"
+                        elif hit is None:
+                            selected = {}
+                            for lag in lags:
+                                if ingress_lag is not None and lag is ingress_lag:
+                                    continue
+                                if not lag_up[lag["name"]]:
+                                    continue
+                                candidates = lag_candidates(
+                                    lag, vlan, forwarding_members
+                                )
+                                if candidates:
+                                    selected[lag["name"]] = lag_pick(
+                                        lag, candidates, src, dst, vlan
+                                    )
+                            for port in ports:
+                                name = port["name"]
+                                lag = lag_of.get(name)
+                                if lag is not None:
+                                    if selected.get(lag["name"]) == name:
+                                        egress.append(name)
+                                elif (
+                                    vlan in port["allowed"]
+                                    and name != port_name
+                                    and port_status(name, t)
+                                    == (True, "forwarding")
+                                ):
+                                    egress.append(name)
+                            if egress:
+                                action = "flood"
+                out_ports = []
+                for name in egress:
+                    port_stats[name]["tx"] += 1
+                    vlan_stats[vlan]["tx"] += 1
+                    out_ports.append(
+                        {
+                            "name": name,
+                            "vlan": (
+                                None
+                                if vlan in by_name[name]["untagged"]
+                                else vlan
+                            ),
+                        }
+                    )
+                if not egress:
+                    port_stats[port_name]["drop"] += 1
+                    vlan_stats[vlan]["drop"] += 1
+                frame_entry = {"t": t, "action": action, "ports": out_ports}
+        # tick 无额外处理
+        sent = sorted(phase_bucket, key=lambda ad: ad["member"])
+        # 到期发送只归入该时间点首个事件；同刻后续事件仅含自身触发的
+        # 被动响应
+        phase_bucket = []
+        after = snapshot(lag_up)
+        changed = before != after
+        results.append(
+            {
+                "changed": changed,
+                "frame": frame_entry,
+                "lags": lag_snapshot(lag_up),
+                "sent": sent,
+                "t": t,
+            }
+        )
+        last_snapshot = after
+        last_t = t
+
+    return {
+        "fdb": [
+            {
+                "mac": mac,
+                "port": entry[0],
+                "seen": entry[1],
+                "vlan": vlan,
+            }
+            for (vlan, mac), entry in sorted(fdb.items())
+        ],
+        "ports": [
+            {
+                "drop": port_stats[port["name"]]["drop"],
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+            }
+            for port in ports
+        ],
+        "results": results,
+        "vlans": [
+            {
+                "drop": vlan_stats[vlan]["drop"],
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "vlan": vlan,
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+    }
 
 
 def mirror_work(
@@ -17614,6 +18503,7 @@ DEFAULT_MAX_FORWARD_WORK = 10000000
 DEFAULT_MAX_FORWARD_STP_WORK = 10000000
 DEFAULT_MAX_STORM_WORK = 10000000
 DEFAULT_MAX_LAG_WORK = 10000000
+DEFAULT_MAX_LACP_WORK = 10000000
 DEFAULT_MAX_MIRROR_WORK = 10000000
 DEFAULT_MAX_ACL_WORK = 10000000
 DEFAULT_MAX_QOS_WORK = 10000000
@@ -23060,6 +23950,7 @@ SUBCOMMANDS = frozenset((
     "storm-check",
     "lag",
     "lag-check",
+    "lacp",
     "mirror",
     "mirror-check",
     "acl",
@@ -23823,6 +24714,7 @@ def main(argv):
     is_storm_check = args[:1] == ["storm-check"]
     is_lag = args[:1] == ["lag"]
     is_lag_check = args[:1] == ["lag-check"]
+    is_lacp = args[:1] == ["lacp"]
     is_mirror = args[:1] == ["mirror"]
     is_mirror_check = args[:1] == ["mirror-check"]
     is_acl = args[:1] == ["acl"]
@@ -23840,6 +24732,7 @@ def main(argv):
         or is_forward_stp
         or is_stp_check
         or is_forward_stp_storm or is_storm_check or is_lag or is_lag_check
+        or is_lacp
         or is_mirror or is_mirror_check
         or is_acl or is_acl_check or is_qos or is_qos_check
         or is_security or is_security_check or is_reload
@@ -23859,6 +24752,7 @@ def main(argv):
         "storm-check",
         "lag",
         "lag-check",
+        "lacp",
         "mirror",
         "mirror-check",
         "acl",
@@ -24041,6 +24935,23 @@ def main(argv):
         max_fdb_work = None
         max_forward_work = None
         max_forward_stp_work = None
+        max_mirror_work = None
+    elif is_lacp:
+        # lacp 沿用 lag 的资源上限；末项为 MAX_LACP_WORK，覆盖事件、
+        # 定时器、候选选择与转发
+        lacp_limits = limits + (DEFAULT_MAX_LACP_WORK,)
+        (
+            max_config_bytes,
+            max_data_bytes,
+            max_items,
+            max_output_bytes,
+            max_lacp_work,
+        ) = parsed + lacp_limits[len(parsed):]
+        max_stp_work = None
+        max_fdb_work = None
+        max_forward_work = None
+        max_forward_stp_work = None
+        max_lag_work = None
         max_mirror_work = None
     elif is_mirror:
         mirror_limits = limits + (DEFAULT_MAX_MIRROR_WORK,)
@@ -24388,6 +25299,43 @@ def main(argv):
                 storm,
                 lags,
                 max_frame,
+                events,
+            )
+        elif mode == "lacp":
+            (
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+            ) = validate_lacp_config(config)
+            link_ids = {link["id"] for link in links}
+            events = validate_lacp_events(data, ports, link_ids, lags)
+            # 全量语义校验后无副作用预演；超限不正式仿真
+            lacp_work(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
+                events,
+                max_lacp_work,
+            )
+            result = forward_lacp(
+                bridges,
+                links,
+                delay,
+                bridge,
+                ports,
+                age,
+                storm,
+                lags,
                 events,
             )
         elif mode == "mirror":
@@ -24876,6 +25824,9 @@ def main(argv):
         return 5
     except LagWorkLimit:
         _fail("lag_work_limit")
+        return 5
+    except LacpWorkLimit:
+        _fail("lacp_work_limit")
         return 5
     except MirrorWorkLimit:
         _fail("mirror_work_limit")
