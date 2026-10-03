@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """igmp-snoop-decode 端到端回归。
 
-覆盖：IGMPv2 Report/Leave/Query 识别与动作、成员建立/刷新/老化/删除、
+覆盖：IGMPv2 Report/Leave/Query 识别与动作、IGMPv3 Membership Report
+六种组记录与 INCLUDE/EXCLUDE 源地址过滤、成员建立/刷新/老化/删除、
 路由端口与无路由口泛洪、Query 始终泛洪、组成员数据按成员+路由端口
 转发（排除入端口、保留标签语义）、其余组播泛洪、外层合法但 IGMP
 非法固定 igmp_invalid（不改状态、计 drop）、分片/IPv4 头校验失败不
@@ -89,6 +90,50 @@ def ipv4_udp_like(group, src=(10, 0, 0, 9), udp_len=8):
     return ip_header(src, group, 17, len(payload)) + payload + b"\x00" * (
         46 - 20 - len(payload)
     )
+
+
+# IGMPv3 组记录类型
+V3_MODE_IS_INCLUDE = 1
+V3_MODE_IS_EXCLUDE = 2
+V3_CHANGE_TO_INCLUDE = 3
+V3_CHANGE_TO_EXCLUDE = 4
+V3_ALLOW_NEW_SOURCES = 5
+V3_BLOCK_OLD_SOURCES = 6
+
+
+def igmp_v3_message(records, bad_checksum=False, count=None,
+                    truncate=0, append=b"", aux_words=0):
+    """IGMPv3 Membership Report 报文。
+
+    records 为 (rtype, group, sources) 列表；count/truncate/append 用于
+    记录数不符、长度不闭合等非法场景。
+    """
+    body = b""
+    for rtype, group, sources in records:
+        body += (
+            bytes([rtype, aux_words])
+            + len(sources).to_bytes(2, "big")
+            + bytes(group)
+            + b"".join(bytes(source) for source in sources)
+            + b"\x00" * (4 * aux_words)
+        )
+    number = len(records) if count is None else count
+    msg = (
+        bytes([0x22, 0x00]) + b"\x00" * 4 + number.to_bytes(2, "big") + body
+    )
+    checksum = internet_checksum(msg)
+    if bad_checksum:
+        checksum ^= 0xFFFF
+    msg = msg[:2] + checksum.to_bytes(2, "big") + msg[4:]
+    msg += append
+    return msg if not truncate else msg[:-truncate]
+
+
+def ipv4_igmp_v3(records, src=(10, 0, 0, 2), **kwargs):
+    msg = igmp_v3_message(records, **kwargs)
+    iphdr = ip_header(src, (224, 0, 0, 22), 2, len(msg))
+    # L2 载荷至少 46 字节，不足处以链路层填充补齐
+    return iphdr + msg + b"\x00" * max(0, 46 - 20 - len(msg))
 
 
 def group_mac(group):
@@ -222,6 +267,19 @@ class IgmpSnoopCase(unittest.TestCase):
             t, port, dst if dst is not None else group_mac(group), src,
             payload if payload is not None else ipv4_udp_like(group),
             vlan=vlan,
+        )
+
+    def data_frame_src(self, t, port, group, src_ip, vlan=1):
+        """源 IPv4 地址可控的组播数据帧。"""
+        return raw_frame(
+            t, port, group_mac(group), "02:00:00:00:00:09",
+            ipv4_udp_like(group, src=src_ip), vlan=vlan,
+        )
+
+    def v3_report(self, t, port, records, vlan=1, **kwargs):
+        return raw_frame(
+            t, port, "01:00:5e:00:00:16", "02:00:00:00:00:02",
+            ipv4_igmp_v3(records, **kwargs), vlan=vlan,
         )
 
 
@@ -618,6 +676,343 @@ class IgmpAdmitTest(IgmpSnoopCase):
         self.assertEqual(result["groups"], [])
 
 
+class IgmpV3ControlTest(IgmpSnoopCase):
+    S1 = (10, 0, 0, 9)
+    S2 = (10, 0, 0, 10)
+    S3 = (10, 0, 0, 11)
+
+    def test_action_and_router_delivery(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(result["results"][0]["action"], "igmpv3_report")
+        # 仅发往同 VLAN 可转发路由端口（带标签）
+        self.assertEqual(
+            result["results"][0]["ports"], [{"name": "p1", "vlan": 1}]
+        )
+
+    def test_report_floods_without_eligible_router(self):
+        config = make_config(router_ports=())
+        events = [self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [])])]
+        result = self.simulate(config, events)
+        self.assertEqual(result["results"][0]["action"], "igmpv3_report")
+        self.assertEqual(
+            [p["name"] for p in result["results"][0]["ports"]],
+            ["p1", "p3", "p4"],
+        )
+
+    def test_include_filter(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            self.data_frame_src(2, "p3", G1, self.S1),
+            self.data_frame_src(3, "p3", G1, self.S2),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [r["action"] for r in result["results"]],
+            ["igmpv3_report", "multicast", "multicast"],
+        )
+        # S1 命中 INCLUDE：成员 p2 + 路由 p1；S2 不命中：仅路由 p1
+        self.assertEqual(
+            [p["name"] for p in result["results"][1]["ports"]], ["p1", "p2"]
+        )
+        self.assertEqual(
+            [p["name"] for p in result["results"][2]["ports"]], ["p1"]
+        )
+
+    def test_empty_include_deletes_member(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            self.v3_report(2, "p2", [(V3_MODE_IS_INCLUDE, G1, [])]),
+            self.data_frame_src(3, "p3", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(result["results"][2]["action"], "flood")
+        self.assertEqual(result["groups"], [])
+
+    def test_exclude_filter_and_empty_means_all(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_EXCLUDE, G1, [self.S1])]),
+            self.data_frame_src(2, "p3", G1, self.S1),  # 被排除
+            self.data_frame_src(3, "p3", G1, self.S2),  # 接收
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [p["name"] for p in result["results"][1]["ports"]], ["p1"]
+        )
+        self.assertEqual(
+            [p["name"] for p in result["results"][2]["ports"]], ["p1", "p2"]
+        )
+        # 空集合 EXCLUDE：接收全部源
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_EXCLUDE, G1, [])]),
+            self.data_frame_src(2, "p3", G1, self.S2),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [p["name"] for p in result["results"][1]["ports"]], ["p1", "p2"]
+        )
+
+    def test_allow_block_semantics(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            # ALLOW_NEW_SOURCES 对 INCLUDE 取并集
+            self.v3_report(2, "p2", [(V3_ALLOW_NEW_SOURCES, G1, [self.S2])]),
+            self.data_frame_src(3, "p3", G1, self.S2),
+            # 切到 EXCLUDE {S1}
+            self.v3_report(4, "p2", [(V3_CHANGE_TO_EXCLUDE, G1, [self.S1])]),
+            # BLOCK_OLD_SOURCES 对 EXCLUDE 取并集
+            self.v3_report(5, "p2", [(V3_BLOCK_OLD_SOURCES, G1, [self.S2])]),
+            self.data_frame_src(6, "p3", G1, self.S2),
+            # ALLOW_NEW_SOURCES 对 EXCLUDE 做差集：解除 S1 封锁
+            self.v3_report(7, "p2", [(V3_ALLOW_NEW_SOURCES, G1, [self.S1])]),
+            self.data_frame_src(8, "p3", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [p["name"] for p in result["results"][2]["ports"]], ["p1", "p2"]
+        )
+        # S2 此时被 EXCLUDE：仅路由 p1
+        self.assertEqual(
+            [p["name"] for p in result["results"][5]["ports"]], ["p1"]
+        )
+        self.assertEqual(
+            [p["name"] for p in result["results"][7]["ports"]], ["p1", "p2"]
+        )
+        member = result["groups"][0]["members"][0]
+        self.assertEqual(member["mode"], "exclude")
+        # EXCLUDE {S1,S2} 再 ALLOW S1（差集）-> EXCLUDE {S2}
+        self.assertEqual(member["sources"], ["10.0.0.10"])
+
+    def test_block_on_include_difference_deletes_when_empty(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            # BLOCK_OLD_SOURCES 对 INCLUDE 做差集：集合变空 -> 删除成员
+            self.v3_report(2, "p2", [(V3_BLOCK_OLD_SOURCES, G1, [self.S1])]),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(result["groups"], [])
+
+    def test_records_apply_in_order_unified_expiry(self):
+        config = make_config(membership_age=50, router_ports=("p1",))
+        events = [
+            # 先 INCLUDE {S1}，再 CHANGE_TO_INCLUDE {S2}：后者覆盖
+            self.v3_report(
+                10, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [self.S1]),
+                 (V3_CHANGE_TO_INCLUDE, G1, [self.S2])],
+            ),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            result["groups"][0]["members"],
+            [{"name": "p2", "expires": 60, "mode": "include",
+              "sources": ["10.0.0.10"]}],
+        )
+
+    def test_multiple_records_multiple_groups(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(
+                1, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [self.S1]),
+                 (V3_MODE_IS_EXCLUDE, G2, [self.S1])],
+            ),
+            self.data_frame_src(2, "p3", G1, self.S1),
+            self.data_frame_src(3, "p3", G2, self.S2),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [g["group"] for g in result["groups"]],
+            ["224.1.2.2", "224.1.2.3"],
+        )
+        self.assertEqual(result["results"][1]["action"], "multicast")
+        self.assertEqual(result["results"][2]["action"], "multicast")
+
+    def test_two_members_independent_filters(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            self.v3_report(2, "p3", [(V3_MODE_IS_INCLUDE, G1, [self.S2])]),
+            self.data_frame_src(3, "p4", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            [p["name"] for p in result["results"][2]["ports"]], ["p1", "p2"]
+        )
+
+    def test_v2_and_v3_coexist_key_shapes(self):
+        config = make_config(membership_age=50, router_ports=("p1",))
+        events = [
+            self.report(1, "p3", G1),
+            self.v3_report(2, "p2", [(V3_MODE_IS_EXCLUDE, G1, [self.S1])]),
+        ]
+        result = self.simulate(config, events)
+        members = result["groups"][0]["members"]
+        # 配置端口序：p2 在 p3 前；p2 为 v3 四键，p3 保持 v2 两键
+        self.assertEqual(list(members[0]), ["name", "expires", "mode",
+                                            "sources"])
+        self.assertEqual(members[0], {
+            "name": "p2", "expires": 52, "mode": "exclude",
+            "sources": ["10.0.0.9"],
+        })
+        self.assertEqual(list(members[1]), ["name", "expires"])
+        self.assertEqual(members[1], {"name": "p3", "expires": 51})
+
+    def test_v3_sources_numeric_sorted(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(
+                1, "p2",
+                [(V3_MODE_IS_INCLUDE, G1,
+                  [self.S2, self.S1, (2, 0, 0, 1)])],
+            ),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(
+            result["groups"][0]["members"][0]["sources"],
+            ["2.0.0.1", "10.0.0.9", "10.0.0.10"],
+        )
+
+    def test_v3_aging(self):
+        config = make_config(membership_age=50, router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            self.data_frame_src(50, "p3", G1, self.S1),
+            self.data_frame_src(51, "p3", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        # expires=51：t=50 仍成员，t=51 事件前清除 -> 泛洪
+        self.assertEqual(
+            [r["action"] for r in result["results"][1:]],
+            ["multicast", "flood"],
+        )
+        self.assertEqual(result["groups"], [])
+
+
+class IgmpV3InvalidTest(IgmpSnoopCase):
+    S1 = (10, 0, 0, 9)
+
+    def _invalid_v3(self, **kwargs):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G1, [self.S1])]),
+            self.v3_report(2, "p2", **kwargs),
+        ]
+        return self.simulate(config, events)
+
+    def test_auxiliary_data_skipped_but_must_close(self):
+        config = make_config(router_ports=("p1",))
+        # 记录带 1 字辅助数据：忽略内容，成员正常建立
+        events = [
+            self.v3_report(
+                1, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [self.S1])], aux_words=1,
+            ),
+            self.data_frame_src(2, "p3", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(result["results"][0]["action"], "igmpv3_report")
+        self.assertEqual(
+            [p["name"] for p in result["results"][1]["ports"]], ["p1", "p2"]
+        )
+
+    def test_bad_checksum_invalid_no_state(self):
+        result = self._invalid_v3(
+            records=[(V3_MODE_IS_INCLUDE, G1, [self.S1])],
+            bad_checksum=True,
+        )
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+        self.assertEqual(result["results"][1]["ports"], [])
+        # 首帧成员保持不变
+        self.assertEqual(len(result["groups"][0]["members"]), 1)
+        self.assertEqual(result["ports"][1]["drop"], 1)
+        self.assertEqual(result["vlans"][0]["drop"], 1)
+
+    def test_bad_record_type_invalid(self):
+        result = self._invalid_v3(records=[(7, G1, [self.S1])])
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+
+    def test_non_class_d_group_invalid(self):
+        result = self._invalid_v3(
+            records=[(V3_MODE_IS_INCLUDE, (240, 1, 2, 3), [self.S1])]
+        )
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+
+    def test_bad_source_address_invalid(self):
+        # 本网 0.x、环回 127.x、D 类组播、E 类/广播首字节均非有效单播
+        for source in ((0, 0, 0, 1), (0, 0, 0, 0), (224, 0, 0, 1),
+                       (127, 0, 0, 1), (240, 0, 0, 1),
+                       (255, 255, 255, 255)):
+            result = self._invalid_v3(
+                records=[(V3_MODE_IS_INCLUDE, G1, [source])]
+            )
+            self.assertEqual(
+                result["results"][1]["action"], "igmp_invalid", source
+            )
+
+    def test_length_not_closed_invalid(self):
+        result = self._invalid_v3(
+            records=[(V3_MODE_IS_INCLUDE, G1, [self.S1])], truncate=2
+        )
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+
+    def test_record_count_mismatch_invalid(self):
+        result = self._invalid_v3(
+            records=[(V3_MODE_IS_INCLUDE, G1, [self.S1])], count=2
+        )
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+        result = self._invalid_v3(
+            records=[(V3_MODE_IS_INCLUDE, G1, [self.S1])], append=b"\x00"
+        )
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+
+    def test_frame_validated_before_commit(self):
+        # 两条记录中第二条源地址非法：整帧丢弃，第一条也不得生效
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(1, "p2", [(V3_MODE_IS_INCLUDE, G2, [self.S1])]),
+            self.v3_report(
+                2, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [self.S1]),
+                 (V3_MODE_IS_INCLUDE, G1, [(0, 0, 0, 0)])],
+            ),
+            self.data_frame_src(3, "p3", G1, self.S1),
+        ]
+        result = self.simulate(config, events)
+        self.assertEqual(result["results"][1]["action"], "igmp_invalid")
+        # G1 无成员（未提交），数据泛洪；G2 成员保持
+        self.assertEqual(result["results"][2]["action"], "flood")
+        self.assertEqual(
+            [g["group"] for g in result["groups"]], ["224.1.2.2"]
+        )
+
+    def test_fragmented_v3_not_recognized(self):
+        config = make_config(router_ports=("p1",))
+        frame = raw_frame(
+            1, "p2", "01:00:5e:00:00:16", "02:00:00:00:00:02",
+            _fragmented_v3_payload(self.S1), vlan=1,
+        )
+        result = self.simulate(config, [frame])
+        self.assertEqual(result["results"][0]["action"], "flood")
+        self.assertEqual(result["groups"], [])
+
+
+def _fragmented_v3_payload(source):
+    msg = igmp_v3_message([(V3_MODE_IS_INCLUDE, G1, [source])])
+    iphdr = ip_header(
+        (10, 0, 0, 2), (224, 0, 0, 22), 2, len(msg), fragment_word=0x2000
+    )
+    return iphdr + msg + b"\x00" * max(0, 46 - 20 - len(msg))
+
+
 class IgmpRecordTest(IgmpSnoopCase):
     def _config_events(self):
         config = make_config(router_ports=("p1",))
@@ -656,6 +1051,35 @@ class IgmpRecordTest(IgmpSnoopCase):
         self.assertEqual(
             [r["output"]["action"] for r in doc["records"]],
             ["igmp_report", "multicast", "igmp_leave", "igmp_query"],
+        )
+
+    def test_v3_record_replay_byte_identical(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(
+                1, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [(10, 0, 0, 9), (10, 0, 0, 10)])],
+            ),
+            self.data_frame_src(2, "p3", G1, (10, 0, 0, 9)),
+        ]
+        self.write(config, events)
+        code, direct, err = self.run_cmd(
+            "igmp-snoop-decode", self.cfg, self.evt
+        )
+        self.assertEqual(code, 0, err)
+        rec = subprocess.run(
+            [sys.executable, SWITCH, "record", self.cfg, self.evt,
+             self.log],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(rec.returncode, 0, rec.stderr)
+        self.assertEqual(rec.stdout, direct)
+        code, out, err = self.run_cmd("replay", self.log)
+        self.assertEqual((code, out, err), (0, direct, b""))
+        with open(self.log, "rb") as handle:
+            doc = json.loads(handle.read().decode())
+        self.assertEqual(
+            doc["records"][0]["output"]["action"], "igmpv3_report"
         )
 
     def test_link_version_and_byte_rebuild(self):
@@ -743,6 +1167,67 @@ class IgmpBillingTest(IgmpSnoopCase):
         )
         self.assertEqual(code, 0, err)
         record_out = out
+        code, out, err = self.run_cmd(
+            "record", self.cfg, self.evt, self.log, *head,
+            str(self.TOTAL - 1),
+        )
+        self.assertEqual(
+            (code, out, err),
+            (5, b"", b'{"error":"record_work_limit"}\n'),
+        )
+        code, out, err = self.run_cmd(
+            "replay", self.log, "100000", "16777216", "16777216",
+            str(self.TOTAL),
+        )
+        self.assertEqual((code, out, err), (0, record_out, b""))
+        code, out, err = self.run_cmd(
+            "replay", self.log, "100000", "16777216", "16777216",
+            str(self.TOTAL - 1),
+        )
+        self.assertEqual(
+            (code, out, err),
+            (5, b"", b'{"error":"replay_work_limit"}\n'),
+        )
+
+
+class IgmpV3BillingTest(IgmpSnoopCase):
+    # B=1、L=0、P=4：初始 1；两帧 E=0,1 计 5+6；stp 小计 12。
+    # N*(N+P+1)=2*7=14；v3 帧含 1 组记录 2 源地址：再加 1+2=3。总计 29。
+    TOTAL = 29
+
+    def _write(self):
+        config = make_config(router_ports=("p1",))
+        events = [
+            self.v3_report(
+                1, "p2",
+                [(V3_MODE_IS_INCLUDE, G1, [(10, 0, 0, 9), (10, 0, 0, 10)])],
+            ),
+            self.data_frame_src(2, "p3", G1, (10, 0, 0, 9)),
+        ]
+        self.write(config, events)
+
+    def test_v3_work_boundary(self):
+        self._write()
+        head = ("1048576", "16777216", "100000", "16777216")
+        code, ok, err = self.run_cmd(
+            "igmp-snoop-decode", self.cfg, self.evt, *head, str(self.TOTAL)
+        )
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cmd(
+            "igmp-snoop-decode", self.cfg, self.evt, *head,
+            str(self.TOTAL - 1),
+        )
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"igmp_work_limit"}\n')
+
+    def test_v3_record_replay_work_boundary(self):
+        self._write()
+        head = ("100000", "16777216", "1048576", "16777216", "16777216")
+        code, record_out, err = self.run_cmd(
+            "record", self.cfg, self.evt, self.log, *head, str(self.TOTAL)
+        )
+        self.assertEqual(code, 0, err)
         code, out, err = self.run_cmd(
             "record", self.cfg, self.evt, self.log, *head,
             str(self.TOTAL - 1),
