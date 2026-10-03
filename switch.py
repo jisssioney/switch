@@ -24889,6 +24889,156 @@ def _cmd_log_mirror(log_path, cursor_token, max_work):
     return 0
 
 
+MULTICAST_LOG_DIGEST_KEYS = (
+    "schema", "source_sha256", "offset", "family", "groups", "routers",
+)
+
+
+def _multicast_log_prefix_bytes(doc):
+    """log-multicast 末项摘要文本：前六键紧凑 UTF-8 加 LF。"""
+    prefix = {key: doc[key] for key in MULTICAST_LOG_DIGEST_KEYS}
+    return (
+        json.dumps(prefix, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _multicast_log_bytes(doc):
+    """log-multicast stdout 载荷：七键紧凑 UTF-8 加 LF。"""
+    ordered = {
+        key: doc[key]
+        for key in MULTICAST_LOG_DIGEST_KEYS + ("sha256",)
+    }
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _cmd_log_multicast(log_path, cursor_token, max_work):
+    # CURSOR 沿用 log-page：* 或 <sha256>:<offset>（调用前已按 usage/2
+    # 校验），但 * 表示 records 长度（重演全部）；offset 为不限长非负
+    # 十进制且不得越界。输入/输出上限固定各 16777216 字节，分块读取与
+    # 字节边界沿用 log-page，等于上限合法。仅接受 igmp/mld-snoop-decode
+    # 两种 snooping 日志，其他模式一律 invalid_input/4。
+    try:
+        with open(log_path, "rb") as handle:
+            log_raw = _read_limited(handle, DEFAULT_MAX_LOG_BYTES)
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    if log_raw is None:
+        _fail("log_limit")
+        return 5
+    try:
+        # 静态校验与内部摘要核对同 log-page：顶层/记录键序与字段类型、
+        # config/event 规范键序、event 已知键形、内部 sha256
+        log = parse_json(log_raw)
+        _validate_log_shape(log)
+        source_sha = log["sha256"]
+        if hashlib.sha256(_log_prefix_bytes(log)).hexdigest() != source_sha:
+            raise InvalidInput("bad log sha256")
+        records = log["records"]
+        total = len(records)
+        if cursor_token == "*":
+            offset = total
+        else:
+            cursor_sha, offset_token = cursor_token.split(":", 1)
+            # 游标摘要须等于 LOG.sha256 且 offset≤记录数（沿用 log-page）
+            if cursor_sha != source_sha:
+                raise InvalidInput("bad cursor sha256")
+            offset = _limit_value(offset_token)
+            if offset > total:
+                raise InvalidInput("bad cursor offset")
+        # 按 replay 合同先定模式：仅接受两种 snooping 配置形状，其他
+        # 模式一律 invalid_input/4
+        config = log["config"]
+        events = [record["event"] for record in log["records"]]
+        mode = _log_mode(config, events)
+        if mode == "igmp_snoop_decode":
+            family = "ipv4"
+            run = _run_igmp_snoop_decode
+        elif mode == "mld_snoop_decode":
+            family = "ipv6"
+            run = _run_mld_snoop_decode
+        else:
+            raise InvalidInput("bad log mode")
+        # 全量语义校验与从空状态重放完全沿用 replay 的对应路径：逐项
+        # 核对 t/version/applied/output，重建 LOG 须与原文件逐字节一致
+        # （max_work=None：全量记录核对不设工作量上限）
+        _, observer = run(config, events, True)
+        _verify_records(log, events, observer["items"])
+        rebuilt = _build_log_doc(config, events, observer["items"])
+        if _log_bytes(rebuilt) != log_raw:
+            raise InvalidInput("bad log")
+        # 仅重演前 offset 条记录求组播控制面状态：独立空状态、无副作用。
+        # 先按所选 snooping 模式入口同一计费公式预演前 offset 项（坏帧、
+        # 准入拒绝、幂等链路均计费），等于上限合法，首次超过即抛对应
+        # WorkLimit，再正式重演；offset=0 为初始空状态。groups 与对应
+        # snooping 入口处理同一前缀后的最终 groups 一致（含成员过期时刻、
+        # 过滤模式与源地址，排序与键序沿用入口输出）；routers 只列当前
+        # 未过期动态路由端口（VLAN 升序、同 VLAN 端口配置序，项键序
+        # vlan/name/expires），兼容模式（未配置 router_age）恒为空数组。
+        # 事件先整体校验再切前缀（与 log-stp 等同口径），取前 offset 项
+        if mode == "igmp_snoop_decode":
+            (
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, router_age,
+            ) = validate_igmp_snoop_config(config)
+            link_ids = {link["id"] for link in links}
+            checked = validate_stp_decode_events(events, ports, link_ids)
+            prefix_events = checked[:offset]
+            igmp_snoop_work(bridges, links, ports, prefix_events, max_work)
+            prefix_result = igmp_snoop_decode(
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, prefix_events,
+                router_age=router_age,
+            )
+        else:
+            (
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, router_age,
+            ) = validate_mld_snoop_config(config)
+            link_ids = {link["id"] for link in links}
+            checked = validate_stp_decode_events(events, ports, link_ids)
+            prefix_events = checked[:offset]
+            mld_snoop_work(bridges, links, ports, prefix_events, max_work)
+            prefix_result = mld_snoop_decode(
+                bridges, links, delay, bridge, ports, age, max_frame,
+                membership_age, router_ports, prefix_events,
+                router_age=router_age,
+            )
+        groups = prefix_result["groups"]
+        # 兼容模式入口结果不含 routers 键；未配置 router_age 时恒空数组
+        routers = prefix_result.get("routers", [])
+        doc = {
+            "schema": RECORD_SCHEMA,
+            "source_sha256": source_sha,
+            "offset": offset,
+            "family": family,
+            "groups": groups,
+            "routers": routers,
+        }
+        doc["sha256"] = hashlib.sha256(
+            _multicast_log_prefix_bytes(doc)
+        ).hexdigest()
+        payload = _multicast_log_bytes(doc)
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except IgmpWorkLimit:
+        _fail("multicast_work_limit")
+        return 5
+    except MldWorkLimit:
+        _fail("multicast_work_limit")
+        return 5
+    # 输出上界（含末尾 LF）在全部校验与重演之后判定；失败 stdout 为空，
+    # 本命令全程只读 LOG
+    if len(payload) > DEFAULT_MAX_OUTPUT_BYTES:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_log_diff(
     left_path,
     right_path,
@@ -26214,6 +26364,7 @@ SUBCOMMANDS = frozenset((
     "log-config",
     "log-link",
     "log-mirror",
+    "log-multicast",
     "log-acl",
     "log-stp",
     "log-lag",
@@ -26534,6 +26685,26 @@ def main(argv):
             else DEFAULT_MAX_MIRROR_WORK
         )
         return _cmd_log_mirror(args[1], args[2], max_work)
+    if args[:1] == ["log-multicast"]:
+        # log-multicast LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误
+        # 顺序完全沿用 log-mirror；MAX_WORK 为不限长正十进制，默认
+        # 10000000（igmp/mld-snoop-decode 各自工作量公式）；LOG 仅接受
+        # igmp-snoop-decode 与 mld-snoop-decode 两种模式，其他模式
+        # invalid_input/4，超限错误名固定 multicast_work_limit
+        if len(args) not in (3, 4):
+            _fail("usage")
+            return 2
+        if _PAGE_CURSOR_RE.fullmatch(args[2]) is None:
+            _fail("usage")
+            return 2
+        if len(args) == 4 and _LIMIT_RE.fullmatch(args[3]) is None:
+            _fail("usage")
+            return 2
+        max_work = (
+            _limit_value(args[3]) if len(args) == 4
+            else DEFAULT_MAX_IGMP_WORK
+        )
+        return _cmd_log_multicast(args[1], args[2], max_work)
     if args[:1] == ["log-acl"]:
         # log-acl LOG CURSOR [MAX_WORK]：参数、资源、CURSOR 与错误顺序
         # 完全沿用 log-qos；MAX_WORK 为不限长正十进制，默认 10000000
