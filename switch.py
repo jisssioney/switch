@@ -205,6 +205,10 @@ class QosPfcWorkLimit(Exception):
     pass
 
 
+class IgmpWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -1825,37 +1829,6 @@ def forward_stp(bridges, links, delay, bridge_name, ports, age, events,
             for vlan in sorted(vlan_stats)
         ],
     }
-
-
-def forward_stp_work(bridges, links, ports, events, limit):
-    """forward-stp 的工作量预演：仅跟踪 up 链路数与帧数，无副作用。
-
-    B、L、P 分别为桥、链路、端口数，U 为 up 链路数，E 为此前帧数。
-    初始收敛计 B+L+2U；逐事件先按原规则老化：帧计 E+P+1 再令 E 加 1；
-    链路先应用 up，再计 E*(P+1)+B+L+2U+2P+1，幂等也计。
-    累计等于上限合法，首次超过即抛 ForwardStpWorkLimit。
-    """
-    B = len(bridges)
-    L = len(links)
-    P = len(ports)
-    sim_up = {link["id"]: link["up"] for link in links}
-    U = sum(1 for link in links if link["up"])
-    E = 0
-    work = B + L + 2 * U  # 初始收敛
-    if work > limit:
-        raise ForwardStpWorkLimit
-    for item in events:
-        if item[0] == "link":
-            _, _, lid, up = item
-            if sim_up[lid] != up:
-                sim_up[lid] = up
-                U += 1 if up else -1
-            work += E * (P + 1) + B + L + 2 * U + 2 * P + 1
-        else:
-            work += E + P + 1
-            E += 1
-        if work > limit:
-            raise ForwardStpWorkLimit
 
 
 def validate_forward_stp_storm_config(config):
@@ -17769,6 +17742,554 @@ def stp_decode(
     )
 
 
+# igmp-snoop-decode：在 stp-decode（stp-check 七键）配置上追加 igmp 对象
+IGMP_SNOOP_CONFIG_KEYS = STP_CHECK_CONFIG_KEYS | frozenset(("igmp",))
+IGMP_KEYS = frozenset(("membership_age", "router_ports"))
+IPV4_ETHER_TYPE = 0x0800
+IP_PROTOCOL_IGMP = 2
+IGMP_TYPE_QUERY_V2 = 0x11
+IGMP_TYPE_REPORT_V2 = 0x16
+IGMP_TYPE_LEAVE_V2 = 0x17
+IGMP_CONTROL_ACTIONS = {
+    IGMP_TYPE_QUERY_V2: "igmp_query",
+    IGMP_TYPE_REPORT_V2: "igmp_report",
+    IGMP_TYPE_LEAVE_V2: "igmp_leave",
+}
+IPV4_MC_MAC_PREFIX = b"\x01\x00\x5e"
+
+
+def validate_igmp_snoop_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != IGMP_SNOOP_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    # 七键与 stp-decode（stp-check）完全一致，复用其全量校验
+    bridges, links, delay, bridge, ports, age, max_frame = (
+        validate_stp_check_config(
+            {key: config[key] for key in STP_CHECK_CONFIG_KEYS}
+        )
+    )
+    igmp = config["igmp"]
+    if not isinstance(igmp, dict) or frozenset(igmp) != IGMP_KEYS:
+        raise InvalidInput("bad igmp")
+    membership_age = igmp["membership_age"]
+    if not _is_int(membership_age) or membership_age <= 0:
+        raise InvalidInput("bad igmp membership_age")
+    router_ports = igmp["router_ports"]
+    if not isinstance(router_ports, list):
+        raise InvalidInput("bad igmp router_ports")
+    name_set = {port["name"] for port in ports}
+    for name in router_ports:
+        if not isinstance(name, str) or name not in name_set:
+            raise InvalidInput("bad igmp router port")
+    if len(set(router_ports)) != len(router_ports):  # 端口名不重复
+        raise InvalidInput("bad igmp router_ports")
+    return (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, tuple(router_ports),
+    )
+
+
+def _internet_checksum(data):
+    """IPv4/IGMP 反码求和校验；奇数尾字节补零，校验时整段求和须为 0。"""
+    if len(data) % 2:
+        data = data + b"\x00"
+    total = 0
+    for index in range(0, len(data), 2):
+        total += (data[index] << 8) | data[index + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _parse_igmp_v2(raw, ethertype_offset):
+    """解析 IPv4 帧中的 IGMPv2 控制消息。
+
+    仅在 ethertype 为 0x0800 时调用：
+
+    - 返回 None：非协议号 2、分片或 IPv4 头非法/校验失败，调用方按普通
+      IPv4 帧处理（组播沿用泛洪或成员投递）；
+    - 返回 ("invalid",)：IPv4 外层合法且为未分片协议号 2，但 IGMP 长度、
+      类型、组地址或校验非法，调用方固定输出 igmp_invalid 且不改状态；
+    - 返回 ("ok", mtype, group)：校验通过的 IGMPv2 Query/Report/Leave，
+      group 为点分十进制组地址（Query 不校验组地址）。
+    """
+    payload = raw[ethertype_offset + 2:-4]
+    if len(payload) < 20:
+        return None
+    version_ihl = payload[0]
+    if version_ihl >> 4 != 4:
+        return None
+    ihl = version_ihl & 0x0F
+    if ihl < 5:
+        return None
+    header_len = ihl * 4
+    if len(payload) < header_len:
+        return None
+    if _internet_checksum(payload[:header_len]) != 0:  # IPv4 头校验
+        return None
+    fragment_word = (payload[6] << 8) | payload[7]
+    # MF（bit13）或片偏移（bit0..12）非零：任何分片都不识别；DF 忽略
+    if fragment_word & 0x3FFF:
+        return None
+    if payload[9] != IP_PROTOCOL_IGMP:
+        return None
+    total_length = (payload[2] << 8) | payload[3]
+    if total_length < header_len + 8 or total_length > len(payload):
+        return ("invalid",)  # IGMP 长度非法（容纳不了 8 字节或超过实际载荷）
+    igmp_msg = payload[header_len:total_length]
+    mtype = igmp_msg[0]
+    if mtype not in IGMP_CONTROL_ACTIONS:
+        return ("invalid",)  # 类型非法（含 IGMPv3 等）
+    if len(igmp_msg) != 8:
+        return ("invalid",)  # IGMPv2 Query/Report/Leave 恰为 8 字节
+    if _internet_checksum(igmp_msg) != 0:  # IGMP 校验
+        return ("invalid",)
+    octets = igmp_msg[4:8]
+    group = ".".join(str(value) for value in octets)
+    if mtype in (IGMP_TYPE_REPORT_V2, IGMP_TYPE_LEAVE_V2):
+        if not 224 <= octets[0] <= 239:  # Report/Leave 组地址须为 D 类
+            return ("invalid",)
+    else:
+        # Query：通用查询组地址 0.0.0.0 合法，组特定查询须为 D 类，
+        # 其余组地址非法
+        if tuple(octets) != (0, 0, 0, 0) and not 224 <= octets[0] <= 239:
+            return ("invalid",)
+    return ("ok", mtype, group)
+
+
+def _ipv4_multicast_group(raw, ethertype_offset):
+    """其他 IPv4 组播的数据帧：目的 MAC 与 D 类组地址映射一致时返回点分
+    十进制组地址，否则返回 None（调用方沿用泛洪）。"""
+    payload = raw[ethertype_offset + 2:-4]
+    if len(payload) < 20:
+        return None
+    octets = payload[16:20]
+    if not 224 <= octets[0] <= 239:
+        return None
+    expected_mac = IPV4_MC_MAC_PREFIX + bytes(
+        (octets[1] & 0x7F, octets[2], octets[3])
+    )
+    if raw[0:6] != expected_mac:
+        return None
+    return ".".join(str(value) for value in octets)
+
+
+def _forward_stp_work_total(bridges, links, ports, events):
+    """forward-stp 工作量公式总值（不含上限比较），供 forward-stp 系与
+    igmp-snoop-decode 复用。B、L、P 为桥、链路、端口数，U 为 up 链路数，
+    E 为此前帧数：初始收敛 B+L+2U；帧计 E+P+1；链路计
+    E*(P+1)+B+L+2U+2P+1（幂等也计，U 先应用）。
+    """
+    B = len(bridges)
+    L = len(links)
+    P = len(ports)
+    sim_up = {link["id"]: link["up"] for link in links}
+    U = sum(1 for link in links if link["up"])
+    E = 0
+    work = B + L + 2 * U  # 初始收敛
+    for item in events:
+        if item[0] == "link":
+            _, _, lid, up = item
+            if sim_up[lid] != up:
+                sim_up[lid] = up
+                U += 1 if up else -1
+            work += E * (P + 1) + B + L + 2 * U + 2 * P + 1
+        else:
+            work += E + P + 1
+            E += 1
+    return work
+
+
+def forward_stp_work(bridges, links, ports, events, limit):
+    """forward-stp 的工作量预演：仅跟踪 up 链路数与帧数，无副作用。
+
+    累计等于上限合法，首次超过即抛 ForwardStpWorkLimit。
+    """
+    if _forward_stp_work_total(bridges, links, ports, events) > limit:
+        raise ForwardStpWorkLimit
+
+
+def igmp_snoop_work(bridges, links, ports, events, limit):
+    """igmp-snoop-decode 工作量预演：现有 stp-decode（forward-stp）工作量
+    再加 N*(N+P+1)，N 为事件数（链路与帧合计）、P 为端口数。等于上限
+    合法，超过即抛 IgmpWorkLimit。
+    """
+    N = len(events)
+    P = len(ports)
+    work = _forward_stp_work_total(bridges, links, ports, events)
+    work += N * (N + P + 1)
+    if work > limit:
+        raise IgmpWorkLimit
+
+
+def igmp_snoop_decode(
+    bridges, links, delay, bridge_name, ports, age, max_frame,
+    membership_age, router_ports, events, observer=None,
+):
+    """在 stp-decode 转发/学习/统计语义上增加 IGMPv2 snooping。
+
+    成员表 membership：(vlan, group) -> {port: expires（绝对时刻）}。
+    每个事件前删除 expires<=t 的成员；Report 建立或刷新至
+    t+membership_age，Leave 立即删除入端口成员，链路断开或端口退出
+    forwarding 时清除该端口全部成员。Report/Leave 仅发往同 VLAN 可转发
+    的 router_ports，无合格路由端口时泛洪；Query 始终泛洪；其他 IPv4
+    组播在 MAC/组地址映射一致且有成员时仅发往成员与路由端口；其余
+    组播沿用泛洪。协议号 2 但 IGMP 非法的帧固定 igmp_invalid、空 ports、
+    计 drop 且不改任何状态。observer 语义同 stp-check。
+    """
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    port_link = {}  # 本桥桥链路口名 -> link
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    membership = {}  # (vlan, group) -> {port_name: expires}
+    router_set = set(router_ports)
+    port_stats = {
+        port["name"]: {
+            "rx": 0,
+            "tx": 0,
+            "drop": 0,
+            "good": 0,
+            "runt": 0,
+            "giant": 0,
+            "alignment": 0,
+            "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    if observer is not None:  # record/replay：逐事件记录 applied 与输出
+        observer["items"] = []
+
+    previous = {}  # (bridge, port) -> 上一轮角色
+    since = {}  # (bridge, port) -> 获得当前 root/designated 角色的时刻
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:  # 同角色不重计时
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        """返回 (物理 up, STP 状态)；边缘口恒为 up 即 forwarding。"""
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"  # alternate
+        return True, state
+
+    def eligible_names(t, vlan, ingress):
+        """同 VLAN 可转发（物理 up、STP forwarding、VLAN 准入）且排除入
+        端口的端口名，按配置端口序。"""
+        return [
+            port["name"]
+            for port in ports
+            if vlan in port["allowed"]
+            and port["name"] != ingress
+            and port_status(port["name"], t) == (True, "forwarding")
+        ]
+
+    def purge_expired(t):
+        for key, table in [
+            (key, table) for key, table in membership.items()
+        ]:
+            for port_name in [
+                name for name, expires in table.items() if expires <= t
+            ]:
+                del table[port_name]
+            if not table:
+                del membership[key]
+
+    converge(0)
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        purge_expired(t)  # 每个事件前删除 expires<=t 的成员
+        if item[0] == "link":
+            _, t, lid, up = item
+            applied = by_id[lid]["up"] != up  # up 实际改变才 applied
+            old_forwarding = forwarding_ports(t)
+            by_id[lid]["up"] = up
+            converge(t)
+            left_forwarding = old_forwarding - forwarding_ports(t)
+            for name in left_forwarding:
+                # 端口退出 forwarding：清 FDB（同 stp-decode）与该端口全部
+                # 组成员（链路断开同理，断口必退出 forwarding）
+                for key in [k for k, (p, _) in fdb.items() if p == name]:
+                    del fdb[key]
+                for key, table in [
+                    (key, table) for key, table in membership.items()
+                ]:
+                    if name in table:
+                        del table[name]
+                        if not table:
+                            del membership[key]
+            if observer is not None:  # 链路项：output 恒 None
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
+            continue
+        _, t, port_name, raw = item
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        if raw[12:14] == FRAME_DECODE_TAG:
+            tci = (raw[14] << 8) | raw[15]
+            tag = tci & 0x0FFF
+            ethertype_offset = 16
+        else:
+            tag = None
+            ethertype_offset = 12
+        ethertype = (
+            (raw[ethertype_offset] << 8) | raw[ethertype_offset + 1]
+        )
+        length = len(raw)
+        port_stats[port_name]["rx"] += 1
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (
+            zlib.crc32(raw[:-4]) & 0xFFFFFFFF
+        ).to_bytes(4, "little"):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        port_stats[port_name][cls] += 1
+        if cls != "good":  # 非 good 丢弃且不学习、不转发、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
+            continue
+        if tag is None:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        else:
+            vlan = tag
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            entry = {"t": t, "class": cls, "action": "drop", "ports": []}
+            results.append(entry)
+            if observer is not None:  # 准入拒绝也逐帧记录
+                observer["items"].append(
+                    {"kind": "frame", "t": t, "applied": True,
+                     "output": entry}
+                )
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        _, state = port_status(port_name, t)
+        egress = []
+        action = "drop"
+        if state == "learning":
+            fdb[(vlan, src)] = [port_name, t]
+        elif state == "forwarding":
+            igmp_info = (
+                _parse_igmp_v2(raw, ethertype_offset)
+                if ethertype == IPV4_ETHER_TYPE
+                else None
+            )
+            if igmp_info is not None and igmp_info[0] == "invalid":
+                # 外层合法的协议号 2 帧但 IGMP 非法：不改任何状态，
+                # action 固定 igmp_invalid、ports 为空并计入丢弃
+                port_stats[port_name]["drop"] += 1
+                vlan_stats[vlan]["drop"] += 1
+                entry = {
+                    "t": t, "class": cls, "action": "igmp_invalid",
+                    "ports": [],
+                }
+                results.append(entry)
+                if observer is not None:
+                    observer["items"].append(
+                        {"kind": "frame", "t": t, "applied": True,
+                         "output": entry}
+                    )
+                continue
+            fdb[(vlan, src)] = [port_name, t]
+            is_group = int(dst[:2], 16) & 1
+            eligible = eligible_names(t, vlan, port_name)
+            if igmp_info is not None:  # 合法 IGMPv2 控制帧
+                _, mtype, group = igmp_info
+                if mtype == IGMP_TYPE_REPORT_V2:
+                    membership.setdefault((vlan, group), {})[port_name] = (
+                        t + membership_age
+                    )
+                    routers = [
+                        name for name in eligible if name in router_set
+                    ]
+                    egress = routers if routers else eligible
+                    action = "igmp_report"
+                elif mtype == IGMP_TYPE_LEAVE_V2:
+                    table = membership.get((vlan, group))
+                    if table is not None:  # Leave 立即删除入端口成员
+                        table.pop(port_name, None)
+                        if not table:
+                            del membership[(vlan, group)]
+                    routers = [
+                        name for name in eligible if name in router_set
+                    ]
+                    egress = routers if routers else eligible
+                    action = "igmp_leave"
+                else:  # Query：始终泛洪，不改成员状态
+                    egress = eligible
+                    action = "igmp_query"
+            elif is_group:
+                group = (
+                    _ipv4_multicast_group(raw, ethertype_offset)
+                    if ethertype == IPV4_ETHER_TYPE
+                    else None
+                )
+                table = (
+                    membership.get((vlan, group))
+                    if group is not None
+                    else None
+                )
+                if table:  # 命中成员表：仅发往成员端口与路由端口
+                    targets = set(table) | router_set
+                    egress = [
+                        name for name in eligible if name in targets
+                    ]
+                    action = "multicast"
+                else:  # 其余组播（含广播、非 IPv4、映射不一致、无成员）泛洪
+                    egress = eligible
+                    action = "flood"
+            else:
+                hit = fdb.get((vlan, dst))
+                if hit is not None and hit[0] != port_name:
+                    target = hit[0]
+                    target_up, target_state = port_status(target, t)
+                    if (
+                        target_up
+                        and target_state == "forwarding"
+                        and vlan in by_name[target]["allowed"]
+                    ):
+                        egress = [target]
+                        action = "unicast"
+                elif hit is None:
+                    egress = eligible
+                    action = "flood"
+        out_ports = []
+        for name in egress:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out_ports.append(
+                {
+                    "name": name,
+                    "vlan": None if vlan in by_name[name]["untagged"] else vlan,
+                }
+            )
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        entry = {"t": t, "class": cls, "action": action, "ports": out_ports}
+        results.append(entry)
+        if observer is not None:  # 帧项恒 applied，output 为对应结果项
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
+    port_order = {port["name"]: index for index, port in enumerate(ports)}
+    groups = []
+    for vlan, group in sorted(
+        membership,
+        key=lambda key: (
+            key[0], tuple(int(part) for part in key[1].split("."))
+        ),
+    ):
+        table = membership[(vlan, group)]
+        members = [
+            {"name": name, "expires": table[name]}
+            for name in sorted(table, key=lambda value: port_order[value])
+        ]
+        groups.append({"vlan": vlan, "group": group, "members": members})
+    return {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "groups": groups,
+    }
+
+
 STORM_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm",
      "max_frame")
@@ -18520,6 +19041,7 @@ DEFAULT_MAX_LINK_WIRE_WORK = 10000000
 DEFAULT_MAX_LINK_FLOW_WORK = 10000000
 DEFAULT_MAX_QOS_WIRE_WORK = 10000000
 DEFAULT_MAX_QOS_PFC_WORK = 10000000
+DEFAULT_MAX_IGMP_WORK = 10000000
 # config-export 三项上限的默认值沿用 config-diff（工作量/输入/输出）
 DEFAULT_MAX_EXPORT_WORK = DEFAULT_MAX_DIFF_WORK
 # config-import 三项上限默认值：工作量沿用 config-export，输入/输出各 1 MiB
@@ -18629,7 +19151,8 @@ def _log_mode(config, events=None):
     forward-decode 路由（既有日志字节不变）。stp 七键配置的非链路帧含
     src（九键）按 stp-check，含 data（t/port/data 原始帧）按 stp-decode；
     两种帧形状混用报 InvalidInput；仅链路项或空事件沿用既有 stp-decode
-    路由（既有日志字节不变）。qos 十二键配置的帧项含 src（十键）按
+    路由（既有日志字节不变）。stp 七键加 igmp 的配置按 igmp-snoop-decode
+    （事件仅链路项与 t/port/data 原始帧）。qos 十二键配置的帧项含 src（十键）按
     qos-check，含 data（t/port/data 原始帧）按 qos-decode，两种帧形状
     混用报 InvalidInput；仅链路/成员/service 项或空事件沿用既有
     qos-check 路由（既有日志字节不变）。link-wire 含 queue_bytes 配置的
@@ -18749,6 +19272,16 @@ def _log_mode(config, events=None):
             if saw_src and saw_data:
                 raise InvalidInput("bad log event")
             return "forward_check" if saw_src else "forward_decode"
+        if keys == IGMP_SNOOP_CONFIG_KEYS:
+            # igmp-snoop-decode：stp-check 七键加 igmp；事件仅链路项与
+            # t/port/data 原始帧，其余形状即非法输入
+            for event in events if isinstance(events, list) else ():
+                if not isinstance(event, dict):
+                    raise InvalidInput("bad log event")
+                ekeys = frozenset(event)
+                if ekeys not in (STP_EVENT_KEYS, FRAME_DECODE_FRAME_KEYS):
+                    raise InvalidInput("bad log event")
+            return "igmp_snoop_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
             # stp-check 与 stp-decode 共享七键配置：非链路帧含 src 按
             # stp-check，含 data 按 stp-decode，两种帧形状混用即非法输入
@@ -19409,6 +19942,38 @@ def _run_stp_decode(config, events, observe, max_work=None):
     result = stp_decode(
         bridges, links, delay, bridge, ports, age, max_frame, stp_events,
         observer=observer,
+    )
+    return result, observer
+
+
+def _run_igmp_snoop_decode(config, events, observe, max_work=None):
+    """record/replay igmp-snoop-decode 模式：校验 stp 七键加 igmp 配置与
+    混合事件并执行仿真。
+
+    事件外壳、全量校验与执行语义完全沿用 igmp-snoop-decode 入口；
+    max_work 非 None 时（record/replay）全量语义校验后先按 igmp 公式
+    （forward-stp 工作量加 N*(N+P+1)）无副作用预演（坏帧、准入拒绝、
+    幂等链路均计费），首次超过即抛 IgmpWorkLimit，不正式仿真。返回
+    (igmp-snoop-decode 结果 dict, observer 或 None)；帧项恒 applied 且
+    output 为对应 t,class,action,ports 结果项，链路项仅 up 实际改变时
+    applied，output 恒 None。
+    """
+    (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, router_ports,
+    ) = validate_igmp_snoop_config(config)
+    link_ids = {link["id"] for link in links}
+    igmp_events = validate_stp_decode_events(events, ports, link_ids)
+    if max_work is not None:
+        # 与 igmp-snoop-decode 入口同一公式：forward-stp 工作量加
+        # N*(N+P+1)
+        igmp_snoop_work(
+            bridges, links, ports, igmp_events, max_work
+        )
+    observer = {} if observe else None
+    result = igmp_snoop_decode(
+        bridges, links, delay, bridge, ports, age, max_frame,
+        membership_age, router_ports, igmp_events, observer=observer,
     )
     return result, observer
 
@@ -20156,7 +20721,8 @@ def _build_log_doc(config, events, items):
             "link_forward", "link_wire", "link_wire_decode",
             "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
             "forward_stp",
-            "stp_decode", "stp_check", "forward_stp_storm"
+            "stp_decode", "stp_check", "forward_stp_storm",
+            "igmp_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -20295,7 +20861,8 @@ def _verify_records(log, events, items):
             "link_forward", "link_wire", "link_wire_decode",
             "link_flow_decode", "qos_wire_decode", "qos_pfc_decode",
             "forward_stp",
-            "stp_decode", "stp_check", "forward_stp_storm"
+            "stp_decode", "stp_check", "forward_stp_storm",
+            "igmp_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -20449,6 +21016,10 @@ def _cmd_record(
             result, observer = _run_stp_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "igmp_snoop_decode":
+            result, observer = _run_igmp_snoop_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_record_work
@@ -20546,6 +21117,7 @@ def _cmd_record(
         QosWorkLimit,
         QosWireWorkLimit,
         QosPfcWorkLimit,
+        IgmpWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -20658,6 +21230,10 @@ def _cmd_replay(
             result, observer = _run_stp_decode(
                 config, events, True, max_replay_work
             )
+        elif mode == "igmp_snoop_decode":
+            result, observer = _run_igmp_snoop_decode(
+                config, events, True, max_replay_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_replay_work
@@ -20755,6 +21331,7 @@ def _cmd_replay(
         QosWorkLimit,
         QosWireWorkLimit,
         QosPfcWorkLimit,
+        IgmpWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -23460,6 +24037,68 @@ def _cmd_stp_decode(
     return 0
 
 
+def _cmd_igmp_snoop_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_igmp_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 全量输入先校验再仿真；igmp 配置为 stp-check 七键加 igmp 对象，
+        # 事件外壳与 stp-decode 完全一致
+        (
+            bridges, links, delay, bridge, ports, age, max_frame,
+            membership_age, router_ports,
+        ) = validate_igmp_snoop_config(config)
+        link_ids = {link["id"] for link in links}
+        events = validate_stp_decode_events(events_doc, ports, link_ids)
+        # 资源、工作量契约：全量校验后无副作用预演，超限不正式仿真；
+        # 公式为现有 stp-decode 工作量加 N*(N+P+1)
+        igmp_snoop_work(bridges, links, ports, events, max_igmp_work)
+        result = igmp_snoop_decode(
+            bridges, links, delay, bridge, ports, age, max_frame,
+            membership_age, router_ports, events
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except IgmpWorkLimit:
+        _fail("igmp_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_qos_decode(
     config_path,
     events_path,
@@ -23932,6 +24571,7 @@ SUBCOMMANDS = frozenset((
     "forward-check",
     "forward-decode",
     "stp-decode",
+    "igmp-snoop-decode",
     "link-forward",
     "link-wire",
     "link-wire-decode",
@@ -24533,6 +25173,29 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_stp_decode(args[1], args[2], *limits)
+    if args[:1] == ["igmp-snoop-decode"]:
+        # igmp-snoop-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_IGMP_WORK]]]：
+        #   签名、四项资源上限与错误契约同 stp-decode，工作量为 stp-decode
+        #   公式加 N*(N+P+1)，超限错误名 igmp_work_limit；可选上限 0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_IGMP_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_igmp_snoop_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
