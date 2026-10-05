@@ -220,6 +220,10 @@ class MldWorkLimit(Exception):
     pass
 
 
+class DhcpWorkLimit(Exception):
+    pass
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -19826,6 +19830,808 @@ def mld_snoop_decode(
     return output
 
 
+# dhcp-snoop-decode：在 stp-decode（stp-check 七键）配置上追加 dhcp 对象
+DHCP_SNOOP_CONFIG_KEYS = STP_CHECK_CONFIG_KEYS | frozenset(("dhcp",))
+DHCP_KEYS = frozenset(("trusted_ports", "binding_capacity", "max_lease"))
+DHCP_CAPACITY_KEYS = frozenset(("vlan", "limit"))
+IP_PROTOCOL_UDP = 17
+BOOTP_SERVER_PORT = 67  # 客户端 -> 服务器（UDP 目的端口）
+BOOTP_CLIENT_PORT = 68  # 服务器 -> 客户端（UDP 目的端口）
+BOOTP_MIN_LEN = 300
+BOOTP_FIXED_LEN = 236
+BOOTP_MAGIC_COOKIE = b"\x63\x82\x53\x63"
+BOOTP_OP_REQUEST = 1
+BOOTP_OP_REPLY = 2
+DHCP_OPT_MSG_TYPE = 53
+DHCP_OPT_LEASE_TIME = 51
+DHCP_OPT_END = 255
+DHCP_MSG_DISCOVER = 1
+DHCP_MSG_OFFER = 2
+DHCP_MSG_REQUEST = 3
+DHCP_MSG_DECLINE = 4
+DHCP_MSG_ACK = 5
+DHCP_MSG_NAK = 6
+DHCP_MSG_RELEASE = 7
+DHCP_MSG_INFORM = 8
+DHCP_CLIENT_MESSAGES = frozenset(
+    (
+        DHCP_MSG_DISCOVER, DHCP_MSG_REQUEST, DHCP_MSG_DECLINE,
+        DHCP_MSG_RELEASE, DHCP_MSG_INFORM,
+    )
+)
+DHCP_SERVER_MESSAGES = frozenset(
+    (DHCP_MSG_OFFER, DHCP_MSG_ACK, DHCP_MSG_NAK)
+)
+DHCP_MSG_NAMES = {
+    DHCP_MSG_DISCOVER: "discover",
+    DHCP_MSG_OFFER: "offer",
+    DHCP_MSG_REQUEST: "request",
+    DHCP_MSG_DECLINE: "decline",
+    DHCP_MSG_ACK: "ack",
+    DHCP_MSG_NAK: "nak",
+    DHCP_MSG_RELEASE: "release",
+    DHCP_MSG_INFORM: "inform",
+}
+# 每端口 DHCP 分类计数固定键序（每帧在入端口恰好归入一类）
+DHCP_CLASSIFICATION_KEYS = (
+    "malformed_dhcp",
+    "untrusted_server",
+    "discover",
+    "request",
+    "offer",
+    "ack",
+    "nak",
+    "release",
+    "decline",
+    "inform",
+    "binding_conflict",
+    "binding_full",
+)
+
+
+def validate_dhcp_snoop_config(config):
+    if (
+        not isinstance(config, dict)
+        or frozenset(config) != DHCP_SNOOP_CONFIG_KEYS
+    ):
+        raise InvalidInput("bad config")
+    # 七键与 stp-decode（stp-check）完全一致，复用其全量校验
+    bridges, links, delay, bridge, ports, age, max_frame = (
+        validate_stp_check_config(
+            {key: config[key] for key in STP_CHECK_CONFIG_KEYS}
+        )
+    )
+    dhcp = config["dhcp"]
+    if not isinstance(dhcp, dict) or frozenset(dhcp) != DHCP_KEYS:
+        raise InvalidInput("bad dhcp")
+    trusted_ports = dhcp["trusted_ports"]
+    if not isinstance(trusted_ports, list):
+        raise InvalidInput("bad dhcp trusted_ports")
+    name_set = {port["name"] for port in ports}
+    for name in trusted_ports:
+        if not isinstance(name, str) or name not in name_set:
+            raise InvalidInput("bad dhcp trusted port")
+    if len(set(trusted_ports)) != len(trusted_ports):  # 端口名不重复
+        raise InvalidInput("bad dhcp trusted_ports")
+    capacity_doc = dhcp["binding_capacity"]
+    if not isinstance(capacity_doc, list):  # 每 VLAN 一项 {"vlan","limit"}
+        raise InvalidInput("bad dhcp binding_capacity")
+    capacity = {}
+    for item in capacity_doc:
+        if not isinstance(item, dict) or frozenset(item) != DHCP_CAPACITY_KEYS:
+            raise InvalidInput("bad dhcp binding_capacity")
+        vlan = item["vlan"]
+        cap = item["limit"]
+        if not _valid_vlan_id(vlan):
+            raise InvalidInput("bad dhcp binding_capacity vlan")
+        if not _is_int(cap) or cap < 0:
+            raise InvalidInput("bad dhcp binding_capacity limit")
+        if vlan in capacity:  # 每 VLAN 至多一项
+            raise InvalidInput("bad dhcp binding_capacity vlan")
+        capacity[vlan] = cap
+    max_lease = dhcp["max_lease"]
+    if not _is_int(max_lease) or max_lease <= 0:
+        raise InvalidInput("bad dhcp max_lease")
+    return (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        tuple(trusted_ports), capacity, max_lease,
+    )
+
+
+def _ipv4_dotted(octets):
+    return ".".join(str(octet) for octet in octets)
+
+
+def _ipv4_bindable(ip_text):
+    """绑定地址有效性：首字节 1..223，排除 127 环回段与 0.0.0.0。"""
+    octets = tuple(int(part) for part in ip_text.split("."))
+    return 1 <= octets[0] <= 223 and octets[0] != 127
+
+
+def _dhcp_locate(payload):
+    """在 IPv4 载荷内判断是否“形似 DHCP”（未分片 UDP，目的端口 67/68）。
+
+    返回 None：不形似（非 IPv4、头容纳不了 UDP、分片、非 UDP、目的端口不
+    是 67/68），调用方沿用既有语义；否则返回
+    (header_len, total_length, udp_len, dst_port)，调用方继续严格校验。
+    """
+    if len(payload) < 20 or payload[0] >> 4 != 4:
+        return None
+    header_len = (payload[0] & 0x0F) * 4
+    if header_len < 20 or len(payload) < header_len + 8:
+        return None
+    if ((payload[6] << 8) | payload[7]) & 0x3FFF:  # 任何分片都不识别
+        return None
+    if payload[9] != IP_PROTOCOL_UDP:
+        return None
+    dst_port = (payload[header_len + 2] << 8) | payload[header_len + 3]
+    if dst_port not in (BOOTP_SERVER_PORT, BOOTP_CLIENT_PORT):
+        return None
+    total_length = (payload[2] << 8) | payload[3]
+    udp_len = (payload[header_len + 4] << 8) | payload[header_len + 5]
+    return header_len, total_length, udp_len, dst_port
+
+
+def _parse_dhcp_frame(raw, ethertype_offset):
+    """识别并校验单层 802.1Q 上的 IPv4/UDP/BOOTP/DHCP。
+
+    返回 None（非形似 DHCP）、("invalid",)（形似但协议长度、IPv4 首部校验
+    和、magic cookie 或关键选项非法）或 ("ok", info)。
+    """
+    payload = raw[ethertype_offset + 2:-4]
+    located = _dhcp_locate(payload)
+    if located is None:
+        return None
+    header_len, total_length, udp_len, dst_port = located
+    # 自此帧形似 DHCP：以下任一非法均为 malformed_dhcp
+    if _internet_checksum(payload[:header_len]) != 0:  # IPv4 首部校验和
+        return ("invalid",)
+    if total_length < header_len + 8 or total_length > len(payload):
+        return ("invalid",)  # IPv4 总长度须容纳 UDP 且不超过实际载荷
+    if udp_len < 8 or header_len + udp_len > total_length:
+        return ("invalid",)  # UDP 长度至少 8 且完整位于 IPv4 总长度内
+    bootp = payload[header_len + 8:header_len + udp_len]
+    if udp_len - 8 < BOOTP_MIN_LEN:  # BOOTP 报文短于 300 字节非法
+        return ("invalid",)
+    op = bootp[0]
+    if op not in (BOOTP_OP_REQUEST, BOOTP_OP_REPLY):
+        return ("invalid",)
+    if bootp[1] != 1 or bootp[2] != 6:  # htype=以太网，hlen=6
+        return ("invalid",)
+    if bootp[3] != 0:  # hops 须为 0（无中继代理）
+        return ("invalid",)
+    chaddr = bytes(bootp[28:34])
+    if not any(chaddr) or chaddr[0] & 1:  # 客户端 MAC 须为非零单播
+        return ("invalid",)
+    if any(bootp[34:44]):  # chaddr 余 10 字节须为零
+        return ("invalid",)
+    xid = int.from_bytes(bootp[4:8], "big")
+    ciaddr = bytes(bootp[12:16])
+    yiaddr = bytes(bootp[16:20])
+    siaddr = bytes(bootp[20:24])
+    if bootp[BOOTP_FIXED_LEN:BOOTP_FIXED_LEN + 4] != BOOTP_MAGIC_COOKIE:
+        return ("invalid",)  # magic cookie
+    options = bootp[BOOTP_FIXED_LEN + 4:]
+    msg_types = []
+    lease = None
+    index = 0
+    closed = False
+    while index < len(options):
+        code = options[index]
+        if code == 0:  # PAD
+            index += 1
+            continue
+        if code == DHCP_OPT_END:
+            if any(options[index + 1:]):  # END 后只允许零填充
+                return ("invalid",)
+            closed = True
+            break
+        if index + 2 > len(options):
+            return ("invalid",)
+        length = options[index + 1]
+        value_end = index + 2 + length
+        if value_end > len(options):
+            return ("invalid",)
+        value = options[index + 2:value_end]
+        if code == DHCP_OPT_MSG_TYPE:
+            if length != 1 or value[0] not in (
+                DHCP_CLIENT_MESSAGES | DHCP_SERVER_MESSAGES
+            ):
+                return ("invalid",)
+            msg_types.append(value[0])
+        elif code == DHCP_OPT_LEASE_TIME:
+            if length != 4:
+                return ("invalid",)
+            candidate = int.from_bytes(value, "big")
+            if candidate == 0:  # 租期 0 非法
+                return ("invalid",)
+            lease = candidate
+        index = value_end
+    if not closed or len(msg_types) != 1:  # 恰一个 53 且选项区 END 闭合
+        return ("invalid",)
+    msg_type = msg_types[0]
+    # op 与 UDP 方向一致：客户端发往 67，服务器发往 68
+    if op == BOOTP_OP_REQUEST:
+        if msg_type not in DHCP_CLIENT_MESSAGES:
+            return ("invalid",)
+        if dst_port != BOOTP_SERVER_PORT:
+            return ("invalid",)
+    else:
+        if msg_type not in DHCP_SERVER_MESSAGES:
+            return ("invalid",)
+        if dst_port != BOOTP_CLIENT_PORT:
+            return ("invalid",)
+    return (
+        "ok",
+        {
+            "msg_type": msg_type,
+            "xid": xid,
+            "chaddr": _format_mac(chaddr),
+            "ciaddr": _ipv4_dotted(ciaddr),
+            "yiaddr": _ipv4_dotted(yiaddr),
+            "siaddr": _ipv4_dotted(siaddr),
+            "lease": lease,
+        },
+    )
+
+
+def _dhcp_stp_context(bridges, links, delay, bridge_name, ports):
+    """构造 converge/forwarding_ports/port_status 闭包（仿真与预演共用）。"""
+    by_id = {link["id"]: link for link in links}
+    by_name = {port["name"]: port for port in ports}
+    port_link = {}
+    for link in links:
+        for end_bridge, end_port in (link["x"], link["y"]):
+            if end_bridge == bridge_name:
+                port_link[end_port] = link
+    previous = {}
+    since = {}
+    roles = {name: {} for name in bridges}
+
+    def converge(t):
+        _, _, new_roles = stp_converge(bridges, links)
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                key = (name, port)
+                if role in STP_TIMED_ROLES:
+                    if previous.get(key) != role:
+                        since[key] = t
+                else:
+                    since.pop(key, None)
+        previous.clear()
+        for name in bridges:
+            for port, role in new_roles[name].items():
+                previous[(name, port)] = role
+        roles.clear()
+        for name in bridges:
+            roles[name] = new_roles[name]
+
+    def forwarding_ports(t):
+        result = set()
+        for name, link in port_link.items():
+            key = (bridge_name, name)
+            role = roles[bridge_name][name]
+            if (
+                by_name[name]["up"]
+                and link["up"]
+                and role in STP_TIMED_ROLES
+                and t - since[key] >= 2 * delay
+            ):
+                result.add(name)
+        return result
+
+    def port_status(name, t):
+        port = by_name[name]
+        link = port_link.get(name)
+        if link is None:
+            return port["up"], ("forwarding" if port["up"] else "down")
+        if not port["up"]:
+            return False, "down"
+        if not link["up"]:
+            return False, "disabled"
+        role = roles[bridge_name][name]
+        if role in STP_TIMED_ROLES:
+            elapsed = t - since[(bridge_name, name)]
+            if elapsed < delay:
+                state = "discarding"
+            elif elapsed < 2 * delay:
+                state = "learning"
+            else:
+                state = "forwarding"
+        else:
+            state = "discarding"
+        return True, state
+
+    return by_id, by_name, port_link, converge, forwarding_ports, port_status
+
+
+def _dhcp_frame_passes(item, by_name, max_frame, port_status, t):
+    """预演闸门：帧合法、VLAN 准入通过且 STP forwarding 才影响绑定。"""
+    _, _, port_name, raw = item
+    if len(raw) < FRAME_CHECK_RUNT_LENGTH or len(raw) > max_frame:
+        return None
+    if raw[-4:] != (
+        zlib.crc32(raw[:-4]) & 0xFFFFFFFF
+    ).to_bytes(4, "little"):
+        return None
+    if raw[12:14] == FRAME_DECODE_TAG:
+        vlan = ((raw[14] << 8) | raw[15]) & 0x0FFF
+        ingress = by_name[port_name]
+        if ingress["mode"] == "access" or vlan not in ingress["allowed"]:
+            return None
+        offset = 16
+    else:
+        vlan = by_name[port_name]["pvid"]
+        offset = 12
+    if port_status(port_name, t)[1] != "forwarding":
+        return None
+    return vlan, offset
+
+
+def _dhcp_client_verdict(t, port_name, vlan, info, bindings, requests):
+    """客户端报文控制面状态机，返回 (verdict, snoop)。"""
+    mtype = info["msg_type"]
+    xid = info["xid"]
+    chaddr = info["chaddr"]
+    if mtype in (DHCP_MSG_DISCOVER, DHCP_MSG_REQUEST):
+        # 合法 DISCOVER/REQUEST 按 xid、chaddr、VLAN 记录接入口；重发刷新
+        requests[(vlan, xid, chaddr)] = port_name
+        snoop = {"xid": xid, "chaddr": chaddr}
+        if mtype == DHCP_MSG_REQUEST:
+            snoop["ciaddr"] = info["ciaddr"]
+        return DHCP_MSG_NAMES[mtype], snoop
+    if mtype == DHCP_MSG_RELEASE:
+        ciaddr = info["ciaddr"]
+        removed = False
+        entry = bindings.get((vlan, ciaddr))
+        if (
+            entry is not None
+            and entry["mac"] == chaddr
+            and entry["port"] == port_name
+        ):
+            # RELEASE 仅在来源端口、MAC、VLAN 均匹配时删除绑定
+            del bindings[(vlan, ciaddr)]
+            removed = True
+        return (
+            "release",
+            {"xid": xid, "chaddr": chaddr, "ciaddr": ciaddr,
+             "removed": removed},
+        )
+    # DECLINE / INFORM：不改绑定与请求
+    return (
+        DHCP_MSG_NAMES[mtype],
+        {"xid": xid, "chaddr": chaddr, "ciaddr": info["ciaddr"]},
+    )
+
+
+def _dhcp_server_verdict(
+    t, port_name, vlan, info, bindings, requests, trusted_set, capacity,
+    max_lease,
+):
+    """服务器报文控制面状态机，返回 (verdict, snoop)。"""
+    mtype = info["msg_type"]
+    xid = info["xid"]
+    chaddr = info["chaddr"]
+    if port_name not in trusted_set:
+        # 非受信任端口发来的 OFFER/ACK/NAK：丢弃，不改任何状态
+        return (
+            "untrusted_server",
+            {"xid": xid, "chaddr": chaddr, "yiaddr": info["yiaddr"]},
+        )
+    if mtype == DHCP_MSG_OFFER:
+        return (
+            "offer",
+            {"xid": xid, "chaddr": chaddr, "yiaddr": info["yiaddr"]},
+        )
+    if mtype == DHCP_MSG_NAK:
+        matched = requests.pop((vlan, xid, chaddr), None) is not None
+        return (
+            "nak", {"xid": xid, "chaddr": chaddr, "matched": matched}
+        )
+    # ACK：仅受信任端口返回且匹配请求（xid、chaddr、VLAN）才建绑定
+    access_port = requests.get((vlan, xid, chaddr))
+    yiaddr = info["yiaddr"]
+    lease = info["lease"]
+    if (
+        access_port is None
+        or yiaddr == "0.0.0.0"
+        or not _ipv4_bindable(yiaddr)
+        or lease is None
+    ):
+        # 无匹配请求/地址无效/无租期：数据面照常转发，不建绑定
+        return (
+            "ack",
+            {"xid": xid, "chaddr": chaddr, "yiaddr": yiaddr,
+             "lease": lease, "bound": False},
+        )
+    ip_key = (vlan, yiaddr)
+    existing = bindings.get(ip_key)
+    if existing is not None and existing["mac"] != chaddr:
+        # 活动 IP 已被同 VLAN 的其他 MAC 占用：binding_conflict，丢弃
+        return (
+            "binding_conflict",
+            {"xid": xid, "chaddr": chaddr, "yiaddr": yiaddr,
+             "owner_mac": existing["mac"]},
+        )
+    effective = min(lease, max_lease)  # 租期超过配置上限时截断
+    if existing is None:
+        cap = capacity.get(vlan)
+        if cap is not None and sum(
+            1 for bvlan, _ in bindings if bvlan == vlan
+        ) >= cap:
+            # 新绑定超过每 VLAN 容量：不建绑定（ACK 仍按数据面转发）
+            return (
+                "binding_full",
+                {"xid": xid, "chaddr": chaddr, "yiaddr": yiaddr,
+                 "lease": effective},
+            )
+    bindings[ip_key] = {
+        "mac": chaddr,
+        "port": access_port,  # 绑定记录接入口，而非受信任服务器口
+        "expires": t + effective,
+    }
+    del requests[(vlan, xid, chaddr)]
+    return (
+        "ack",
+        {"xid": xid, "chaddr": chaddr, "yiaddr": yiaddr,
+         "lease": effective, "port": access_port, "expires": t + effective,
+         "bound": True, "refreshed": existing is not None,
+         "truncated": lease > max_lease},
+    )
+
+
+def dhcp_snoop_work(
+    bridges, links, delay, bridge_name, ports, max_frame, trusted_ports,
+    capacity, max_lease, events, limit,
+):
+    """dhcp-snoop-decode 工作量无副作用预演。
+
+    逐事件（链路项与帧项合计）累计 1 + 端口数 P + 处理前活动绑定数 B
+    （每事件先老化 expires<=t 再取 B）。预演在 links 浅拷贝上完整复算 STP
+    与 DHCP 绑定机，保证 B 与正式仿真逐事件一致，但不修改正式输入、不产生
+    结果与统计。等于上限合法，首次超过抛 DhcpWorkLimit。
+    """
+    preview_links = [dict(link) for link in links]
+    by_id, by_name, _, converge, forwarding_ports, port_status = (
+        _dhcp_stp_context(
+            bridges, preview_links, delay, bridge_name, ports
+        )
+    )
+    trusted_set = set(trusted_ports)
+    bindings = {}
+    requests = {}
+    P = len(ports)
+    converge(0)
+    work = 0
+    for item in events:
+        t = item[1]
+        for key in [k for k, e in bindings.items() if e["expires"] <= t]:
+            del bindings[key]
+        work += 1 + P + len(bindings)
+        if work > limit:
+            raise DhcpWorkLimit
+        if item[0] == "link":
+            _, _, lid, up = item
+            old_forwarding = forwarding_ports(t)
+            by_id[lid]["up"] = up
+            converge(t)
+            forwarding_ports(t)  # 绑定仅按租期/RELEASE/NAK 消亡，链路不清
+            continue
+        gate = _dhcp_frame_passes(
+            item, by_name, max_frame, port_status, t
+        )
+        if gate is None:
+            continue
+        vlan, offset = gate
+        raw = item[3]
+        if ((raw[offset] << 8) | raw[offset + 1]) != IPV4_ETHER_TYPE:
+            continue
+        parsed = _parse_dhcp_frame(raw, offset)
+        if parsed is None or parsed[0] == "invalid":
+            continue
+        info = parsed[1]
+        if info["msg_type"] in DHCP_SERVER_MESSAGES:
+            _dhcp_server_verdict(
+                t, item[2], vlan, info, bindings, requests, trusted_set,
+                capacity, max_lease,
+            )
+        else:
+            _dhcp_client_verdict(
+                t, item[2], vlan, info, bindings, requests
+            )
+
+
+def dhcp_snoop_decode(
+    bridges, links, delay, bridge_name, ports, age, max_frame,
+    trusted_ports, capacity, max_lease, events, observer=None,
+):
+    """在 stp-decode 转发/学习/统计语义上增加 DHCPv4 Snooping。
+
+    非 DHCP 帧完全沿用既有 VLAN、STP、帧合法性与转发语义。形似 DHCP 但
+    IPv4/UDP/BOOTP/DHCP 任一层非法时固定 malformed_dhcp、空 ports、计
+    drop，不学习 FDB、不记录请求或绑定。非受信任端口发来的
+    OFFER/ACK/NAK 固定 untrusted_server 并丢弃（帧合法，源 MAC 仍学
+    FDB）；binding_conflict 同为合法帧的策略拒绝，学习 FDB 但不转发。合法
+    客户端 DISCOVER/REQUEST 按 (vlan,xid,chaddr) 记录接入口；仅受信任端口
+    返回且匹配请求的 ACK 才按 yiaddr、客户端 MAC、VLAN、接入口与租期建立
+    或刷新绑定，租期超过 max_lease 截断；每事件先老化 expires<=t 的绑定；
+    NAK 清除匹配请求；RELEASE 仅在来源端口、MAC、VLAN 均匹配时删除绑定。
+    活动 IP 已被同 VLAN 其他 MAC 占用时 binding_conflict 丢弃；新绑定超过
+    每 VLAN 容量时 binding_full，ACK 仍按既有数据面转发但不建绑定。
+
+    每个帧结果固定键序 t/action/ports/snoop（非 DHCP 裁决帧 snoop 为
+    null）；末态 bindings 按 VLAN、IP、MAC、端口排序；每端口追加固定键序
+    DHCP 分类计数。observer 语义同 stp-check。
+    """
+    by_id, by_name, port_link, converge, forwarding_ports, port_status = (
+        _dhcp_stp_context(bridges, links, delay, bridge_name, ports)
+    )
+    fdb = {}  # (vlan, mac) -> [port, seen]
+    bindings = {}  # (vlan, ip) -> {"mac", "port", "expires"}
+    requests = {}  # (vlan, xid, chaddr) -> access_port
+    trusted_set = set(trusted_ports)
+    port_stats = {
+        port["name"]: {
+            "rx": 0, "tx": 0, "drop": 0, "good": 0, "runt": 0,
+            "giant": 0, "alignment": 0, "bad_fcs": 0,
+        }
+        for port in ports
+    }
+    snoop_counters = {
+        port["name"]: {key: 0 for key in DHCP_CLASSIFICATION_KEYS}
+        for port in ports
+    }
+    vlan_stats = {}
+    for port in ports:
+        for vlan in port["allowed"]:
+            vlan_stats.setdefault(vlan, {"rx": 0, "tx": 0, "drop": 0})
+    results = []
+    if observer is not None:
+        observer["items"] = []
+
+    def eligible_names(t, vlan, ingress):
+        return [
+            port["name"]
+            for port in ports
+            if vlan in port["allowed"]
+            and port["name"] != ingress
+            and port_status(port["name"], t) == (True, "forwarding")
+        ]
+
+    def data_egress(t, port_name, vlan, dst):
+        """DHCP 帧数据面：完全沿用既有组播/广播泛洪、单播 FDB 命中语义。"""
+        eligible = eligible_names(t, vlan, port_name)
+        if int(dst[:2], 16) & 1:
+            return eligible
+        hit = fdb.get((vlan, dst))
+        if hit is None:
+            return eligible
+        if hit[0] == port_name:
+            return []
+        target = hit[0]
+        target_up, target_state = port_status(target, t)
+        if (
+            target_up
+            and target_state == "forwarding"
+            and vlan in by_name[target]["allowed"]
+        ):
+            return [target]
+        return []
+
+    def emit(t, action, out_ports, snoop, vlan):
+        out = []
+        for name in out_ports:
+            port_stats[name]["tx"] += 1
+            vlan_stats[vlan]["tx"] += 1
+            out.append(
+                {
+                    "name": name,
+                    "vlan": (
+                        None if vlan in by_name[name]["untagged"] else vlan
+                    ),
+                }
+            )
+        entry = {"t": t, "action": action, "ports": out, "snoop": snoop}
+        results.append(entry)
+        if observer is not None:
+            observer["items"].append(
+                {"kind": "frame", "t": t, "applied": True, "output": entry}
+            )
+
+    converge(0)
+    for item in events:
+        t = item[1]
+        for key in [k for k, (_, seen) in fdb.items() if t - seen >= age]:
+            del fdb[key]
+        for key in [  # 每个事件前先老化 expires<=t 的绑定
+            key for key, entry in bindings.items() if entry["expires"] <= t
+        ]:
+            del bindings[key]
+        if item[0] == "link":
+            _, t, lid, up = item
+            applied = by_id[lid]["up"] != up
+            old_forwarding = forwarding_ports(t)
+            by_id[lid]["up"] = up
+            converge(t)
+            for name in old_forwarding - forwarding_ports(t):
+                # FDB 清理沿用 stp-decode；绑定与请求仅按租期/RELEASE/NAK
+                # 消亡，链路事件不删除
+                for key in [k for k, (p, _) in fdb.items() if p == name]:
+                    del fdb[key]
+            if observer is not None:
+                observer["items"].append(
+                    {"kind": "link", "t": t, "applied": applied,
+                     "output": None}
+                )
+            continue
+        _, t, port_name, raw = item
+        dst = _format_mac(raw[0:6])
+        src = _format_mac(raw[6:12])
+        tagged = raw[12:14] == FRAME_DECODE_TAG
+        offset = 16 if tagged else 12
+        ethertype = (raw[offset] << 8) | raw[offset + 1]
+        length = len(raw)
+        port_stats[port_name]["rx"] += 1
+        if length < FRAME_CHECK_RUNT_LENGTH:
+            cls = "runt"
+        elif length > max_frame:
+            cls = "giant"
+        elif raw[-4:] != (
+            zlib.crc32(raw[:-4]) & 0xFFFFFFFF
+        ).to_bytes(4, "little"):
+            cls = "bad_fcs"
+        else:
+            cls = "good"
+        port_stats[port_name][cls] += 1
+        if cls != "good":  # 坏帧丢弃，不学习、不解析、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            emit(t, "drop", [], None, None)
+            continue
+        if tagged:
+            vlan = ((raw[14] << 8) | raw[15]) & 0x0FFF
+            ingress = by_name[port_name]
+            rejected = (
+                ingress["mode"] == "access" or vlan not in ingress["allowed"]
+            )
+        else:
+            vlan = by_name[port_name]["pvid"]
+            rejected = False
+        if rejected:  # VLAN 准入拒绝：不学习、不计 VLAN
+            port_stats[port_name]["drop"] += 1
+            emit(t, "drop", [], None, None)
+            continue
+        vlan_stats[vlan]["rx"] += 1
+        _, state = port_status(port_name, t)
+        # DHCP 识别仅在 forwarding 进行；learning/discarding 上的形似帧不
+        # 触发 malformed 分类（learning 仍学 FDB 但不转发）
+        parsed = (
+            _parse_dhcp_frame(raw, offset)
+            if state == "forwarding" and ethertype == IPV4_ETHER_TYPE
+            else None
+        )
+        if parsed is not None and parsed[0] == "invalid":
+            # 形似 DHCP 但报文非法：丢弃，不学习 FDB、请求或绑定
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+            snoop_counters[port_name]["malformed_dhcp"] += 1
+            emit(
+                t, "malformed_dhcp", [],
+                {"verdict": "malformed_dhcp"}, vlan,
+            )
+            continue
+        egress = []
+        action = "drop"
+        snoop = None
+        if state == "learning":
+            fdb[(vlan, src)] = [port_name, t]
+        elif state == "forwarding":
+            if parsed is not None:
+                info = parsed[1]
+                if info["msg_type"] in DHCP_SERVER_MESSAGES:
+                    verdict, detail = _dhcp_server_verdict(
+                        t, port_name, vlan, info, bindings, requests,
+                        trusted_set, capacity, max_lease,
+                    )
+                else:
+                    verdict, detail = _dhcp_client_verdict(
+                        t, port_name, vlan, info, bindings, requests
+                    )
+                snoop = {"verdict": verdict, **detail}
+                snoop_counters[port_name][verdict] += 1
+                # 合法解析的 DHCP 帧（含策略拒绝）均先按既有语义学习源
+                # MAC；只有 malformed_dhcp 显式不学习 FDB
+                fdb[(vlan, src)] = [port_name, t]
+                if verdict in ("untrusted_server", "binding_conflict"):
+                    # 策略拒绝：不转发（ports 为空，计 drop），但源 MAC 已学
+                    port_stats[port_name]["drop"] += 1
+                    vlan_stats[vlan]["drop"] += 1
+                    emit(t, verdict, [], snoop, vlan)
+                    continue
+                # 其余合法裁决（含 binding_full）按既有数据面转发；
+                # action 取 DHCP 裁决名，ports 仍为数据面出口（binding_full
+                # 的 ACK 同样转发，只是不建绑定）
+                egress = data_egress(t, port_name, vlan, dst)
+                action = verdict
+            else:
+                fdb[(vlan, src)] = [port_name, t]
+                eligible = eligible_names(t, vlan, port_name)
+                if int(dst[:2], 16) & 1:
+                    egress = eligible
+                    action = "flood"
+                else:
+                    hit = fdb.get((vlan, dst))
+                    if hit is not None and hit[0] != port_name:
+                        target = hit[0]
+                        target_up, target_state = port_status(target, t)
+                        if (
+                            target_up
+                            and target_state == "forwarding"
+                            and vlan in by_name[target]["allowed"]
+                        ):
+                            egress = [target]
+                            action = "unicast"
+                    elif hit is None:
+                        egress = eligible
+                        action = "flood"
+        if not egress:
+            port_stats[port_name]["drop"] += 1
+            vlan_stats[vlan]["drop"] += 1
+        emit(t, action, egress, snoop, vlan)
+    port_order = {port["name"]: index for index, port in enumerate(ports)}
+    bindings_out = []
+    for (vlan, ip), entry in sorted(
+        bindings.items(),
+        key=lambda item: (
+            item[0][0],
+            tuple(int(part) for part in item[0][1].split(".")),
+            tuple(int(part, 16) for part in item[1]["mac"].split(":")),
+            port_order[item[1]["port"]],
+        ),
+    ):
+        bindings_out.append(
+            {
+                "vlan": vlan,
+                "ip": ip,
+                "mac": entry["mac"],
+                "port": entry["port"],
+                "expires": entry["expires"],
+            }
+        )
+    counters_out = [
+        {"name": port["name"], **snoop_counters[port["name"]]}
+        for port in ports
+    ]
+    output = {
+        "results": results,
+        "ports": [
+            {
+                "name": port["name"],
+                "rx": port_stats[port["name"]]["rx"],
+                "tx": port_stats[port["name"]]["tx"],
+                "drop": port_stats[port["name"]]["drop"],
+                "good": port_stats[port["name"]]["good"],
+                "runt": port_stats[port["name"]]["runt"],
+                "giant": port_stats[port["name"]]["giant"],
+                "alignment": port_stats[port["name"]]["alignment"],
+                "bad_fcs": port_stats[port["name"]]["bad_fcs"],
+            }
+            for port in ports
+        ],
+        "vlans": [
+            {
+                "vlan": vlan,
+                "rx": vlan_stats[vlan]["rx"],
+                "tx": vlan_stats[vlan]["tx"],
+                "drop": vlan_stats[vlan]["drop"],
+            }
+            for vlan in sorted(vlan_stats)
+        ],
+        "bindings": bindings_out,
+        "counters": counters_out,
+    }
+    return output
+
+
 STORM_CHECK_CONFIG_KEYS = frozenset(
     ("bridges", "links", "delay", "bridge", "ports", "age", "storm",
      "max_frame")
@@ -20581,6 +21387,7 @@ DEFAULT_MAX_QOS_WIRE_WORK = 10000000
 DEFAULT_MAX_QOS_PFC_WORK = 10000000
 DEFAULT_MAX_IGMP_WORK = 10000000
 DEFAULT_MAX_MLD_WORK = 10000000
+DEFAULT_MAX_DHCP_WORK = 10000000
 # log-multicast 前缀重演工作量上限：数值与 igmp/mld 两口径默认值相同，
 # 实际计费按 LOG 模式选择 igmp_snoop_work 或 mld_snoop_work
 DEFAULT_MAX_MULTICAST_WORK = 10000000
@@ -20835,6 +21642,16 @@ def _log_mode(config, events=None):
                 if ekeys not in (STP_EVENT_KEYS, FRAME_DECODE_FRAME_KEYS):
                     raise InvalidInput("bad log event")
             return "mld_snoop_decode"
+        if keys == DHCP_SNOOP_CONFIG_KEYS:
+            # dhcp-snoop-decode：stp-check 七键加 dhcp；事件仅链路项与
+            # t/port/data 原始帧，其余形状即非法输入
+            for event in events if isinstance(events, list) else ():
+                if not isinstance(event, dict):
+                    raise InvalidInput("bad log event")
+                ekeys = frozenset(event)
+                if ekeys not in (STP_EVENT_KEYS, FRAME_DECODE_FRAME_KEYS):
+                    raise InvalidInput("bad log event")
+            return "dhcp_snoop_decode"
         if keys == STP_CHECK_CONFIG_KEYS:
             # stp-check 与 stp-decode 共享七键配置：非链路帧含 src 按
             # stp-check，含 data 按 stp-decode，两种帧形状混用即非法输入
@@ -21563,6 +22380,37 @@ def _run_mld_snoop_decode(config, events, observe, max_work=None):
         bridges, links, delay, bridge, ports, age, max_frame,
         membership_age, router_ports, mld_events,
         router_age=router_age, observer=observer,
+    )
+    return result, observer
+
+
+def _run_dhcp_snoop_decode(config, events, observe, max_work=None):
+    """record/replay dhcp-snoop-decode 模式：校验 stp 七键加 dhcp 配置与
+    混合事件并执行仿真。
+
+    事件外壳、全量校验与执行语义完全沿用 dhcp-snoop-decode 入口；
+    max_work 非 None 时（record/replay）全量语义校验后先按逐事件
+    1+P+处理前活动绑定数无副作用预演（预演在 links 浅拷贝上复算 STP 与
+    绑定机，坏帧、准入拒绝、幂等链路均计费），首次超过即抛 DhcpWorkLimit，
+    不正式仿真。返回 (dhcp-snoop-decode 结果 dict, observer 或 None)；帧项
+    恒 applied 且 output 为对应 t,action,ports,snoop 结果项，链路项仅 up
+    实际改变时 applied，output 恒 None。
+    """
+    (
+        bridges, links, delay, bridge, ports, age, max_frame,
+        trusted_ports, capacity, max_lease,
+    ) = validate_dhcp_snoop_config(config)
+    link_ids = {link["id"] for link in links}
+    dhcp_events = validate_stp_decode_events(events, ports, link_ids)
+    if max_work is not None:
+        dhcp_snoop_work(
+            bridges, links, delay, bridge, ports, max_frame, trusted_ports,
+            capacity, max_lease, dhcp_events, max_work,
+        )
+    observer = {} if observe else None
+    result = dhcp_snoop_decode(
+        bridges, links, delay, bridge, ports, age, max_frame,
+        trusted_ports, capacity, max_lease, dhcp_events, observer=observer,
     )
     return result, observer
 
@@ -22312,6 +23160,7 @@ def _build_log_doc(config, events, items):
             "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm",
             "igmp_snoop_decode", "mld_snoop_decode",
+            "dhcp_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -22452,6 +23301,7 @@ def _verify_records(log, events, items):
             "forward_stp",
             "stp_decode", "stp_check", "forward_stp_storm",
             "igmp_snoop_decode", "mld_snoop_decode",
+            "dhcp_snoop_decode",
         ):
             if kind == "link" and observed["applied"]:
                 version += 1
@@ -22613,6 +23463,10 @@ def _cmd_record(
             result, observer = _run_mld_snoop_decode(
                 config, events, True, max_record_work
             )
+        elif mode == "dhcp_snoop_decode":
+            result, observer = _run_dhcp_snoop_decode(
+                config, events, True, max_record_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_record_work
@@ -22712,6 +23566,7 @@ def _cmd_record(
         QosPfcWorkLimit,
         IgmpWorkLimit,
         MldWorkLimit,
+        DhcpWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -22832,6 +23687,10 @@ def _cmd_replay(
             result, observer = _run_mld_snoop_decode(
                 config, events, True, max_replay_work
             )
+        elif mode == "dhcp_snoop_decode":
+            result, observer = _run_dhcp_snoop_decode(
+                config, events, True, max_replay_work
+            )
         elif mode == "stp_check":
             result, observer = _run_stp_check(
                 config, events, True, max_replay_work
@@ -22931,6 +23790,7 @@ def _cmd_replay(
         QosPfcWorkLimit,
         IgmpWorkLimit,
         MldWorkLimit,
+        DhcpWorkLimit,
         AclWorkLimit,
         MirrorWorkLimit,
         LagWorkLimit,
@@ -25905,6 +26765,71 @@ def _cmd_mld_snoop_decode(
     return 0
 
 
+def _cmd_dhcp_snoop_decode(
+    config_path,
+    events_path,
+    max_config_bytes,
+    max_data_bytes,
+    max_items,
+    max_output_bytes,
+    max_dhcp_work,
+):
+    try:
+        # 先打开两文件，任一失败即停；均可读后按 CONFIG、EVENTS 顺序分块读
+        with open(config_path, "rb") as config_handle, open(
+            events_path, "rb"
+        ) as events_handle:
+            config_raw = _read_limited(config_handle, max_config_bytes)
+            if config_raw is None:
+                _fail("config_limit")
+                return 5
+            events_raw = _read_limited(events_handle, max_data_bytes)
+            if events_raw is None:
+                _fail("data_limit")
+                return 5
+    except OSError:
+        _fail("file_not_found")
+        return 3
+    try:
+        config = parse_json(config_raw)
+        events_doc = parse_json(events_raw)
+        # 事件数上界在解析后、语义校验前判定；EVENTS 非数组仍按非法输入处理
+        if isinstance(events_doc, list) and len(events_doc) > max_items:
+            _fail("item_limit")
+            return 5
+        # 全量输入先校验再仿真；dhcp 配置为 stp-check 七键加 dhcp 对象，
+        # 事件外壳与 stp-decode 完全一致
+        (
+            bridges, links, delay, bridge, ports, age, max_frame,
+            trusted_ports, capacity, max_lease,
+        ) = validate_dhcp_snoop_config(config)
+        link_ids = {link["id"] for link in links}
+        events = validate_stp_decode_events(events_doc, ports, link_ids)
+        # 资源、工作量契约：全量校验后无副作用预演，超限不正式仿真；
+        # 逐事件 1+P+处理前活动绑定数，首次超过即 dhcp_work_limit
+        dhcp_snoop_work(
+            bridges, links, delay, bridge, ports, max_frame, trusted_ports,
+            capacity, max_lease, events, max_dhcp_work,
+        )
+        result = dhcp_snoop_decode(
+            bridges, links, delay, bridge, ports, age, max_frame,
+            trusted_ports, capacity, max_lease, events,
+        )
+    except InvalidInput:
+        _fail("invalid_input")
+        return 4
+    except DhcpWorkLimit:
+        _fail("dhcp_work_limit")
+        return 5
+    payload = _result_bytes(result)
+    # 输出字节上界（含末尾 LF）写出前判定；等于上限合法，超限时 stdout 为空
+    if len(payload) > max_output_bytes:
+        _fail("output_limit")
+        return 5
+    sys.stdout.buffer.write(payload)
+    return 0
+
+
 def _cmd_qos_decode(
     config_path,
     events_path,
@@ -26380,6 +27305,7 @@ SUBCOMMANDS = frozenset((
     "stp-decode",
     "igmp-snoop-decode",
     "mld-snoop-decode",
+    "dhcp-snoop-decode",
     "link-forward",
     "link-wire",
     "link-wire-decode",
@@ -27048,6 +27974,30 @@ def main(argv):
             _fail("usage")
             return 2
         return _cmd_mld_snoop_decode(args[1], args[2], *limits)
+    if args[:1] == ["dhcp-snoop-decode"]:
+        # dhcp-snoop-decode CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
+        #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_DHCP_WORK]]]：
+        #   签名、四项资源上限与错误契约同 stp-decode，工作量逐事件累计
+        #   1+P+处理前活动绑定数，超限错误名 dhcp_work_limit；可选上限
+        #   0、2、4、5 项
+        if len(args) not in (3, 5, 7, 8):
+            _fail("usage")
+            return 2
+        limits = _parse_limits(
+            args[3:],
+            (0, 2, 4, 5),
+            (
+                DEFAULT_MAX_CONFIG_BYTES,
+                DEFAULT_MAX_DATA_BYTES,
+                DEFAULT_MAX_ITEMS,
+                DEFAULT_MAX_OUTPUT_BYTES,
+                DEFAULT_MAX_DHCP_WORK,
+            ),
+        )
+        if limits is None:
+            _fail("usage")
+            return 2
+        return _cmd_dhcp_snoop_decode(args[1], args[2], *limits)
     if args[:1] == ["link-forward"]:
         # link-forward CONFIG EVENTS [MAX_CONFIG_BYTES MAX_DATA_BYTES
         #   [MAX_ITEMS MAX_OUTPUT_BYTES [MAX_LINK_FORWARD_WORK]]]：
